@@ -37,9 +37,11 @@ You need a 64-bit **DirectX 11** game (DX12/DX9/32-bit won't work).
 2. **DLSS 5 Feeder** â€” download **`dlss5-feed.addon64`** and **`DLSS5_Feed.fx`** from the
    **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)**.
    Put `dlss5-feed.addon64` next to the game `.exe` (same folder as `dxgi.dll`), and
-   `DLSS5_Feed.fx` in `â€¦eshade-shaders\Shaders\`.
+   `DLSS5_Feed.fx` into the `reshade-shaders/Shaders/` folder.
+
 3. **LaunchPad (motion vectors)** â€” from iMMERSE: **https://github.com/martymcmodding/iMMERSE** â†’
-   green **Code â–¸ Download ZIP**. Copy into `â€¦eshade-shaders\`:
+   green **Code ▸ Download ZIP**. Copy these into your game's `reshade-shaders/` folder:
+
    `Shaders\MartysMods_LAUNCHPAD.fx`, the whole `Shaders\MartysMods\` folder, and
    `Textures\iMMERSE_bluenoise_opt.png`.
 4. **DLSS 5 neural-rendering add-on** â€” `renodx-dlss5.addon64` and its model `nvngx_dlssnr.dll`.

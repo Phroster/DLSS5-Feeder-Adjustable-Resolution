@@ -6,3 +6,10 @@
 *.addon64
 *.log
 build/
+
+# NVIDIA NGX SDK (bring your own — see external/ngx/README.md); not redistributed here
+external/ngx/*.h
+external/ngx/*.lib
+external/ngx/libs/
+# Upstream bridge sources are not re-hosted; see README credits
+external/bridge-1.0.19/

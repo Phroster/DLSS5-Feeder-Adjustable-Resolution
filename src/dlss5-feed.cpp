@@ -1118,10 +1118,20 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
 
     g.handles_ok = g.technique.handle != 0 && g.mv_var.handle != 0 && g.depth_var.handle != 0;
     g.missing_reported = false;
+
+    // Games can recreate the swapchain (and ReShade its runtime) dozens of times per second;
+    // only say something when the situation actually changed.
+    const int signature = (g.technique.handle ? 1 : 0) | (g.mv_var.handle ? 2 : 0) | (g.depth_var.handle ? 4 : 0) |
+                          (g.launchpad.handle ? 8 : 0) | (g.depth_reversed ? 16 : 0) |
+                          ((g.launchpad.handle && rt->get_technique_state(g.launchpad)) ? 32 : 0);
+    static int last_signature = -1;
+    if (signature == last_signature) return;
+    last_signature = signature;
+
     Log("[feed] effects: %s technique %s, DLSS5_MV %s, DLSS5_Depth %s, LaunchPad technique %s (%s), depth reversed=%d",
         kEffectFile, g.technique.handle ? "found" : "MISSING", g.mv_var.handle ? "found" : "MISSING",
         g.depth_var.handle ? "found" : "MISSING", g.launchpad.handle ? "found" : "MISSING",
-        g.launchpad.handle ? (rt->get_technique_state(g.launchpad) ? "enabled" : "DISABLED") : "-", g.depth_reversed ? 1 : 0);
+        g.launchpad.handle ? ((signature & 32) ? "enabled" : "DISABLED") : "-", g.depth_reversed ? 1 : 0);
     if (!g.handles_ok)
         Warn("DLSS5_Feed.fx is not loaded (technique/textures missing) -- install it into reshade-shaders\\Shaders and enable it below MartysMods_Launchpad.");
     else if (g.launchpad.handle == 0)
@@ -1134,13 +1144,16 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
     ResolveHandles(rt);
     // A recreated runtime means the DLSS 5 add-on has re-armed its hooks: give it a fresh feature.
     if (g.session_ready) g.frame_ready = false;
-    Log("[feed] effect runtime %p initialised", (void *)rt);
+    static int inits = 0;
+    if (++inits <= 8) Log("[feed] effect runtime %p initialised", (void *)rt);
+    else if (inits == 9) Log("[feed] (further runtime init/destroy messages suppressed)");
 }
 
 static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
 {
     if (rt != g.runtime) return;
-    Log("[feed] effect runtime %p destroyed", (void *)rt);
+    static int destroys = 0;
+    if (++destroys <= 8) Log("[feed] effect runtime %p destroyed", (void *)rt);
     ReleaseFrameResources();
     g.runtime = nullptr;
     g.technique = {}; g.launchpad = {}; g.mv_var = {}; g.depth_var = {};

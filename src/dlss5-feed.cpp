@@ -453,6 +453,24 @@ static void DrainGpu()
     for (int i = 0; i < Feed::kFrames; ++i) g.alloc_fence[i] = 0;
 }
 
+// NGX can access-violate inside its own code or inside the DLSS 5 add-on (a leaked, closed-source
+// snippet), especially across a resolution or device change. SEH keeps that from taking the game
+// down -- it becomes a graceful disable instead. These wrappers hold no C++ objects, so __try is
+// legal here under /EHsc (same approach as the dlss5-dx11-bridge).
+static NVSDK_NGX_Result SafeCreateDLSS(NVSDK_NGX_DLSS_Create_Params *cp, DWORD *code)
+{
+    *code = 0;
+    __try { return NGX_D3D12_CREATE_DLSS_EXT(g.list, 1, 1, &g.feature, g.params, cp); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+}
+
+static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, DWORD *code)
+{
+    *code = 0;
+    __try { return NGX_D3D12_EVALUATE_DLSS_EXT(g.list, g.feature, g.params, ep); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
+}
+
 static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
 {
     D3D12_RESOURCE_BARRIER b = {};
@@ -655,8 +673,15 @@ static bool BuildResources(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 
     if (!BeginCommands()) { Log("[feed] could not start a command list"); return false; }
     Breadcrumb("creating the DLSS feature");
-    NVSDK_NGX_Result rf = NGX_D3D12_CREATE_DLSS_EXT(g.list, 1, 1, &g.feature, g.params, &cp);
+    DWORD ccode = 0;
+    NVSDK_NGX_Result rf = SafeCreateDLSS(&cp, &ccode);
     const UINT64 v = EndCommands();
+    if (ccode != 0)
+    {
+        Log("[feed] CreateFeature raised exception 0x%08X -- disabling to protect the game", ccode);
+        FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
+        return false;
+    }
     if (g.fence12->GetCompletedValue() < v)
     {
         g.fence12->SetEventOnCompletion(v, g.fence_event);
@@ -988,12 +1013,21 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
         ok = false;
     }
 
-    if (ok && !g.session_ready)
+    if (ok)
     {
         ID3D11Device *dev = nullptr;
         ctx->GetDevice(&dev);
-        if (dev != nullptr) { ok = InitSession(dev, ctx); dev->Release(); }
-        else ok = false;
+        if (dev == nullptr) ok = false;
+        else
+        {
+            if (g.session_ready && g.dev11 != nullptr && dev != g.dev11)
+            {
+                Log("[feed] the game recreated its D3D11 device; rebuilding the session");
+                ShutdownSession();
+            }
+            if (!g.session_ready) ok = InitSession(dev, ctx);
+            dev->Release();
+        }
     }
 
     if (ok && (!g.frame_ready || cd.Width != g.width || cd.Height != g.height || cd.Format != g.bb_fmt))
@@ -1054,7 +1088,8 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
                 ep.InExposureScale   = 1.0f;
 
                 Breadcrumb("running the D3D12 evaluate");
-                NVSDK_NGX_Result re = NGX_D3D12_EVALUATE_DLSS_EXT(g.list, g.feature, g.params, &ep);
+                DWORD ecode = 0;
+                NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
 
                 Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
@@ -1062,7 +1097,14 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
                 const UINT64 v_out = EndCommands();
 
-                if (NVSDK_NGX_FAILED(re))
+                if (ecode != 0)
+                {
+                    Log("[feed] evaluate raised exception 0x%08X -- disabling to protect the game", ecode);
+                    FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
+                    g.frame_ready = false;
+                    ok = false;
+                }
+                else if (NVSDK_NGX_FAILED(re))
                 {
                     Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
                     FeedFail("evaluate");

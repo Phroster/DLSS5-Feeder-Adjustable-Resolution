@@ -1,0 +1,8 @@
+*.obj
+*.exp
+*.lib
+*.pdb
+*.res
+*.addon64
+*.log
+build/

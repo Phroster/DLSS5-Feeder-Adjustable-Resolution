@@ -1,6 +1,6 @@
 ﻿// dlss5-feed - ReShade add-on
 //
-// Makes DLSS 5 neural rendering work in a D3D11 game that has no DLSS of its own.
+// Makes DLSS 5 neural rendering work in a D3D11 or D3D12 game that has no DLSS of its own.
 //
 // The DLSS 5 add-on (renodx-dlss5) only detours NVSDK_NGX_D3D12_CreateFeature /
 // EvaluateFeature and reads the DLSS "contract" it finds there (Color, Depth,
@@ -14,6 +14,9 @@
 //
 // The D3D11 <-> D3D12 transport (shared textures, shared fence, allocator ring) is
 // adapted from NIGos' dlss5-dx11-bridge (MIT), see external/bridge-1.0.19/LICENSE.
+// In a D3D12 game there is no transport at all: NGX runs on the game's own device
+// and queue (the DLSS 5 add-on's native scenario), with the motion vectors and
+// depth consumed zero-copy straight from the effect textures.
 // The NGX side uses NVIDIA's NGX SDK static library, which locates and loads the
 // driver's _nvngx.dll by itself.
 //
@@ -38,14 +41,14 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
-#define FEED_VERSION "0.1.0"
+#define FEED_VERSION "0.2.0"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Feeds DLSS 5 neural rendering with ReShade's depth and LaunchPad motion vectors in games "
-    "without DLSS: runs a real DLSS DLAA pass on a private D3D12 device (where the DLSS 5 add-on "
-    "hooks in) and writes the result back into the frame. Needs DLSS5_Feed.fx + MartysMods LaunchPad. "
-    "Settings in dlss5-feed.cfg, re-read while the game runs.";
+    "Feeds DLSS 5 neural rendering with ReShade's depth and LaunchPad motion vectors in D3D11 and "
+    "D3D12 games without DLSS: runs a real DLSS DLAA pass where the DLSS 5 add-on hooks in (a private "
+    "D3D12 device for D3D11 games, the game's own device for D3D12) and writes the result back into "
+    "the frame. Needs DLSS5_Feed.fx + MartysMods LaunchPad. Settings in dlss5-feed.cfg.";
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -263,6 +266,8 @@ struct Feed
     ID3D11DeviceContext4      *ctx4;
     UINT64                     fence_value;
     ID3D11Device              *dev11;      // not owned
+    bool                       dev12_owned; // true on the D3D11 path (we created the private device)
+    reshade::api::command_queue *rs_queue;  // D3D12 path: ReShade's wrapper of the game's queue (not owned)
 
     // NGX
     bool                 ngx_inited;
@@ -612,6 +617,8 @@ static bool MakeBlitShaders()
     return true;
 }
 
+static bool CreateDlssFeature(UINT w, UINT h, bool inverted);
+
 static bool BuildResources(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
     Breadcrumb("building shared textures");
@@ -655,7 +662,13 @@ static bool BuildResources(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
-    // The DLSS contract. DLAA: render size == output size, no jitter, MVs at render size.
+    return CreateDlssFeature(w, h, inverted);
+}
+
+// The DLSS contract, shared by the D3D11 and D3D12 paths. DLAA: render size == output
+// size, no jitter, MVs at render size. The DLSS 5 add-on captures this create inline.
+static bool CreateDlssFeature(UINT w, UINT h, bool inverted)
+{
     int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     if (inverted) flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     if (g.hdr)    flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
@@ -746,6 +759,7 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
     {
         HRESULT hr = create_device(adapter, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&g.dev12));
         if (FAILED(hr) || g.dev12 == nullptr) { Log("[feed] D3D12CreateDevice failed 0x%08X", hr); goto fail; }
+        g.dev12_owned = true;
 
         wchar_t data_path[MAX_PATH] = {};
         GetModuleFileNameW(g_self, data_path, MAX_PATH);
@@ -843,6 +857,170 @@ static void ShutdownSession()
     SafeRelease(g.dev12);
     g.session_ready = false;
     g.dev11 = nullptr;
+    g.rs_queue = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Session, D3D12 same-device: NGX runs on the game's own device and queue -- the
+// DLSS 5 add-on's native scenario (it watches every D3D12 device ReShade knows).
+// No transport at all: MV and depth are consumed zero-copy from the effect
+// textures; only the backbuffer is copied (swapchain buffers are not reliably
+// shader-readable, and DLSS needs Output != Color anyway).
+// ---------------------------------------------------------------------------
+
+static bool InitSession12(reshade::api::effect_runtime *rt)
+{
+    Breadcrumb("opening the same-device D3D12 session");
+    Log("################ feed: opening same-device D3D12 session ################");
+
+    reshade::api::device *dev_api = rt->get_device();
+    auto *dev = reinterpret_cast<ID3D12Device *>(dev_api->get_native());
+    g.rs_queue = rt->get_command_queue();
+    auto *queue = g.rs_queue != nullptr ? reinterpret_cast<ID3D12CommandQueue *>(g.rs_queue->get_native()) : nullptr;
+    if (dev == nullptr || queue == nullptr)
+    {
+        Log("[feed] no native D3D12 device/queue");
+        FeedDisable("the game's D3D12 device/queue is not reachable");
+        return false;
+    }
+
+    dev->AddRef();
+    g.dev12 = dev;
+    g.dev12_owned = false;
+    queue->AddRef();
+    g.queue = queue;
+
+    wchar_t data_path[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, data_path, MAX_PATH);
+    if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
+
+    Breadcrumb("initialising NGX on the game's device");
+    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
+    Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
+    if (NVSDK_NGX_FAILED(r))
+    {
+        r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+                                                "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
+        Log("[feed] NVSDK_NGX_D3D12_Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
+    }
+    if (NVSDK_NGX_FAILED(r))
+    {
+        ShutdownSession();
+        FeedDisable("NGX would not initialise on the game's device");
+        return false;
+    }
+    g.ngx_inited = true;
+
+    NVSDK_NGX_Parameter *caps = nullptr;
+    r = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
+    if (NVSDK_NGX_SUCCEED(r) && caps != nullptr)
+    {
+        int avail = 0;
+        caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
+        Log("[feed] NGX capabilities: SuperSampling.Available=%d", avail);
+        if (!avail)
+        {
+            ShutdownSession();
+            FeedDisable("DLSS is not available on this GPU/driver");
+            return false;
+        }
+    }
+    else
+        Log("[feed] capability query failed 0x%08X (%s); continuing", r, NgxResultName(r));
+
+    r = NVSDK_NGX_D3D12_AllocateParameters(&g.params);
+    if (NVSDK_NGX_FAILED(r) || g.params == nullptr)
+    {
+        Log("[feed] AllocateParameters failed 0x%08X", r);
+        ShutdownSession();
+        FeedDisable("NGX parameter allocation failed");
+        return false;
+    }
+
+    // Our own allocators + list on the game's device; submission goes to the game's queue.
+    for (int i = 0; i < Feed::kFrames; ++i)
+        g.dev12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                        reinterpret_cast<void **>(&g.alloc[i]));
+    if (g.alloc[0] != nullptr)
+        g.dev12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.alloc[0], nullptr,
+                                   __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g.list));
+    if (g.list != nullptr) g.list->Close();
+    g.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g.dev12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12));
+    if (g.list == nullptr || g.fence12 == nullptr || g.fence_event == nullptr)
+    {
+        Log("[feed] D3D12 list/fence creation failed");
+        ShutdownSession();
+        FeedDisable("could not create the D3D12 objects");
+        return false;
+    }
+
+    Log("[feed] session ready (same-device): dev=%p queue=%p list=%p fence=%p", (void *)g.dev12, (void *)g.queue,
+        (void *)g.list, (void *)g.fence12);
+    Log("############# feed: session open (same-device D3D12) #############");
+    g.session_ready = true;
+    return true;
+}
+
+static bool MakeTex12(int i, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, D3D12_RESOURCE_STATES initial)
+{
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width            = w;
+    rd.Height           = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = fmt;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags            = uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
+    const HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, initial, nullptr,
+                                                        __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g.tex12[i]));
+    if (FAILED(hr)) { Log("[feed] %s: CreateCommittedResource failed 0x%08X", kSlotName[i], hr); return false; }
+    Log("[feed] %-6s %ux%u %s on the game's device%s", kSlotName[i], w, h, FormatName(fmt), uav ? " (UAV)" : "");
+    return true;
+}
+
+static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
+{
+    Breadcrumb("building same-device textures");
+    ReleaseFrameResources();
+
+    g.width      = w;
+    g.height     = h;
+    g.bb_fmt     = bb_fmt;
+    g.color_fmt  = TypedColorFormat(bb_fmt);
+    g.output_fmt = g.color_fmt;   // the copy home is a plain CopyResource; no blit on this path
+    g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+    const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+
+    if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
+    {
+        Log("[feed] backbuffer format %u (%s) is not supported", bb_fmt, FormatName(bb_fmt));
+        FeedDisable("unsupported backbuffer format");
+        return false;
+    }
+
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = { g.output_fmt };
+    if (SUCCEEDED(g.dev12->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
+        (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) == 0)
+        Log("[feed] note: %s reports no typed UAV store on this GPU; the DLSS output may fail", FormatName(g.output_fmt));
+
+    // Rest states: Color sits as a shader resource, Output as a UAV. Every transition away
+    // and back goes through ReShade's own barrier API so its state tracking stays right.
+    if (!MakeTex12(SLOT_COLOR, w, h, g.color_fmt, false,
+                   D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
+        !MakeTex12(SLOT_OUTPUT, w, h, g.output_fmt, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    {
+        ReleaseFrameResources();
+        return false;
+    }
+
+    if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
+
+    return CreateDlssFeature(w, h, inverted);
 }
 
 // ---------------------------------------------------------------------------
@@ -948,19 +1126,225 @@ static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *d
     return tex;  // caller releases
 }
 
-static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+// ---------------------------------------------------------------------------
+// Per frame, D3D12 same-device: ReShade's own command list carries every barrier
+// and copy (so its state tracking stays right); our list carries only the NGX
+// evaluate, executed on the game's queue right after ReShade's work is flushed.
+// ---------------------------------------------------------------------------
+
+static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
-    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
+    using namespace reshade::api;
 
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
 
-    reshade::api::device *dev_api = rt->get_device();
-    if (dev_api->get_api() != reshade::api::device_api::d3d11)
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.frame_ready = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+
+    device *dev_api = rt->get_device();
+
+    resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
+    if (g.mv_var.handle != 0)    rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
+    if (g.depth_var.handle != 0) rt->get_texture_binding(g.depth_var, &d_srv, &d_srgb);
+    if (mv_srv.handle == 0 || d_srv.handle == 0)
     {
-        FeedDisable("only Direct3D 11 games are supported");
+        if (!g.missing_reported)
+        {
+            g.missing_reported = true;
+            Warn("DLSS5_Feed.fx textures not found (technique %s). Install DLSS5_Feed.fx + MartysMods LaunchPad and enable both.",
+                 g.technique.handle ? "found" : "MISSING");
+        }
         return;
     }
+
+    const resource bb_res = dev_api->get_resource_from_view(rtv);
+    auto *bb    = reinterpret_cast<ID3D12Resource *>(bb_res.handle);
+    auto *mv    = reinterpret_cast<ID3D12Resource *>(dev_api->get_resource_from_view(mv_srv).handle);
+    auto *depth = reinterpret_cast<ID3D12Resource *>(dev_api->get_resource_from_view(d_srv).handle);
+    if (bb == nullptr || mv == nullptr || depth == nullptr) return;
+
+    const D3D12_RESOURCE_DESC cd = bb->GetDesc(), md = mv->GetDesc(), dd = depth->GetDesc();
+    const UINT w = static_cast<UINT>(cd.Width), h = cd.Height;
+    if (cd.Width != md.Width || h != md.Height || cd.Width != dd.Width || h != dd.Height ||
+        cd.SampleDesc.Count != 1 || md.Format != DXGI_FORMAT_R16G16_FLOAT || dd.Format != DXGI_FORMAT_R32_FLOAT)
+    {
+        static bool said12 = false;
+        if (!said12)
+        {
+            said12 = true;
+            Log("[feed] input mismatch: color %ux%u %s samp=%u | mv %ux%u %s | depth %ux%u %s -- skipping",
+                w, h, FormatName(cd.Format), cd.SampleDesc.Count, static_cast<UINT>(md.Width), md.Height,
+                FormatName(md.Format), static_cast<UINT>(dd.Width), dd.Height, FormatName(dd.Format));
+        }
+        return;
+    }
+
+    auto *native_dev = reinterpret_cast<ID3D12Device *>(dev_api->get_native());
+    if (g.session_ready && !g.dev12_owned && g.dev12 != nullptr && g.dev12 != native_dev)
+    {
+        Log("[feed] the game recreated its D3D12 device; rebuilding the session");
+        ShutdownSession();
+    }
+    bool ok = g.session_ready || InitSession12(rt);
+
+    if (ok && (!g.frame_ready || w != g.width || h != g.height || cd.Format != g.bb_fmt))
+    {
+        Log("[feed] building: %ux%u backbuffer %s (same-device D3D12, depth reversed=%d)", w, h,
+            FormatName(cd.Format), g.depth_reversed ? 1 : 0);
+        ok = BuildResources12(w, h, cd.Format);
+        if (!ok) FeedFail("resource build");
+        else g.consecutive_fails = 0;
+    }
+
+    if (ok)
+    {
+        const resource color12  = { reinterpret_cast<uint64_t>(g.tex12[SLOT_COLOR]) };
+        const resource output12 = { reinterpret_cast<uint64_t>(g.tex12[SLOT_OUTPUT]) };
+
+        // ReShade renders effects into the backbuffer, so its tracked state here is render_target.
+        Breadcrumb("copying the backbuffer (D3D12)");
+        {
+            const resource       res[2]  = { bb_res, color12 };
+            const resource_usage from[2] = { resource_usage::render_target, resource_usage::shader_resource };
+            const resource_usage to[2]   = { resource_usage::copy_source, resource_usage::copy_dest };
+            cl->barrier(2, res, from, to);
+        }
+        cl->copy_resource(bb_res, color12);
+
+        if (g_cfg.mode == 1)
+        {
+            // Transport test: the copied frame goes straight back.
+            {
+                const resource       res[2]  = { bb_res, color12 };
+                const resource_usage from[2] = { resource_usage::copy_source, resource_usage::copy_dest };
+                const resource_usage to[2]   = { resource_usage::copy_dest, resource_usage::copy_source };
+                cl->barrier(2, res, from, to);
+            }
+            cl->copy_resource(color12, bb_res);
+            {
+                const resource       res[2]  = { bb_res, color12 };
+                const resource_usage from[2] = { resource_usage::copy_dest, resource_usage::copy_source };
+                const resource_usage to[2]   = { resource_usage::render_target, resource_usage::shader_resource };
+                cl->barrier(2, res, from, to);
+            }
+            ++g.frames_done;
+        }
+        else
+        {
+            // Park the backbuffer to receive the output; the copy becomes DLSS's colour input.
+            {
+                const resource       res[2]  = { bb_res, color12 };
+                const resource_usage from[2] = { resource_usage::copy_source, resource_usage::copy_dest };
+                const resource_usage to[2]   = { resource_usage::copy_dest, resource_usage::shader_resource };
+                cl->barrier(2, res, from, to);
+            }
+
+            // Everything recorded so far (LaunchPad, the feed passes, these copies) goes to
+            // the game's queue now; our evaluate follows it on the same queue.
+            Breadcrumb("flushing ReShade's command list");
+            g.rs_queue->flush_immediate_command_list();
+
+            bool restored = false;
+            if (!BeginCommands()) { FeedFail("command list"); }
+            else
+            {
+                const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+                g.need_reset = false;
+
+                NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
+                ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
+                ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
+                ep.Feature.InSharpness = 0.0f;
+                ep.pInDepth          = depth;   // the effect textures themselves: zero-copy
+                ep.pInMotionVectors  = mv;
+                ep.InJitterOffsetX   = 0.0f;
+                ep.InJitterOffsetY   = 0.0f;
+                ep.InRenderSubrectDimensions.Width  = g.width;
+                ep.InRenderSubrectDimensions.Height = g.height;
+                ep.InReset           = reset;
+                ep.InMVScaleX        = g_cfg.mv_scale_x;
+                ep.InMVScaleY        = g_cfg.mv_scale_y;
+                ep.InPreExposure     = 1.0f;
+                ep.InExposureScale   = 1.0f;
+
+                Breadcrumb("running the same-device evaluate");
+                DWORD ecode = 0;
+                NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+                EndCommands();
+
+                if (ecode != 0)
+                {
+                    Log("[feed] evaluate raised exception 0x%08X -- disabling to protect the game", ecode);
+                    FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
+                    g.frame_ready = false;
+                }
+                else if (NVSDK_NGX_FAILED(re))
+                {
+                    Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
+                    FeedFail("evaluate");
+                    g.frame_ready = false;
+                }
+                else
+                {
+                    // The copy home is recorded on the (fresh) immediate list: it executes on
+                    // the same queue after the evaluate, so no fence is needed.
+                    {
+                        const resource       res[1]  = { output12 };
+                        const resource_usage from[1] = { resource_usage::unordered_access };
+                        const resource_usage to[1]   = { resource_usage::copy_source };
+                        cl->barrier(1, res, from, to);
+                    }
+                    cl->copy_resource(output12, bb_res);
+                    {
+                        const resource       res[2]  = { bb_res, output12 };
+                        const resource_usage from[2] = { resource_usage::copy_dest, resource_usage::copy_source };
+                        const resource_usage to[2]   = { resource_usage::render_target, resource_usage::unordered_access };
+                        cl->barrier(2, res, from, to);
+                    }
+                    restored = true;
+
+                    const UINT64 n = ++g.frames_done;
+                    g.consecutive_fails = 0;
+                    if (n <= static_cast<UINT64>(g_cfg.log_frames) || (n % 1800) == 0)
+                        Log("[feed] frame %llu delivered (%ux%u, reset=%d, same-device)", n, g.width, g.height, reset);
+
+                    // The DLSS 5 add-on sometimes latches STANDBY/FAILED on the very first create
+                    // and only recovers on a fresh one; re-create once after the pipeline settled.
+                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                    {
+                        g.warmup_done = true;
+                        g.frame_ready = false;
+                        Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu)", n);
+                    }
+                }
+            }
+
+            if (!restored)
+            {
+                // Whatever went wrong, hand the backbuffer back in the state ReShade expects.
+                const resource       res[1]  = { bb_res };
+                const resource_usage from[1] = { resource_usage::copy_dest };
+                const resource_usage to[1]   = { resource_usage::render_target };
+                cl->barrier(1, res, from, to);
+            }
+        }
+    }
+
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
+// ---------------------------------------------------------------------------
+// Per frame, D3D11: the original private-device transport
+// ---------------------------------------------------------------------------
+
+static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+{
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+
+    reshade::api::device *dev_api = rt->get_device();
 
     auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cl->get_native());
     if (ctx == nullptr || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
@@ -1142,6 +1526,17 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
     TimingTick(t0.QuadPart, t1.QuadPart);
 }
 
+static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+{
+    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
+    switch (rt->get_device()->get_api())
+    {
+    case reshade::api::device_api::d3d11: FeedFrame11(rt, cl, rtv); break;
+    case reshade::api::device_api::d3d12: FeedFrame12(rt, cl, rtv); break;
+    default: FeedDisable("only Direct3D 11 and 12 games are supported"); break;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ReShade events
 // ---------------------------------------------------------------------------
@@ -1220,6 +1615,12 @@ static void OnDestroyDevice(reshade::api::device *dev)
     if (g.dev11 != nullptr && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev11)
     {
         Log("[feed] D3D11 device destroyed; shutting the session down");
+        ShutdownSession();
+    }
+    else if (g.session_ready && !g.dev12_owned && g.dev12 != nullptr &&
+             reinterpret_cast<ID3D12Device *>(dev->get_native()) == g.dev12)
+    {
+        Log("[feed] the game's D3D12 device is being destroyed; shutting the session down");
         ShutdownSession();
     }
 }

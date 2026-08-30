@@ -557,7 +557,15 @@ static int Serve(DWORD game_pid)
             {
                 if (BeginCommands())
                 {
-                    h.list->CopyResource(h.tex[FEED_OUTPUT], h.tex[FEED_COLOR]);
+                    // Deliberately copy only the LEFT half: a split screen in the game is
+                    // unambiguous visual proof that the host's output reaches the screen.
+                    D3D12_TEXTURE_COPY_LOCATION src = {}, dst = {};
+                    src.pResource = h.tex[FEED_COLOR];
+                    src.Type      = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    dst.pResource = h.tex[FEED_OUTPUT];
+                    dst.Type      = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    D3D12_BOX box = { 0, 0, 0, h.width / 2, h.height, 1 };
+                    h.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
                     EndCommands();
                     done = true;
                 }

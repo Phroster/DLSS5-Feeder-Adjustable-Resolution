@@ -1,0 +1,6 @@
+* text=auto
+*.ps1 text eol=crlf
+*.cpp text eol=crlf
+*.fx text eol=crlf
+*.rc text eol=crlf
+*.addon64 binary

@@ -1,0 +1,12 @@
+build/
+artifacts/
+.vs/
+*.obj
+*.res
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.log
+*.zip
+test-fixture/

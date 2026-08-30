@@ -143,11 +143,12 @@ struct Cfg
     int   rebuild;         // any change of this number re-creates the feature once (manual trigger)
     int   log_frames;      // how many first frames get a full parameter dump in the log
     int   create_delay;    // frames to hold the FIRST feature create (the DLSS 5 add-on arms its NGX hooks asynchronously)
+    int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer)
     float mv_scale_x;      // multiplier applied to the motion vectors (the FX already outputs pixels)
     float mv_scale_y;
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 0, 1.0f, 1.0f };
 
 static void CfgPath(char *out)
 {
@@ -174,10 +175,12 @@ static void CfgWriteDefault()
             "rebuild=%d\n"
             "log_frames=%d\n"
             "create_delay=%d\n"
+            "preset=%d\n"
             "mv_scale_x=%.3f\n"
             "mv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -208,6 +211,7 @@ static bool CfgReload()
         else if (_stricmp(key, "rebuild")        == 0) next.rebuild        = iv;
         else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
         else if (_stricmp(key, "create_delay")   == 0) next.create_delay   = iv;
+        else if (_stricmp(key, "preset")         == 0) next.preset         = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
@@ -215,7 +219,8 @@ static bool CfgReload()
     if (next.mode < 0 || next.mode > 2) next.mode = g_cfg.mode;
 
     const bool rebuild = next.hdr != g_cfg.hdr || next.depth_inverted != g_cfg.depth_inverted ||
-                         next.flags != g_cfg.flags || next.rebuild != g_cfg.rebuild;
+                         next.flags != g_cfg.flags || next.rebuild != g_cfg.rebuild ||
+                         next.preset != g_cfg.preset;
     const bool changed = rebuild || memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
     if (!changed) return false;
     g_cfg = next;
@@ -783,6 +788,17 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
     cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
     cp.InFeatureCreateFlags       = flags;
     cp.InEnableOutputSubrects     = false;
+
+    // Render-preset hint: presets differ in how aggressively history is clamped, which is
+    // both a diagnostic and a partial mitigation for warping around transparents (dust,
+    // flames) whose optical-flow vectors drag the background along. K=11 transformer is
+    // the modern default; E=5/F=6 are the legacy CNN presets with stronger clamping.
+    if (g_cfg.preset > 0)
+    {
+        g.params->Set(NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, static_cast<unsigned int>(g_cfg.preset));
+        Log("[feed] DLSS render preset hint: %d (%s)", g_cfg.preset,
+            g_cfg.preset == 5 ? "E" : g_cfg.preset == 6 ? "F" : g_cfg.preset == 10 ? "J" : g_cfg.preset == 11 ? "K" : "?");
+    }
 
     if (!BeginCommands()) { Log("[feed] could not start a command list"); return false; }
     Breadcrumb("creating the DLSS feature");

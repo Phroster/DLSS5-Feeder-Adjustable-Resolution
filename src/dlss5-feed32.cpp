@@ -174,6 +174,11 @@ struct Feed32
     reshade::api::effect_technique         launchpad;
     reshade::api::effect_texture_variable  mv_var;
     reshade::api::effect_texture_variable  depth_var;
+
+    // in-game control of the host's DLSS 5 (renodx) settings, via shader uniforms
+    reshade::api::effect_uniform_variable  u_apply, u_uplift, u_intensity, u_style,
+                                           u_structure, u_tone, u_automask, u_uicorr;
+    bool host_nr_synced;
     bool depth_reversed;
     bool handles_ok;
     bool missing_reported;
@@ -360,6 +365,106 @@ static bool EnsureHost()
     { HostLost("handshake failed"); return false; }
     Log("[feed32] host connected (protocol v%u)", ack.version);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// The host's DLSS 5 settings, controlled from the game's own ReShade panel.
+// The renodx add-on reads [RenoDX.DLSS5] from the HOST's ReShade.ini at startup
+// (only its own panel can change them live), so applying = write that ini and
+// cycle the host. The game renders normally during the ~2 s gap.
+// ---------------------------------------------------------------------------
+
+struct HostNR
+{
+    int   uplift, intensity, style, automask, uicorr;
+    float structure_, tone;
+};
+
+static void HostIniPath(char *out)
+{
+    GetModuleFileNameA(g_self, out, MAX_PATH);
+    if (char *s = strrchr(out, '\\'))
+        strcpy_s(s + 1, MAX_PATH - (s + 1 - out), "host64\\ReShade.ini");
+}
+
+static void ReadHostNR(HostNR *v)
+{
+    char p[MAX_PATH], buf[64];
+    HostIniPath(p);
+    v->uplift    = GetPrivateProfileIntA("RenoDX.DLSS5", "NeuralUplift", 1, p);
+    v->intensity = GetPrivateProfileIntA("RenoDX.DLSS5", "NRIntensity", 2, p);
+    v->style     = GetPrivateProfileIntA("RenoDX.DLSS5", "NRStyle", 0, p);
+    v->automask  = GetPrivateProfileIntA("RenoDX.DLSS5", "NRAutoMask", 1, p);
+    v->uicorr    = GetPrivateProfileIntA("RenoDX.DLSS5", "NRUICorrection", 1, p);
+    GetPrivateProfileStringA("RenoDX.DLSS5", "NRLocalStructure", "0.99", buf, sizeof(buf), p);
+    v->structure_ = static_cast<float>(atof(buf));
+    GetPrivateProfileStringA("RenoDX.DLSS5", "NRLocalTone", "0.45", buf, sizeof(buf), p);
+    v->tone = static_cast<float>(atof(buf));
+}
+
+static void WriteHostNR(const HostNR &v)
+{
+    char p[MAX_PATH], buf[64];
+    HostIniPath(p);
+    sprintf_s(buf, "%d", v.uplift);        WritePrivateProfileStringA("RenoDX.DLSS5", "NeuralUplift", buf, p);
+    sprintf_s(buf, "%d", v.intensity);     WritePrivateProfileStringA("RenoDX.DLSS5", "NRIntensity", buf, p);
+    sprintf_s(buf, "%d", v.style);         WritePrivateProfileStringA("RenoDX.DLSS5", "NRStyle", buf, p);
+    sprintf_s(buf, "%d", v.automask);      WritePrivateProfileStringA("RenoDX.DLSS5", "NRAutoMask", buf, p);
+    sprintf_s(buf, "%d", v.uicorr);        WritePrivateProfileStringA("RenoDX.DLSS5", "NRUICorrection", buf, p);
+    sprintf_s(buf, "%.6f", v.structure_);  WritePrivateProfileStringA("RenoDX.DLSS5", "NRLocalStructure", buf, p);
+    sprintf_s(buf, "%.6f", v.tone);        WritePrivateProfileStringA("RenoDX.DLSS5", "NRLocalTone", buf, p);
+}
+
+// Push the host's active values into the shader sliders, so the panel shows the truth.
+static void SyncHostNRToShader(reshade::api::effect_runtime *rt)
+{
+    if (g.host_nr_synced || g.u_apply.handle == 0) return;
+    HostNR v;
+    ReadHostNR(&v);
+    const bool bf = false;
+    rt->set_uniform_value_bool(g.u_apply, &bf, 1);
+    bool b;
+    b = v.uplift   != 0; rt->set_uniform_value_bool(g.u_uplift, &b, 1);
+    b = v.automask != 0; rt->set_uniform_value_bool(g.u_automask, &b, 1);
+    b = v.uicorr   != 0; rt->set_uniform_value_bool(g.u_uicorr, &b, 1);
+    rt->set_uniform_value_int(g.u_intensity, &v.intensity, 1);
+    rt->set_uniform_value_int(g.u_style, &v.style, 1);
+    rt->set_uniform_value_float(g.u_structure, &v.structure_, 1);
+    rt->set_uniform_value_float(g.u_tone, &v.tone, 1);
+    g.host_nr_synced = true;
+    Log("[feed32] host DLSS 5 settings loaded into the panel: uplift=%d intensity=%d style=%d structure=%.2f tone=%.2f automask=%d uicorr=%d",
+        v.uplift, v.intensity, v.style, v.structure_, v.tone, v.automask, v.uicorr);
+}
+
+static void HostClose();   // below
+
+static void HostApplySettings(reshade::api::effect_runtime *rt)
+{
+    HostNR v = {};
+    bool b = false;
+    rt->get_uniform_value_bool(g.u_uplift, &b, 1);   v.uplift = b ? 1 : 0;
+    rt->get_uniform_value_bool(g.u_automask, &b, 1); v.automask = b ? 1 : 0;
+    rt->get_uniform_value_bool(g.u_uicorr, &b, 1);   v.uicorr = b ? 1 : 0;
+    rt->get_uniform_value_int(g.u_intensity, &v.intensity, 1);
+    rt->get_uniform_value_int(g.u_style, &v.style, 1);
+    rt->get_uniform_value_float(g.u_structure, &v.structure_, 1);
+    rt->get_uniform_value_float(g.u_tone, &v.tone, 1);
+
+    Log("[feed32] applying DLSS 5 host settings: uplift=%d intensity=%d style=%d structure=%.2f tone=%.2f automask=%d uicorr=%d",
+        v.uplift, v.intensity, v.style, v.structure_, v.tone, v.automask, v.uicorr);
+
+    // Order matters: the host's ReShade saves its ini ON EXIT and would clobber our
+    // values -- close the host first, write after, respawn on the next frame.
+    HostClose();
+    WriteHostNR(v);
+
+    SafeRelease(g.fence_in);    // the new host creates new fences; reopen from its BuildAck
+    SafeRelease(g.fence_out);
+    g.built = false;
+    g.disabled = false;
+    g.consecutive_fails = 0;
+    g_retry_at = 0;
+    Warn("DLSS 5 settings applied -- restarting the host (~2 s)");
 }
 
 // ---------------------------------------------------------------------------
@@ -618,6 +723,19 @@ static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *d
 
 static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
+    // The APPLY tick works even while the feed is disabled -- it is also the recovery path.
+    if (g.u_apply.handle != 0)
+    {
+        bool apply = false;
+        rt->get_uniform_value_bool(g.u_apply, &apply, 1);
+        if (apply)
+        {
+            const bool off = false;
+            rt->set_uniform_value_bool(g.u_apply, &off, 1);
+            HostApplySettings(rt);
+        }
+    }
+
     if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
 
     LARGE_INTEGER t0, t1;
@@ -747,6 +865,16 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     g.mv_var    = rt->find_texture_variable(kEffectFile, "DLSS5_MV");
     g.depth_var = rt->find_texture_variable(kEffectFile, "DLSS5_Depth");
     g.launchpad = rt->find_technique(kLaunchpadFile, kLaunchpadTech);
+
+    g.u_apply     = rt->find_uniform_variable(kEffectFile, "HOST_APPLY");
+    g.u_uplift    = rt->find_uniform_variable(kEffectFile, "HOST_NeuralUplift");
+    g.u_intensity = rt->find_uniform_variable(kEffectFile, "HOST_NRIntensity");
+    g.u_style     = rt->find_uniform_variable(kEffectFile, "HOST_NRStyle");
+    g.u_structure = rt->find_uniform_variable(kEffectFile, "HOST_NRLocalStructure");
+    g.u_tone      = rt->find_uniform_variable(kEffectFile, "HOST_NRLocalTone");
+    g.u_automask  = rt->find_uniform_variable(kEffectFile, "HOST_NRAutoMask");
+    g.u_uicorr    = rt->find_uniform_variable(kEffectFile, "HOST_NRUICorrection");
+    SyncHostNRToShader(rt);
 
     char v[16] = {};
     g.depth_reversed = true;

@@ -116,6 +116,59 @@ uniform int DEBUG_VIEW <
     ui_label = "Debug view (DLSS5_Feed_Debug technique)";
 > = 0;
 
+// --- DLSS 5 host settings (32-bit games) --------------------------------------------
+// On 32-bit games the DLSS 5 add-on runs in the helper process, so its tuning panel
+// lives in the helper's window. These mirror its persisted settings: the add-on reads
+// them here, writes them into host64\ReShade.ini and restarts the helper (~2 s without
+// DLSS; the game keeps rendering). The sliders are loaded FROM the helper's ini at
+// start, so they always show what is actually active. 64-bit games ignore this block.
+
+uniform bool HOST_APPLY <
+    ui_category = "DLSS 5 host settings (32-bit games)";
+    ui_label    = "APPLY to the DLSS 5 host";
+    ui_tooltip  = "Tick to write the settings below into host64\\ReShade.ini and restart the\n"
+                  "helper (~2 seconds without DLSS). The tick clears itself once applied.";
+> = false;
+
+uniform bool HOST_NeuralUplift <
+    ui_category = "DLSS 5 host settings (32-bit games)";
+    ui_label    = "Neural uplift";
+> = true;
+
+uniform int HOST_NRIntensity <
+    ui_category = "DLSS 5 host settings (32-bit games)";
+    ui_type = "slider"; ui_min = 0; ui_max = 5;
+    ui_label = "NR intensity";
+> = 2;
+
+uniform int HOST_NRStyle <
+    ui_category = "DLSS 5 host settings (32-bit games)";
+    ui_type = "slider"; ui_min = 0; ui_max = 3;
+    ui_label = "NR style";
+> = 0;
+
+uniform float HOST_NRLocalStructure <
+    ui_category = "DLSS 5 host settings (32-bit games)";
+    ui_type = "slider"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+    ui_label = "NR local structure";
+> = 0.99;
+
+uniform float HOST_NRLocalTone <
+    ui_category = "DLSS 5 host settings (32-bit games)";
+    ui_type = "slider"; ui_min = 0.0; ui_max = 1.0; ui_step = 0.01;
+    ui_label = "NR local tone";
+> = 0.45;
+
+uniform bool HOST_NRAutoMask <
+    ui_category = "DLSS 5 host settings (32-bit games)";
+    ui_label    = "NR auto mask";
+> = true;
+
+uniform bool HOST_NRUICorrection <
+    ui_category = "DLSS 5 host settings (32-bit games)";
+    ui_label    = "NR UI correction";
+> = true;
+
 texture DLSS5_MV    { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F; };
 texture DLSS5_Depth { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R32F;  };
 sampler sDLSS5_MV    { Texture = DLSS5_MV;    MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
@@ -186,6 +239,9 @@ float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
     float angle = atan2(mv.y, mv.x);
     float speed = length(mv);
     float3 rgb = saturate(3.0 * abs(2.0 * frac(angle / 6.283185 + float3(0.0, -1.0 / 3.0, 1.0 / 3.0)) - 1.0) - 1.0);
+    // keep the HOST_* uniforms alive (the effect compiler strips unreferenced uniforms)
+    rgb += 1e-30 * (float(HOST_APPLY) + float(HOST_NeuralUplift) + HOST_NRIntensity + HOST_NRStyle +
+                    HOST_NRLocalStructure + HOST_NRLocalTone + float(HOST_NRAutoMask) + float(HOST_NRUICorrection));
     return lerp(0.5, rgb, saturate(speed / 16.0)); // 16 px/frame saturates the colour
 }
 

@@ -1,3 +1,5 @@
+## ⚠️ Not compatible with Nvidia Smooth Motion / Optiscaler. Disable them to avoid issues.
+
 # DLSS5-Feeder
 
 **DLSS 5 neural rendering in games that ship without any DLSS — D3D11, D3D12, 32-bit, even DirectX 9.**

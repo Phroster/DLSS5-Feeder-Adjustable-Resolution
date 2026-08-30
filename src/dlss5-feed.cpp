@@ -539,8 +539,7 @@ static void ReleaseFrameResources()
         SafeReleaseFeature(g.feature);
         g.feature = nullptr;
     }
-    g.frame_ready  = false;
-    g.create_grace = 0;
+    g.frame_ready = false;
 }
 
 // One texture visible to both APIs: created on D3D12 and opened on D3D11, or the other
@@ -1269,16 +1268,18 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
     bool ok = g.session_ready || InitSession12(rt);
 
     // Same hook-arming grace as the D3D11 path: never call into NGX while the DLSS 5
-    // add-on may still be patching its vtable (that has crashed the process at EXEC 0x0).
-    if (ok && !g.frame_ready && g.feature == nullptr && g.create_grace < g_cfg.create_delay)
+    // add-on may still be patching its vtable (that has crashed the process at EXEC 0x0),
+    // and it re-patches after every runtime recreation.
+    const bool needs_build12 = !g.frame_ready || w != g.width || h != g.height || cd.Format != g.bb_fmt;
+    if (ok && needs_build12 && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
-            Log("[feed] holding the first feature create for %d frames (the DLSS 5 add-on arms its hooks asynchronously)",
+            Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously)",
                 g_cfg.create_delay);
         ok = false;
     }
 
-    if (ok && (!g.frame_ready || w != g.width || h != g.height || cd.Format != g.bb_fmt))
+    if (ok && needs_build12)
     {
         Log("[feed] building: %ux%u backbuffer %s (same-device D3D12, depth reversed=%d)", w, h,
             FormatName(cd.Format), g.depth_reversed ? 1 : 0);
@@ -1509,18 +1510,20 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
         }
     }
 
-    // The DLSS 5 add-on arms its NGX hooks asynchronously (~300 ms after NGX loads); calling
-    // into NGX while the vtable is being patched has crashed the process (EXEC at 0x0 on a
-    // worker thread, outside any SEH). Hold the first feature create until it settled.
-    if (ok && !g.frame_ready && g.feature == nullptr && g.create_grace < g_cfg.create_delay)
+    // The DLSS 5 add-on arms (and re-arms, on every runtime recreation) its NGX hooks
+    // asynchronously; calling into NGX while the vtable is being patched has crashed the
+    // process (EXEC at 0x0, sometimes fatally on a foreign thread). Hold EVERY build that
+    // follows a runtime (re-)init until that settled.
+    const bool needs_build11 = !g.frame_ready || cd.Width != g.width || cd.Height != g.height || cd.Format != g.bb_fmt;
+    if (ok && needs_build11 && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
-            Log("[feed] holding the first feature create for %d frames (the DLSS 5 add-on arms its hooks asynchronously)",
+            Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously)",
                 g_cfg.create_delay);
         ok = false;
     }
 
-    if (ok && (!g.frame_ready || cd.Width != g.width || cd.Height != g.height || cd.Format != g.bb_fmt))
+    if (ok && needs_build11)
     {
         Log("[feed] building: %ux%u backbuffer %s (mv %s, depth %s, depth reversed=%d)", cd.Width, cd.Height,
             FormatName(cd.Format), FormatName(md.Format), FormatName(dd.Format), g.depth_reversed ? 1 : 0);
@@ -1694,6 +1697,9 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
     // On the same-device D3D12 path its hooks live on the game's device and survive; the
     // feature must NOT be touched (re-creating a live one is where the add-on crashes).
     if (g.session_ready && g.dev12_owned) g.frame_ready = false;
+    // Either way the add-on may be re-patching its NGX hooks right now: hold any upcoming
+    // feature create for a fresh grace period.
+    g.create_grace = 0;
     static int inits = 0;
     if (++inits <= 8) Log("[feed] effect runtime %p initialised", (void *)rt);
     else if (inits == 9) Log("[feed] (further runtime init/destroy messages suppressed)");
@@ -1704,7 +1710,12 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
     if (rt != g.runtime) return;
     static int destroys = 0;
     if (++destroys <= 8) Log("[feed] effect runtime %p destroyed", (void *)rt);
-    ReleaseFrameResources();
+    // D3D11 path: the DLSS 5 add-on re-arms its hooks with the runtime, so the feature is
+    // rebuilt anyway. Same-device D3D12: feature and textures live on the GAME's device and
+    // survive runtime churn -- keep them. Every feature create near a hook re-arm has been
+    // a crash risk (EXEC 0x0 inside the add-on, sometimes fatal on a foreign thread), so
+    // the fewer creates, the better.
+    if (g.dev12_owned) ReleaseFrameResources();
     g.runtime = nullptr;
     g.technique = {}; g.launchpad = {}; g.mv_var = {}; g.depth_var = {};
     g.handles_ok = false;

@@ -29,10 +29,11 @@ moving geometry), and the HUD is processed along with the scene.
 It is not game-specific: any D3D11 or D3D12 game with a working ReShade depth buffer and LaunchPad
 motion vectors should work — 64-bit directly, 32-bit via a bundled 64-bit helper process (below).
 
-**Beta (v0.3.0):** 32-bit support is new and proven on one title so far —
-**Splinter Cell: Blacklist** (32-bit D3D11): full DLAA + neural rendering running at a locked 60 fps,
-confirmed by a deliberate split-screen test (see "How the 32-bit path works"). Expect rough edges
-outside that one game; report what you find.
+**Beta (v0.3.0):** 32-bit support is new, proven on **Splinter Cell: Blacklist** (60 fps at 3303×1858)
+and **BioShock Remastered** (47–58 fps at 4K with Luma HDR), both 32-bit D3D11 — full DLAA + neural
+rendering, verified end to end with a deliberate split-screen test (see
+["How the 32-bit path works"](#how-the-32-bit-path-works)). Resolution changes and alt-tabs are
+handled. Expect rough edges elsewhere; report what you find.
 
 ## Install (5 steps)
 
@@ -206,11 +207,14 @@ add-on — outputs `host\dlss5-feed-host64.exe`). `spike\build-spike.bat` builds
 * Exclusive-fullscreen swapchain churn can make some games reload effects repeatedly; windowed is
   smoother.
 * Depends on a closed-source, community-distributed DLSS 5 add-on and the NGX runtime; both can change.
-* **32-bit path is beta**, proven on one title (Splinter Cell: Blacklist) — see
+* **32-bit path is beta**, proven on two titles (Splinter Cell: Blacklist, BioShock Remastered) — see
   [`PLAN-32BIT.md`](PLAN-32BIT.md) for the full design and known risks. Cross-process adds a small
   amount of scheduling jitter versus the in-process 64-bit path (not measured as a problem so far).
-  32-bit **D3D9** games (e.g. BioShock Remastered) are explicitly out of scope for now — no shared
-  fences, more restricted shared-surface formats; would need a different transport.
+* A game whose **D3D9** calls are wrapped to D3D11 works fine — ReShade reports the D3D11 device and
+  that is all this project needs (BioShock Remastered is exactly this case). A game rendering on a
+  *real* D3D9 device does not: no shared fences and far more restricted shared-surface formats, so
+  it would need a different transport. Check `ReShade.log` for `Using feature level b100` (D3D11) to
+  tell the two apart.
 
 ## Credits
 

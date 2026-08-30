@@ -1,0 +1,209 @@
+// feed_vk_hook.h - make the Vulkan transport possible without any launcher.
+//
+// The transport (feed_vk.h) imports the feeder's D3D12 fences and textures into the
+// game's own VkDevice. That needs the KHR external-interop extensions plus the
+// timelineSemaphore feature, and Vulkan fixes both at vkCreateDevice. Games enable
+// only what they use, so most of them would leave the feed with no entry points.
+//
+// The add-on is loaded early enough to fix that itself: ReShade's Vulkan layer calls
+// reshade::load_addons() INSIDE its vkCreateInstance hook, before the game ever calls
+// vkCreateDevice. So on the create_device event (fired from that same place) we put an
+// inline hook on vulkan-1.dll's exported vkCreateDevice. The loader hands that very
+// export back for vkGetInstanceProcAddr(instance, "vkCreateDevice") too, so a direct
+// link, volk, or any other loading style all land here -- above every layer,
+// including ReShade's, which then simply passes the extended list down.
+//
+// In the hook: append the extensions the driver supports and the app did not ask
+// for, switch timelineSemaphore on if nothing in the chain does, call the original.
+// If the driver then refuses, retry with the app's untouched create info -- the
+// hook can never be the reason a game does not start.
+//
+// The hook MUST come out again on DLL unload (FeedVkHookRemove from DllMain):
+// ReShade refcounts add-on loading per instance, and a game that creates a probe
+// instance, destroys it, then creates the real one unloads and reloads this DLL in
+// between. A jmp left behind into unmapped memory would crash the next vkCreateDevice.
+//
+// layer/VkLayer_feed_vk.dll does the same job from outside the process and remains
+// the fallback for whatever loading style slips past this.
+
+#pragma once
+#include <MinHook.h>
+#include <vector>
+#include <string>
+
+static void Log(const char *fmt, ...);   // dlss5-feed.cpp
+
+static const char *kFeedVkWanted[] = {
+    VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+    VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+    VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
+    VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
+    VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,       // VkMemoryDedicatedAllocateInfo
+    VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,  // dependency of the above
+    VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,         // core in 1.2, still advertised by drivers
+};
+
+static PFN_vkCreateDevice g_vk_create_device_orig;   // MinHook trampoline to the loader's export
+static void              *g_vk_create_device_target;  // the export itself (hook target)
+static int                g_vk_hook_devices;          // how many vkCreateDevice calls we have seen
+
+static VKAPI_ATTR VkResult VKAPI_CALL FeedVkHookCreateDevice(VkPhysicalDevice physicalDevice,
+                                                             const VkDeviceCreateInfo *pCreateInfo,
+                                                             const VkAllocationCallbacks *pAllocator,
+                                                             VkDevice *pDevice)
+{
+    ++g_vk_hook_devices;
+    if (pCreateInfo == nullptr) return g_vk_create_device_orig(physicalDevice, pCreateInfo, pAllocator, pDevice);
+
+    // What does the driver actually offer? The enumerate entry point is a plain
+    // vulkan-1.dll export; no GIPA needed.
+    std::vector<std::string> supported;
+    if (HMODULE lib = GetModuleHandleW(L"vulkan-1.dll"))
+    {
+        if (const auto enumerate = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+                GetProcAddress(lib, "vkEnumerateDeviceExtensionProperties")))
+        {
+            uint32_t n = 0;
+            if (enumerate(physicalDevice, nullptr, &n, nullptr) == VK_SUCCESS && n > 0)
+            {
+                std::vector<VkExtensionProperties> props(n);
+                if (enumerate(physicalDevice, nullptr, &n, props.data()) == VK_SUCCESS)
+                    for (const auto &p : props) supported.emplace_back(p.extensionName);
+            }
+        }
+    }
+    const bool know_supported = !supported.empty();
+    if (!know_supported)
+        Log("[feed] vkCreateDevice hook: could not enumerate device extensions; assuming the Win32 "
+            "external-interop extensions are supported (they are, on every Windows driver)");
+
+    // Start from what the app asked for, append what is missing. "Did the app ask for
+    // this?" is answered against the ORIGINAL list, never against the vector we are
+    // appending to -- otherwise the logging pass below sees our own additions and
+    // reports every one of them as having come from the app.
+    std::vector<const char *> exts(pCreateInfo->ppEnabledExtensionNames,
+                                   pCreateInfo->ppEnabledExtensionNames + pCreateInfo->enabledExtensionCount);
+    auto already = [&](const char *name) {
+        for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i)
+            if (strcmp(pCreateInfo->ppEnabledExtensionNames[i], name) == 0) return true;
+        return false;
+    };
+    auto driver_has = [&](const char *name) {
+        if (!know_supported) return true;
+        for (const auto &s : supported) if (s == name) return true;
+        return false;
+    };
+
+    int added = 0;
+    for (const char *want : kFeedVkWanted)
+        if (!already(want) && driver_has(want)) { exts.push_back(want); ++added; }
+
+    // timelineSemaphore is a FEATURE as well: importing a D3D12 fence yields a timeline
+    // semaphore, so it has to be on. If the app chains a struct that covers it, fine. If
+    // it chains VkPhysicalDeviceVulkan12Features with the bit off, flip that bit in place
+    // (a second timeline struct next to Vulkan12Features is not allowed). Otherwise chain
+    // our own (stack lifetime is fine -- the call below is synchronous).
+    VkDeviceCreateInfo ci = *pCreateInfo;
+    VkPhysicalDeviceTimelineSemaphoreFeatures tl = { VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES };
+    const char *timeline_how = "enabled by the add-on";
+    bool have_timeline_feature = false;
+    for (const auto *s = static_cast<const VkBaseInStructure *>(pCreateInfo->pNext); s != nullptr; s = s->pNext)
+    {
+        if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES)
+        {
+            auto *f = const_cast<VkPhysicalDeviceTimelineSemaphoreFeatures *>(
+                reinterpret_cast<const VkPhysicalDeviceTimelineSemaphoreFeatures *>(s));
+            timeline_how = f->timelineSemaphore ? "already enabled by the app" : "switched on in the app's features struct";
+            f->timelineSemaphore = VK_TRUE;
+            have_timeline_feature = true;
+        }
+        else if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+        {
+            auto *f = const_cast<VkPhysicalDeviceVulkan12Features *>(
+                reinterpret_cast<const VkPhysicalDeviceVulkan12Features *>(s));
+            timeline_how = f->timelineSemaphore ? "already enabled by the app" : "switched on in the app's Vulkan 1.2 features";
+            f->timelineSemaphore = VK_TRUE;
+            have_timeline_feature = true;
+        }
+    }
+    if (!have_timeline_feature)
+    {
+        tl.timelineSemaphore = VK_TRUE;
+        tl.pNext = const_cast<void *>(ci.pNext);
+        ci.pNext = &tl;
+    }
+
+    ci.enabledExtensionCount   = static_cast<uint32_t>(exts.size());
+    ci.ppEnabledExtensionNames = exts.data();
+
+    Log("[feed] vkCreateDevice #%d: app asked for %u extension(s), added %d, timelineSemaphore %s",
+        g_vk_hook_devices, pCreateInfo->enabledExtensionCount, added, timeline_how);
+    for (const char *want : kFeedVkWanted)
+        Log("[feed]   %-40s %s", want,
+            already(want) ? "(app)" : driver_has(want) ? "ADDED" : "unsupported by driver");
+
+    VkResult r = g_vk_create_device_orig(physicalDevice, &ci, pAllocator, pDevice);
+    if (r != VK_SUCCESS && (added > 0 || !have_timeline_feature))
+    {
+        // A driver that advertised an extension but refuses it is not worth arguing
+        // with: retry untouched so the hook can never stop a game from starting.
+        Log("[feed] vkCreateDevice failed (%d) with the added extensions; retrying with the app's original create info", r);
+        r = g_vk_create_device_orig(physicalDevice, pCreateInfo, pAllocator, pDevice);
+    }
+    Log("[feed] vkCreateDevice -> %d", r);
+    return r;
+}
+
+// Install from the create_device event (api == vulkan), i.e. from inside ReShade's
+// vkCreateInstance hook: vulkan-1.dll is loaded, no device exists yet. Idempotent.
+static bool FeedVkHookInstall()
+{
+    if (g_vk_create_device_target != nullptr) return true;
+
+    HMODULE lib = GetModuleHandleW(L"vulkan-1.dll");
+    if (lib == nullptr)
+    {
+        Log("[feed] vkCreateDevice hook: vulkan-1.dll is not loaded in this process (?)");
+        return false;
+    }
+    void *target = GetProcAddress(lib, "vkCreateDevice");
+    if (target == nullptr)
+    {
+        Log("[feed] vkCreateDevice hook: vulkan-1.dll exports no vkCreateDevice (?)");
+        return false;
+    }
+
+    MH_STATUS s = MH_Initialize();
+    if (s != MH_OK && s != MH_ERROR_ALREADY_INITIALIZED)
+    {
+        Log("[feed] vkCreateDevice hook: MH_Initialize -> %s", MH_StatusToString(s));
+        return false;
+    }
+    s = MH_CreateHook(target, reinterpret_cast<void *>(&FeedVkHookCreateDevice),
+                      reinterpret_cast<void **>(&g_vk_create_device_orig));
+    if (s == MH_OK) s = MH_EnableHook(target);
+    if (s != MH_OK)
+    {
+        Log("[feed] vkCreateDevice hook: could not hook vulkan-1!vkCreateDevice (%s); "
+            "fall back to layer\\run-with-feed-layer.bat if the interop entry points turn out missing",
+            MH_StatusToString(s));
+        MH_RemoveHook(target);
+        return false;
+    }
+    g_vk_create_device_target = target;
+    Log("[feed] vkCreateDevice hook installed on vulkan-1!vkCreateDevice (%p): the KHR external-interop "
+        "extensions will be appended to every device this game creates", target);
+    return true;
+}
+
+// From DllMain(DLL_PROCESS_DETACH). See the header comment for why this is mandatory.
+static void FeedVkHookRemove()
+{
+    if (g_vk_create_device_target == nullptr) return;
+    MH_DisableHook(g_vk_create_device_target);
+    MH_RemoveHook(g_vk_create_device_target);
+    MH_Uninitialize();
+    g_vk_create_device_target = nullptr;
+    g_vk_create_device_orig   = nullptr;
+    Log("[feed] vkCreateDevice hook removed");
+}

@@ -178,16 +178,23 @@ Same pieces as a 64-bit game — with two differences.
    [64-bit instructions](#install-for-a-64-bit-game). The DLSS evaluate runs on a private D3D12
    device (see [The Vulkan path](#the-vulkan-path)); nothing extra is needed for that.
 
-**If `dlss5-feed.log` says the Vulkan interop entry points are missing**, the game did not enable the
-KHR external-interop extensions at `vkCreateDevice` and nothing in-process can add them afterwards.
-Launch it through the bundled layer instead:
+The transport needs the KHR external-interop extensions on the game's `VkDevice`, and most games do
+not enable them. **The add-on takes care of that by itself**: ReShade loads add-ons from inside its
+`vkCreateInstance` hook, i.e. before the game creates its device, so the add-on hooks
+`vkCreateDevice` and appends whichever of those extensions the driver supports (plus the
+`timelineSemaphore` feature). `dlss5-feed.log` lists, per extension, whether the game already had
+it, the add-on added it, or the driver lacks it. If the driver refuses the extended list, the call
+is retried untouched — the hook can never stop a game from starting.
+
+**Only if `dlss5-feed.log` still says the interop entry points are missing** (the log says why:
+hook not installed, or installed but never reached — a game that creates its device some way the
+hook does not intercept), launch through the bundled out-of-process layer instead:
 
 ```
 layer\run-with-feed-layer.bat "E:\path\to\game.exe"
 ```
 
-That is the whole fix — see [`layer/README.md`](layer/README.md). DOOM (2016) does *not* need it
-(ReShade already enables the extensions there); games like Tekken 3 Recomp do.
+See [`layer/README.md`](layer/README.md). It does the same job from outside the process.
 
 ## How it works
 
@@ -260,15 +267,21 @@ shared memory rather than being copied out to system RAM:
   raw `vkCmdCopyImage`/`vkCmdBlitImage` move pixels into and out of our imported images, which sit
   permanently in `VK_IMAGE_LAYOUT_GENERAL`.
 
-The one thing that cannot be done from inside the process is enabling the interop extensions — those
-are fixed at `vkCreateDevice`. That is what
-[`layer/VkLayer_feed_vk.dll`](layer/README.md) exists for.
+The interop extensions are fixed at `vkCreateDevice`, and games rarely enable them (ReShade adds
+`external_memory_win32` and `timeline_semaphore` itself, but not the semaphore/dedicated-allocation
+ones). The add-on is already in the process by then — ReShade's Vulkan layer loads add-ons inside
+its `vkCreateInstance` hook and fires `create_device` from there — so on that event it puts an
+inline hook (MinHook) on `vulkan-1.dll`'s exported `vkCreateDevice` (`src/feed_vk_hook.h`). The
+loader returns that same export for `vkGetInstanceProcAddr(instance, "vkCreateDevice")`, so every
+loading style lands in the hook, above ReShade's own layer, which then passes the extended list
+down. The hook is removed on DLL unload, since ReShade reloads add-ons per Vulkan instance.
+[`layer/VkLayer_feed_vk.dll`](layer/README.md) does the same from outside the process, as a fallback.
 
 ## Requirements
 
 | Piece | Notes |
 | --- | --- |
-| D3D11, D3D12 or Vulkan game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan may need [a small bundled layer](#install-for-a-vulkan-game). D3D10 is not supported. |
+| D3D11, D3D12 or Vulkan game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan works out of the box (the add-on adds the interop extensions itself; [a small bundled layer](#install-for-a-vulkan-game) is the fallback). D3D10 is not supported. |
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
 | DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | from its own author; this project does not include it. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
@@ -335,24 +348,28 @@ Common cases:
   (a 64-bit `dxgi.dll` cannot load into a 32-bit game, and vice versa).
 * **"ran out of video memory" with dgVoodoo** — raise `VRAM` in `dgVoodoo.conf`; the default 256 MB
   is a virtual limit unrelated to your real GPU.
-* **Vulkan game: "the Vulkan interop entry points are missing"** — that game did not enable the KHR
-  external-interop extensions at `vkCreateDevice`. Launch it via `layer\run-with-feed-layer.bat`
-  (see [`layer/README.md`](layer/README.md)); `feed-vk-layer.log` next to the DLL shows what it added.
+* **Vulkan game: "the Vulkan interop entry points are missing"** — the add-on's `vkCreateDevice`
+  hook did not get to add the KHR external-interop extensions; the lines right above it in
+  `dlss5-feed.log` say whether the hook was not installed, never reached, or what the driver
+  refused. Fallback: launch via `layer\run-with-feed-layer.bat` (see
+  [`layer/README.md`](layer/README.md)); `feed-vk-layer.log` next to the DLL shows what it added.
 * **DLSS 5 panel stuck in STANDBY** — the add-on missed the first create; the built-in warm-up
   re-creates the feature a few seconds in, which normally clears it.
 
 ## Building
 
 MSVC (v143/v145) + Windows SDK. Dependencies not vendored: the **NGX SDK** (see
-[`external/ngx/README.md`](external/ngx/README.md)); the ReShade add-on headers *are* included under
-`external/reshade/include` (BSD-3-Clause, Patrick Mours).
+[`external/ngx/README.md`](external/ngx/README.md)) and the **Vulkan headers** (see
+[`external/vulkan/README.md`](external/vulkan/README.md)); the ReShade add-on headers *are* included
+under `external/reshade/include` (BSD-3-Clause, Patrick Mours), as is **MinHook** under
+`external/minhook` (BSD-2-Clause, Tsuda Kageyu) for the `vkCreateDevice` hook.
 
 | Script | Output | Needs |
 | --- | --- | --- |
 | `build.bat` | `build\dlss5-feed.addon64` | NGX SDK |
 | `build-addon32.bat` | `build\dlss5-feed.addon32` | ReShade headers only |
 | `host\build-host.bat` | `host\dlss5-feed-host64.exe` | NGX SDK |
-| `layer\build-layer.bat` | `layer\VkLayer_feed_vk.dll` (only needed by Vulkan games that lack the interop extensions) | Vulkan headers |
+| `layer\build-layer.bat` | `layer\VkLayer_feed_vk.dll` (fallback for Vulkan games where the add-on's own `vkCreateDevice` hook cannot add the interop extensions) | Vulkan headers |
 | `spike\build-spike.bat` | the standalone 32↔64-bit shared-resource proof used during development | — |
 
 NGX links against the Release CRT, so the builds use `/MD`.

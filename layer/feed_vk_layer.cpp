@@ -165,7 +165,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL FeedCreateDevice(VkPhysicalDevice physical
     std::vector<const char *> exts(pCreateInfo->ppEnabledExtensionNames,
                                    pCreateInfo->ppEnabledExtensionNames + pCreateInfo->enabledExtensionCount);
     auto already = [&](const char *name) {
-        for (const char *e : exts) if (strcmp(e, name) == 0) return true;
+        // Answered against the ORIGINAL list, never against the vector we append to --
+        // otherwise the logging pass below sees our own additions and reports every one
+        // of them as having come from the app.
+        for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i)
+            if (strcmp(pCreateInfo->ppEnabledExtensionNames[i], name) == 0) return true;
         return false;
     };
     auto driver_has = [&](const char *name) {

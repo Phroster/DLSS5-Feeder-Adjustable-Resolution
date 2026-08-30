@@ -44,8 +44,9 @@
 #include <nvsdk_ngx_helpers.h>
 
 #include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
+#include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 
-#define FEED_VERSION "0.5.1"
+#define FEED_VERSION "0.5.2"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -1396,14 +1397,22 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
     // api::fence handle IS a VkSemaphore -- so queue signal/wait stay inside its locks.
     if (!FeedVkLoad(&g.vk, reinterpret_cast<VkDevice>(g.rs_dev->get_native())))
     {
-        // The game did not enable the KHR external-interop extensions at vkCreateDevice,
-        // so the entry points do not resolve and nothing in-process can fix it. That is
-        // exactly what layer\VkLayer_feed_vk.dll is for.
-        Log("[feed] the Vulkan external-memory/semaphore entry points are missing: this game did not enable");
-        Log("[feed] the KHR external-interop extensions at vkCreateDevice, and they cannot be added afterwards.");
-        Log("[feed] FIX: launch the game through layer\run-with-feed-layer.bat (VK_LAYER_feed_vk appends them).");
+        // The KHR external-interop extensions were not enabled at vkCreateDevice. Our
+        // vkCreateDevice hook (feed_vk_hook.h) normally appends them; if it never saw
+        // this device -- the game resolved vkCreateDevice some way the hook does not
+        // cover, or the hook could not be installed -- the out-of-process layer is the
+        // fallback.
+        Log("[feed] the Vulkan external-memory/semaphore entry points are missing: the KHR external-interop");
+        Log("[feed] extensions were not enabled on this device at vkCreateDevice.");
+        if (g_vk_create_device_target == nullptr)
+            Log("[feed] The add-on's vkCreateDevice hook was NOT installed (see the hook lines above).");
+        else if (g_vk_hook_devices == 0)
+            Log("[feed] The add-on's vkCreateDevice hook was installed but never called: this game creates its device some way it does not intercept.");
+        else
+            Log("[feed] The hook did run (%d vkCreateDevice call(s)); check its per-extension lines above for what the driver refused.", g_vk_hook_devices);
+        Log("[feed] FALLBACK: launch the game through layer\\run-with-feed-layer.bat (VK_LAYER_feed_vk appends them from outside).");
         ShutdownSession();
-        FeedDisable("this game needs VK_LAYER_feed_vk -- see dlss5-feed.log");
+        FeedDisable("the Vulkan interop extensions are missing on this device -- see dlss5-feed.log");
         return false;
     }
     g.vk_sem_in  = FeedVkImportFence(&g.vk, g.fence_in_handle);
@@ -2511,6 +2520,16 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
 // ---------------------------------------------------------------------------
 
+// Fired by ReShade before the device (for Vulkan: from inside its vkCreateInstance
+// hook, i.e. before the game's vkCreateDevice). That is the one moment the interop
+// extensions can still be added from in-process -- see feed_vk_hook.h.
+static bool OnCreateDevice(reshade::api::device_api api, uint32_t & /*api_version*/)
+{
+    if (api == reshade::api::device_api::vulkan)
+        FeedVkHookInstall();
+    return false;   // never change the requested API version
+}
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
@@ -2536,6 +2555,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         CfgReload();
         DetectRenodxAddon();
 
+        reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
@@ -2546,11 +2566,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     else if (reason == DLL_PROCESS_DETACH)
     {
         reshade::unregister_overlay(nullptr, DrawOverlay);
+        reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        FeedVkHookRemove();   // before this code is unmapped -- ReShade reloads add-ons per Vulkan instance
         g_ngx_dying = true;   // process is exiting: never call back into NGX
         ShutdownSession();
         reshade::unregister_addon(module);

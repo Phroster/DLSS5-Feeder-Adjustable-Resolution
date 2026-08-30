@@ -1,26 +1,30 @@
 # VK_LAYER_feed_vk
 
 A ~19 KB Vulkan layer whose only job is to make DLSS5-Feeder's Vulkan transport
-possible in games that would otherwise block it.
+possible in games that would otherwise block it. **Since v0.5.2 it is a fallback**:
+the add-on does the same thing from inside the process (`src/feed_vk_hook.h`) and
+needs no launcher.
 
 ## Why it exists
 
 The transport imports the feeder's D3D12 fences and textures into the game's own
 `VkDevice`. That needs four KHR external-interop extensions plus the
 `timelineSemaphore` feature — and Vulkan requires all of them to be enabled at
-**`vkCreateDevice`**, long before a ReShade add-on gets to see the device. Games
-enable only what they need:
+**`vkCreateDevice`**. Games enable only what they need:
 
 | Game | Situation |
 | --- | --- |
-| DOOM (2016) | all present (ReShade enables them) — layer **not** needed |
-| Tekken 3 Recomp | only `timeline_semaphore` + `external_memory_win32` — feed fails without the layer |
+| DOOM (2016) | all present — nothing to add |
+| Tekken 3 Recomp | only `timeline_semaphore` + `external_memory_win32` (both added by ReShade itself) — the rest has to be appended |
 
-Nothing in-process can fix this after the fact, and the game is closed-source.
-A layer is the only place the extension list can still be changed.
+The add-on normally appends them itself: ReShade loads add-ons inside its
+`vkCreateInstance` hook, before the game's `vkCreateDevice`, and the add-on hooks
+that export. This layer does the identical job from outside the process, for the
+case where that hook cannot run (it was not installed, or the game creates its
+device some way the hook does not intercept — `dlss5-feed.log` says which).
 
-**You only need this if `dlss5-feed.log` says the entry points are missing** —
-it names this layer as the fix.
+**You only need this if `dlss5-feed.log` still says the entry points are missing** —
+it names this layer as the fallback.
 
 ## Use
 

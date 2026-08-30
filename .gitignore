@@ -18,3 +18,13 @@ spike/*.exe
 spike/*.obj
 spike/*.log
 spike/*.err
+host/*.exe
+host/*.obj
+host/*.log
+host/*.err
+host/dxgi.dll
+host/*.addon64
+host/nvngx_*.dll
+host/reshade.ini
+host/ReShade.ini
+host/ReShadePreset.ini

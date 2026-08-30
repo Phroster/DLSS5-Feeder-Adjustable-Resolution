@@ -476,6 +476,34 @@ static NVSDK_NGX_Result SafeEvaluateDLSS(NVSDK_NGX_D3D12_DLSS_Eval_Params *ep, D
     __except (EXCEPTION_EXECUTE_HANDLER) { *code = GetExceptionCode(); return static_cast<NVSDK_NGX_Result>(0x7FFFFFFF); }
 }
 
+static void CloseListGuarded()
+{
+    __try { g.list->Close(); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+// NGX crashed while recording into our list: it may hold half-written commands, and
+// executing those is what actually takes the game down (the driver faults later on
+// another thread). Close it guarded, throw it away WITHOUT executing, replace it.
+static void AbortCommands()
+{
+    if (g.list == nullptr) return;
+    CloseListGuarded();
+    SafeRelease(g.list);
+    if (g.alloc[g.frame_slot] != nullptr && g.dev12 != nullptr &&
+        SUCCEEDED(g.dev12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.alloc[g.frame_slot], nullptr,
+                                             __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g.list))))
+        g.list->Close();
+    else
+        Log("[feed] could not replace the aborted command list");
+}
+
+static void SafeReleaseFeature(NVSDK_NGX_Handle *f)
+{
+    if (f == nullptr) return;
+    __try { NVSDK_NGX_D3D12_ReleaseFeature(f); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { Log("[feed] ReleaseFeature raised exception 0x%08X (ignored)", GetExceptionCode()); }
+}
+
 static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to)
 {
     D3D12_RESOURCE_BARRIER b = {};
@@ -504,7 +532,7 @@ static void ReleaseFrameResources()
     if (g.feature != nullptr)
     {
         Breadcrumb("releasing the DLSS feature");
-        NVSDK_NGX_D3D12_ReleaseFeature(g.feature);
+        SafeReleaseFeature(g.feature);
         g.feature = nullptr;
     }
     g.frame_ready = false;
@@ -617,10 +645,39 @@ static bool MakeBlitShaders()
     return true;
 }
 
-static bool CreateDlssFeature(UINT w, UINT h, bool inverted);
+static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed);
+
+// A same-size rebuild (warm-up, runtime recreation, cfg knob) only needs a fresh feature:
+// the textures stay put, the new feature is created FIRST, and if that fails or crashes
+// the old feature keeps working -- a flaky re-create can no longer take the feed down.
+// (The DLSS 5 add-on has crashed twice inside a release-then-recreate; never again.)
+static bool RecreateFeatureOnly(UINT w, UINT h)
+{
+    const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+    g.hdr = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+
+    NVSDK_NGX_Handle *old = g.feature;
+    g.feature = nullptr;
+    bool crashed = false;
+    if (CreateDlssFeature(w, h, inverted, &crashed))
+    {
+        DrainGpu();  // the old feature's last evaluate may still be in flight
+        SafeReleaseFeature(old);
+        return true;
+    }
+    g.feature     = old;   // keep what worked
+    g.warmup_done = true;  // and stop asking
+    g.frame_ready = true;
+    Log("[feed] feature re-create %s; keeping the previous feature", crashed ? "crashed (caught)" : "failed");
+    return true;
+}
 
 static bool BuildResources(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
+    if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        return RecreateFeatureOnly(w, h);
+
     Breadcrumb("building shared textures");
     ReleaseFrameResources();
 
@@ -662,13 +719,20 @@ static bool BuildResources(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
-    return CreateDlssFeature(w, h, inverted);
+    bool crashed = false;
+    if (!CreateDlssFeature(w, h, inverted, &crashed))
+    {
+        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
+        return false;
+    }
+    return true;
 }
 
 // The DLSS contract, shared by the D3D11 and D3D12 paths. DLAA: render size == output
 // size, no jitter, MVs at render size. The DLSS 5 add-on captures this create inline.
-static bool CreateDlssFeature(UINT w, UINT h, bool inverted)
+static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
 {
+    if (crashed != nullptr) *crashed = false;
     int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     if (inverted) flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     if (g.hdr)    flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
@@ -688,13 +752,14 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted)
     Breadcrumb("creating the DLSS feature");
     DWORD ccode = 0;
     NVSDK_NGX_Result rf = SafeCreateDLSS(&cp, &ccode);
-    const UINT64 v = EndCommands();
     if (ccode != 0)
     {
-        Log("[feed] CreateFeature raised exception 0x%08X -- disabling to protect the game", ccode);
-        FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
+        AbortCommands();  // half-recorded NGX work must never reach the GPU
+        Log("[feed] CreateFeature raised exception 0x%08X (caught; nothing was submitted)", ccode);
+        if (crashed != nullptr) *crashed = true;
         return false;
     }
+    const UINT64 v = EndCommands();
     if (g.fence12->GetCompletedValue() < v)
     {
         g.fence12->SetEventOnCompletion(v, g.fence_event);
@@ -985,6 +1050,10 @@ static bool MakeTex12(int i, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, D3D12_RE
 
 static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
+    if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        return RecreateFeatureOnly(w, h);
+
     Breadcrumb("building same-device textures");
     ReleaseFrameResources();
 
@@ -1020,7 +1089,13 @@ static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
-    return CreateDlssFeature(w, h, inverted);
+    bool crashed = false;
+    if (!CreateDlssFeature(w, h, inverted, &crashed))
+    {
+        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
+        return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1271,11 +1346,14 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 Breadcrumb("running the same-device evaluate");
                 DWORD ecode = 0;
                 NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
-                EndCommands();
+                if (ecode != 0)
+                    AbortCommands();  // never execute a list NGX crashed while recording
+                else
+                    EndCommands();
 
                 if (ecode != 0)
                 {
-                    Log("[feed] evaluate raised exception 0x%08X -- disabling to protect the game", ecode);
+                    Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
                     FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
                     g.frame_ready = false;
                 }
@@ -1309,14 +1387,9 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                     if (n <= static_cast<UINT64>(g_cfg.log_frames) || (n % 1800) == 0)
                         Log("[feed] frame %llu delivered (%ux%u, reset=%d, same-device)", n, g.width, g.height, reset);
 
-                    // The DLSS 5 add-on sometimes latches STANDBY/FAILED on the very first create
-                    // and only recovers on a fresh one; re-create once after the pipeline settled.
-                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
-                    {
-                        g.warmup_done = true;
-                        g.frame_ready = false;
-                        Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu)", n);
-                    }
+                    // No warm-up rebuild on the same-device path: the DLSS 5 add-on watches the
+                    // game's device from the first frame (its native scenario), and re-creating a
+                    // live feature is exactly where it has crashed. The cfg `rebuild` knob remains.
                 }
             }
 
@@ -1475,20 +1548,23 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 DWORD ecode = 0;
                 NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
 
+                if (ecode != 0)
+                {
+                    AbortCommands();  // never execute a list NGX crashed while recording
+                    Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
+                    FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
+                    g.frame_ready = false;
+                    ok = false;
+                }
+                else
+                {
                 Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
                 const UINT64 v_out = EndCommands();
 
-                if (ecode != 0)
-                {
-                    Log("[feed] evaluate raised exception 0x%08X -- disabling to protect the game", ecode);
-                    FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
-                    g.frame_ready = false;
-                    ok = false;
-                }
-                else if (NVSDK_NGX_FAILED(re))
+                if (NVSDK_NGX_FAILED(re))
                 {
                     Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
                     FeedFail("evaluate");
@@ -1513,6 +1589,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                         g.frame_ready = false;
                         Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu)", n);
                     }
+                }
                 }
             }
         }
@@ -1579,8 +1656,11 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
     g.runtime = rt;
     ResolveHandles(rt);
-    // A recreated runtime means the DLSS 5 add-on has re-armed its hooks: give it a fresh feature.
-    if (g.session_ready) g.frame_ready = false;
+    // A recreated runtime means the DLSS 5 add-on has re-armed its hooks on our private
+    // device: give it a fresh feature (a cheap feature-only re-create -- the textures stay).
+    // On the same-device D3D12 path its hooks live on the game's device and survive; the
+    // feature must NOT be touched (re-creating a live one is where the add-on crashes).
+    if (g.session_ready && g.dev12_owned) g.frame_ready = false;
     static int inits = 0;
     if (++inits <= 8) Log("[feed] effect runtime %p initialised", (void *)rt);
     else if (inits == 9) Log("[feed] (further runtime init/destroy messages suppressed)");

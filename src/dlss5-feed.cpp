@@ -47,7 +47,7 @@
 #include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 
-#define FEED_VERSION "0.6.0-beta.1"
+#define FEED_VERSION "0.6.0-beta.2"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -364,6 +364,12 @@ static const int   kMvModeCount  = static_cast<int>(sizeof(kMvModeName) / sizeof
 static char g_mv_status[192]  = "not checked yet";
 static char g_mv_problem[640] = "";
 
+// 16-bit float colour round trip (the shader's DLSS5_COLOR_16F): 0 off, 1 as displayed,
+// 2 linearised (flagged HDR to DLSS). Status for the overlay/log.
+static const char *kColor16Name[] = { "off (8-bit backbuffer round trip)", "16-bit float, as displayed", "16-bit float, linearised (HDR contract)" };
+static char g_color_status[192]  = "";
+static char g_color_problem[512] = "";
+
 // ReShade keeps a technique of an effect that FAILED to compile in its list, and it can even
 // be "enabled" -- it just never runs. ReshadeMotionEstimation on ReShade 6.8 is the textbook
 // case ("cannot sample from texture that is also used as render target"): the feed then gets
@@ -412,6 +418,16 @@ static bool ProviderCompileError(const char *file, char *out, size_t out_size)
     return failed;
 }
 
+static int ReadColor16Mode(reshade::api::effect_runtime *rt)
+{
+    char v[16] = {};
+    int mode = 0;
+    if (rt->get_preprocessor_definition_for_effect(kEffectFile, "DLSS5_COLOR_16F", v) ||
+        rt->get_preprocessor_definition("DLSS5_COLOR_16F", v))
+        mode = atoi(v);
+    return (mode < 0 || mode > 2) ? 0 : mode;
+}
+
 // The DLSS5_MV_PROVIDER value DLSS5_Feed.fx is compiled with: the effect's own
 // definition first, then the global list, else the shader's default of 0.
 static int ReadMvProviderMode(reshade::api::effect_runtime *rt)
@@ -434,6 +450,18 @@ struct Feed
     reshade::api::effect_texture_variable  depth_var;
     reshade::api::effect_texture_variable  mask_var;      // DLSS5_Mask; handle 0 with an older shader
     bool                                   mask_ok;       // this frame: DLSS5_Mask present, right size/format, copied
+    // 16-bit colour round trip (DLSS5_COLOR_16F): the shader's RGBA16F copy of the frame goes to
+    // DLSS, DLSS's RGBA16F result goes into DLSS5_Output, and the DLSS5_Output technique writes
+    // it to the screen (dithered). The backbuffer is never touched by the add-on in that mode.
+    reshade::api::effect_texture_variable  color_var;     // DLSS5_Color
+    reshade::api::effect_texture_variable  output_var;    // DLSS5_Output
+    reshade::api::effect_technique         output_tech;   // technique DLSS5_Output
+    reshade::api::effect_uniform_variable  output_active; // uniform OUTPUT_ACTIVE (gates the output technique)
+    int                                    color16_mode;  // 0 off, 1 as displayed, 2 linearised
+    bool                                   color16_ok;    // this frame: both textures present, right size/format
+    bool                                   color16_built; // the current resources/feature were built for color16_ok
+    bool                                   feed_delivered;// a frame reached DLSS5_Output since the output technique last ran
+    bool                                   output_order_bad; // the output technique rendered BEFORE the feed this frame
     bool                                   depth_reversed;
     bool                                   handles_ok;
     bool                                   missing_reported;
@@ -985,6 +1013,55 @@ static bool MakeBlitShaders()
 
 static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed);
 
+// HDR flag for the feature: forced by the cfg, else from the game's backbuffer format --
+// or from the shader's linearised 16-bit mode, whose values are linear light like an HDR game's.
+static bool WantHdr()
+{
+    if (g_cfg.hdr >= 0) return g_cfg.hdr != 0;
+    return IsHdrFormat(TypedColorFormat(g.bb_fmt)) || (g.color16_ok && g.color16_mode == 2);
+}
+
+// The shader's DLSS5_Color / DLSS5_Output for this frame, when the shader is compiled for
+// DLSS5_COLOR_16F and both are backbuffer-sized RGBA16F. Sets g.color16_ok; a mode/size
+// mismatch is reported once and falls back to the 8-bit backbuffer round trip.
+static void ResolveColor16(reshade::api::effect_runtime *rt, reshade::api::device *dev,
+                           UINT bb_w, UINT bb_h, reshade::api::resource *color, reshade::api::resource *output)
+{
+    using namespace reshade::api;
+    *color = {}; *output = {};
+    g.color16_ok = false;
+    if (g.color16_mode == 0 || g.color_var.handle == 0 || g.output_var.handle == 0) return;
+    resource_view c_srv = {}, c_srgb = {}, o_srv = {}, o_srgb = {};
+    rt->get_texture_binding(g.color_var, &c_srv, &c_srgb);
+    rt->get_texture_binding(g.output_var, &o_srv, &o_srgb);
+    if (c_srv.handle == 0 || o_srv.handle == 0) return;
+    const resource c = dev->get_resource_from_view(c_srv), o = dev->get_resource_from_view(o_srv);
+    if (c.handle == 0 || o.handle == 0) return;
+    const resource_desc cd = dev->get_resource_desc(c), od = dev->get_resource_desc(o);
+    const bool ok = cd.texture.width == bb_w && cd.texture.height == bb_h && cd.texture.format == format::r16g16b16a16_float &&
+                    od.texture.width == bb_w && od.texture.height == bb_h && od.texture.format == format::r16g16b16a16_float;
+    static bool said16 = false;
+    if (!ok)
+    {
+        if (!said16)
+        {
+            said16 = true;
+            Log("[feed] DLSS5_Color/DLSS5_Output are %ux%u fmt=%u / %ux%u fmt=%u, backbuffer %ux%u -- 16-bit colour round trip off",
+                cd.texture.width, cd.texture.height, (unsigned)cd.texture.format, od.texture.width, od.texture.height,
+                (unsigned)od.texture.format, bb_w, bb_h);
+        }
+        return;
+    }
+    *color = c; *output = o;
+    g.color16_ok = true;
+}
+
+// Tells the output technique whether DLSS5_Output holds this frame's result.
+static void SetOutputActive(reshade::api::effect_runtime *rt, bool on)
+{
+    if (g.output_active.handle != 0) rt->set_uniform_value_bool(g.output_active, &on, 1);
+}
+
 // A same-size rebuild (warm-up, runtime recreation, cfg knob) only needs a fresh feature:
 // the textures stay put, the new feature is created FIRST, and if that fails or crashes
 // the old feature keeps working -- a flaky re-create can no longer take the feed down.
@@ -992,7 +1069,7 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed);
 static bool RecreateFeatureOnly(UINT w, UINT h)
 {
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
-    g.hdr = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+    g.hdr = WantHdr();
 
     NVSDK_NGX_Handle *old = g.feature;
     g.feature = nullptr;
@@ -1013,7 +1090,7 @@ static bool RecreateFeatureOnly(UINT w, UINT h)
 static bool BuildResources(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
-        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt && g.color16_ok == g.color16_built)
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building shared textures");
@@ -1027,8 +1104,10 @@ static bool BuildResources(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     g.height     = h;
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = TypedColorFormat(bb_fmt);
+    g.color16_built = g.color16_ok;
+    if (g.color16_ok) g.color_fmt = DXGI_FORMAT_R16G16B16A16_FLOAT;   // the shader's copy, not the backbuffer
     g.output_fmt = OutputFormatFor(g.color_fmt);
-    g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+    g.hdr        = WantHdr();
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
 
     if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
@@ -1416,7 +1495,7 @@ static bool MakeTex12(int i, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, D3D12_RE
 static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
-        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt && g.color16_ok == g.color16_built)
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building same-device textures");
@@ -1426,8 +1505,10 @@ static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     g.height     = h;
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = TypedColorFormat(bb_fmt);
+    g.color16_built = g.color16_ok;
+    if (g.color16_ok) g.color_fmt = DXGI_FORMAT_R16G16B16A16_FLOAT;   // the shader's copy, not the backbuffer
     g.output_fmt = g.color_fmt;   // the copy home is a plain CopyResource; no blit on this path
-    g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+    g.hdr        = WantHdr();
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
 
     if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
@@ -1679,7 +1760,7 @@ static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
 static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
-        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt && g.color16_ok == g.color16_built)
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building the Vulkan-shared textures");
@@ -1689,8 +1770,10 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     g.height     = h;
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = TypedColorFormat(bb_fmt);
+    g.color16_built = g.color16_ok;
+    if (g.color16_ok) g.color_fmt = DXGI_FORMAT_R16G16B16A16_FLOAT;   // the shader's copy, not the backbuffer
     g.output_fmt = OutputFormatFor(g.color_fmt);
-    g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+    g.hdr        = WantHdr();
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
 
     if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
@@ -1884,6 +1967,10 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
 
     const D3D12_RESOURCE_DESC cd = bb->GetDesc(), md = mv->GetDesc(), dd = depth->GetDesc();
     const UINT w = static_cast<UINT>(cd.Width), h = cd.Height;
+
+    resource c16_res = {}, o16_res = {};
+    ResolveColor16(rt, dev_api, w, h, &c16_res, &o16_res);
+    auto *c16 = reinterpret_cast<ID3D12Resource *>(c16_res.handle);
     if (cd.Width != md.Width || h != md.Height || cd.Width != dd.Width || h != dd.Height ||
         cd.SampleDesc.Count != 1 || md.Format != DXGI_FORMAT_R16G16_FLOAT || dd.Format != DXGI_FORMAT_R32_FLOAT)
     {
@@ -1909,7 +1996,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
     // Same hook-arming grace as the D3D11 path: never call into NGX while the DLSS 5
     // add-on may still be patching its vtable (that has crashed the process at EXEC 0x0),
     // and it re-patches after every runtime recreation.
-    const bool needs_build12 = !g.frame_ready || w != g.width || h != g.height || cd.Format != g.bb_fmt;
+    const bool needs_build12 = !g.frame_ready || w != g.width || h != g.height || cd.Format != g.bb_fmt || g.color16_ok != g.color16_built;
     if (ok && needs_build12 && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
@@ -1932,6 +2019,24 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
         const resource color12  = { reinterpret_cast<uint64_t>(g.tex12[SLOT_COLOR]) };
         const resource output12 = { reinterpret_cast<uint64_t>(g.tex12[SLOT_OUTPUT]) };
 
+        if (g.color16_ok)
+        {
+            // 16-bit mode: the shader's DLSS5_Color IS the colour input (zero-copy, like mv/depth),
+            // and the result goes into DLSS5_Output; the backbuffer stays ReShade's.
+            if (g_cfg.mode == 1)
+            {
+                const resource       res[2]  = { c16_res, o16_res };
+                const resource_usage from[2] = { resource_usage::shader_resource, resource_usage::shader_resource };
+                const resource_usage to[2]   = { resource_usage::copy_source, resource_usage::copy_dest };
+                cl->barrier(2, res, from, to);
+                cl->copy_resource(c16_res, o16_res);
+                cl->barrier(2, res, to, from);
+                SetOutputActive(rt, true);
+                ++g.frames_done;
+            }
+        }
+        else
+        {
         // ReShade renders effects into the backbuffer, so its tracked state here is render_target.
         Breadcrumb("copying the backbuffer (D3D12)");
         {
@@ -1941,8 +2046,9 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
             cl->barrier(2, res, from, to);
         }
         cl->copy_resource(bb_res, color12);
+        }
 
-        if (g_cfg.mode == 1)
+        if (g_cfg.mode == 1 && !g.color16_ok)
         {
             // Transport test: the copied frame goes straight back.
             {
@@ -1960,9 +2066,10 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
             }
             ++g.frames_done;
         }
-        else
+        else if (g_cfg.mode != 1)
         {
             // Park the backbuffer to receive the output; the copy becomes DLSS's colour input.
+            if (!g.color16_ok)
             {
                 const resource       res[2]  = { bb_res, color12 };
                 const resource_usage from[2] = { resource_usage::copy_source, resource_usage::copy_dest };
@@ -1986,7 +2093,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 MvProbeRecord(mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
                 NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
-                ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
+                ep.Feature.pInColor  = g.color16_ok ? c16 : g.tex12[SLOT_COLOR];
                 ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
                 ep.Feature.InSharpness = 0.0f;
                 ep.pInDepth          = depth;   // the effect textures themselves: zero-copy
@@ -2026,20 +2133,25 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 {
                     // The copy home is recorded on the (fresh) immediate list: it executes on
                     // the same queue after the evaluate, so no fence is needed.
+                    // Copy home: the backbuffer (parked as copy_dest above), or in 16-bit mode the
+                    // shader's DLSS5_Output (a ReShade texture, at rest as shader_resource).
+                    const resource       home      = g.color16_ok ? o16_res : bb_res;
+                    const resource_usage home_rest = g.color16_ok ? resource_usage::shader_resource : resource_usage::render_target;
                     {
-                        const resource       res[1]  = { output12 };
-                        const resource_usage from[1] = { resource_usage::unordered_access };
-                        const resource_usage to[1]   = { resource_usage::copy_source };
-                        cl->barrier(1, res, from, to);
+                        const resource       res[2]  = { output12, home };
+                        const resource_usage from[2] = { resource_usage::unordered_access, home_rest };
+                        const resource_usage to[2]   = { resource_usage::copy_source, resource_usage::copy_dest };
+                        cl->barrier(g.color16_ok ? 2 : 1, res, from, to);
                     }
-                    cl->copy_resource(output12, bb_res);
+                    cl->copy_resource(output12, home);
                     {
-                        const resource       res[2]  = { bb_res, output12 };
+                        const resource       res[2]  = { home, output12 };
                         const resource_usage from[2] = { resource_usage::copy_dest, resource_usage::copy_source };
-                        const resource_usage to[2]   = { resource_usage::render_target, resource_usage::unordered_access };
+                        const resource_usage to[2]   = { home_rest, resource_usage::unordered_access };
                         cl->barrier(2, res, from, to);
                     }
                     restored = true;
+                    if (g.color16_ok) SetOutputActive(rt, true);
 
                     const UINT64 n = ++g.frames_done;
                     g.consecutive_fails = 0;
@@ -2059,7 +2171,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 }
             }
 
-            if (!restored)
+            if (!restored && !g.color16_ok)
             {
                 // Whatever went wrong, hand the backbuffer back in the state ReShade expects.
                 const resource       res[1]  = { bb_res };
@@ -2132,6 +2244,9 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     const resource_desc md = dev_api->get_resource_desc(mv_res);
     const resource_desc dd = dev_api->get_resource_desc(depth_res);
     const UINT w = cd.texture.width, h = cd.texture.height;
+
+    resource c16_res = {}, o16_res = {};
+    ResolveColor16(rt, dev_api, w, h, &c16_res, &o16_res);
     if (w != md.texture.width || h != md.texture.height || w != dd.texture.width || h != dd.texture.height ||
         cd.texture.samples != 1 ||
         md.texture.format != format::r16g16_float || dd.texture.format != format::r32_float)
@@ -2156,7 +2271,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     if (!g.session_ready) ok = InitSessionVk(rt);
 
     const DXGI_FORMAT bbf = static_cast<DXGI_FORMAT>(cd.texture.format);
-    const bool needs_build_vk = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt;
+    const bool needs_build_vk = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt || g.color16_ok != g.color16_built;
     if (ok && needs_build_vk && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
@@ -2179,6 +2294,13 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         VkImage bb_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(bb_res.handle));
         VkImage mv_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(mv_res.handle));
         VkImage dp_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(depth_res.handle));
+        // Colour source / result home: the backbuffer, or in 16-bit mode the shader's own textures.
+        const resource       src_res  = g.color16_ok ? c16_res : bb_res;
+        const resource       dst_res  = g.color16_ok ? o16_res : bb_res;
+        const resource_usage src_rest = g.color16_ok ? resource_usage::shader_resource : resource_usage::render_target;
+        const resource_usage dst_rest = g.color16_ok ? resource_usage::shader_resource : resource_usage::render_target;
+        VkImage src_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(src_res.handle));
+        VkImage dst_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(dst_res.handle));
 
         // Our imported images -> GENERAL (first frame after a build, from UNDEFINED).
         // ReShade never touches them; only these raw barriers do.
@@ -2192,12 +2314,12 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         // Game images -> copy_source via ReShade (its layout tracking stays correct),
         // then raw-copy each into our GENERAL image.
         {
-            const resource       res[3]  = { bb_res, mv_res, depth_res };
-            const resource_usage from[3] = { resource_usage::render_target, resource_usage::shader_resource, resource_usage::shader_resource };
+            const resource       res[3]  = { src_res, mv_res, depth_res };
+            const resource_usage from[3] = { src_rest, resource_usage::shader_resource, resource_usage::shader_resource };
             const resource_usage to[3]   = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source };
             cl->barrier(3, res, from, to);
         }
-        FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
+        FeedVkCopyImage(&g.vk, cb, src_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
         FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MV],    VK_IMAGE_LAYOUT_GENERAL, w, h);
         FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
         if (g.mask_ok)
@@ -2223,29 +2345,31 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         {
             // Transport test: raw-copy the LEFT half of our COLOR back over the game's
             // backbuffer -- a split screen is unambiguous proof of the round trip.
+            // (16-bit mode: into DLSS5_Output; the right half of that stays whatever it was.)
             {
-                const resource       res[3]  = { bb_res, mv_res, depth_res };
-                const resource_usage from[3] = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source };
-                const resource_usage to[3]   = { resource_usage::copy_dest, resource_usage::shader_resource, resource_usage::shader_resource };
-                cl->barrier(3, res, from, to);
+                const resource       res[4]  = { src_res, mv_res, depth_res, dst_res };
+                const resource_usage from[4] = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source, dst_rest };
+                const resource_usage to[4]   = { g.color16_ok ? src_rest : resource_usage::copy_dest, resource_usage::shader_resource, resource_usage::shader_resource, resource_usage::copy_dest };
+                cl->barrier(g.color16_ok ? 4 : 3, res, from, to);
             }
-            FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w / 2, h);
+            FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, dst_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w / 2, h);
             {
-                const resource       res[1]  = { bb_res };
+                const resource       res[1]  = { dst_res };
                 const resource_usage from[1] = { resource_usage::copy_dest };
-                const resource_usage to[1]   = { resource_usage::render_target };
+                const resource_usage to[1]   = { dst_rest };
                 cl->barrier(1, res, from, to);
             }
+            if (g.color16_ok) SetOutputActive(rt, true);
             ++g.frames_done;
         }
         else
         {
-            // Park the backbuffer as copy_dest to receive the output; restore mv/depth.
+            // Park the result home (backbuffer, or DLSS5_Output) as copy_dest; restore the rest.
             {
-                const resource       res[3]  = { bb_res, mv_res, depth_res };
-                const resource_usage from[3] = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source };
-                const resource_usage to[3]   = { resource_usage::copy_dest, resource_usage::shader_resource, resource_usage::shader_resource };
-                cl->barrier(3, res, from, to);
+                const resource       res[4]  = { src_res, mv_res, depth_res, dst_res };
+                const resource_usage from[4] = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source, dst_rest };
+                const resource_usage to[4]   = { g.color16_ok ? src_rest : resource_usage::copy_dest, resource_usage::shader_resource, resource_usage::shader_resource, resource_usage::copy_dest };
+                cl->barrier(g.color16_ok ? 4 : 3, res, from, to);
             }
 
             const UINT64 n = ++g.vk_frame;
@@ -2324,15 +2448,19 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             Breadcrumb("waiting for the result (Vulkan)");
             g.rs_queue->wait(g.rs_fence_out, n);
             cb = reinterpret_cast<VkCommandBuffer>(cl->get_native());  // fresh buffer after the flush
-            if (done)  // blit (not copy): handles an output/backbuffer channel-order or format diff
+            if (done && g.color16_ok)   // same format (RGBA16F) both sides: a plain copy
+                FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                dst_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+            else if (done)  // blit (not copy): handles an output/backbuffer channel-order or format diff
                 FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
-                                bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                                dst_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
             {
-                const resource       res[1]  = { bb_res };
+                const resource       res[1]  = { dst_res };
                 const resource_usage from[1] = { resource_usage::copy_dest };
-                const resource_usage to[1]   = { resource_usage::render_target };
+                const resource_usage to[1]   = { dst_rest };
                 cl->barrier(1, res, from, to);
             }
+            if (done && g.color16_ok) SetOutputActive(rt, true);
 
             if (done)
             {
@@ -2413,6 +2541,13 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     }
     g.mask_ok = mask != nullptr && kd.Width == cd.Width && kd.Height == cd.Height && kd.Format == DXGI_FORMAT_R8_UNORM;
 
+    // 16-bit mode: the shader's DLSS5_Color replaces the backbuffer as the copy source, and
+    // DLSS5_Output receives the result (a same-format CopyResource instead of the blit).
+    reshade::api::resource c16_res = {}, o16_res = {};
+    ResolveColor16(rt, dev_api, cd.Width, cd.Height, &c16_res, &o16_res);
+    auto *c16 = reinterpret_cast<ID3D11Resource *>(c16_res.handle);
+    auto *o16 = reinterpret_cast<ID3D11Resource *>(o16_res.handle);
+
     bool ok = true;
     if (cd.Width != md.Width || cd.Height != md.Height || cd.Width != dd.Width || cd.Height != dd.Height ||
         cd.SampleDesc.Count != 1 || md.Format != DXGI_FORMAT_R16G16_FLOAT || dd.Format != DXGI_FORMAT_R32_FLOAT)
@@ -2449,7 +2584,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     // asynchronously; calling into NGX while the vtable is being patched has crashed the
     // process (EXEC at 0x0, sometimes fatally on a foreign thread). Hold EVERY build that
     // follows a runtime (re-)init until that settled.
-    const bool needs_build11 = !g.frame_ready || cd.Width != g.width || cd.Height != g.height || cd.Format != g.bb_fmt;
+    const bool needs_build11 = !g.frame_ready || cd.Width != g.width || cd.Height != g.height || cd.Format != g.bb_fmt || g.color16_ok != g.color16_built;
     if (ok && needs_build11 && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
@@ -2470,7 +2605,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     if (ok)
     {
         Breadcrumb("copying inputs");
-        ctx->CopyResource(g.tex11[SLOT_COLOR], color);
+        ctx->CopyResource(g.tex11[SLOT_COLOR], g.color16_ok ? c16 : color);
         ctx->CopyResource(g.tex11[SLOT_DEPTH], depth);
         ctx->CopyResource(g.tex11[SLOT_MV], mv);
         if (g.mask_ok) ctx->CopyResource(g.tex11[SLOT_MASK], mask);
@@ -2479,7 +2614,8 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
         {
             // Transport test: what went out comes straight back, through the same copy-back path.
             ctx->CopyResource(g.tex11[SLOT_OUTPUT], g.tex11[SLOT_COLOR]);
-            BlitOutputToBackbuffer(ctx, rtv11);
+            if (g.color16_ok) { ctx->CopyResource(o16, g.tex11[SLOT_OUTPUT]); SetOutputActive(rt, true); }
+            else BlitOutputToBackbuffer(ctx, rtv11);
             ++g.frames_done;
         }
         else
@@ -2551,7 +2687,8 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 {
                     Breadcrumb("waiting for the D3D12 result");
                     g.ctx4->Wait(g.fence11, v_out);
-                    BlitOutputToBackbuffer(ctx, rtv11);
+                    if (g.color16_ok) { ctx->CopyResource(o16, g.tex11[SLOT_OUTPUT]); SetOutputActive(rt, true); }
+                    else BlitOutputToBackbuffer(ctx, rtv11);
                     const UINT64 n = ++g.frames_done;
                     g.consecutive_fails = 0;
                     if (n <= static_cast<UINT64>(g_cfg.log_frames) || (n % 1800) == 0)
@@ -2582,6 +2719,10 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
 
 static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
+    // Until a result actually lands in DLSS5_Output this frame, the output technique must leave
+    // the screen alone (the paths below flip this to true on delivery).
+    SetOutputActive(rt, false);
+    g.feed_delivered = false;
     if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
     switch (rt->get_device()->get_api())
     {
@@ -2590,6 +2731,7 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
     case reshade::api::device_api::vulkan: FeedFrameVk(rt, cl, rtv); break;
     default: FeedDisable("only Direct3D 11/12 and Vulkan games are supported"); break;
     }
+    g.feed_delivered = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -2602,6 +2744,37 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     g.mv_var    = rt->find_texture_variable(kEffectFile, "DLSS5_MV");
     g.depth_var = rt->find_texture_variable(kEffectFile, "DLSS5_Depth");
     g.mask_var  = rt->find_texture_variable(kEffectFile, "DLSS5_Mask");
+    // 16-bit colour round trip: the shader's mode, its two textures, the technique that writes
+    // the result to the screen (enabled here if the user forgot), and the gate uniform.
+    g.color16_mode  = ReadColor16Mode(rt);
+    g.color_var     = rt->find_texture_variable(kEffectFile, "DLSS5_Color");
+    g.output_var    = rt->find_texture_variable(kEffectFile, "DLSS5_Output");
+    g.output_tech   = rt->find_technique(kEffectFile, "DLSS5_Output");
+    g.output_active = rt->find_uniform_variable(kEffectFile, "OUTPUT_ACTIVE");
+    g.output_order_bad = false;
+    g.color16_ok    = false;   // decided per frame from the bound textures
+    {
+        const bool have = g.color_var.handle != 0 && g.output_var.handle != 0 && g.output_tech.handle != 0;
+        g_color_problem[0] = '\0';
+        if (g.color16_mode == 0)
+            _snprintf_s(g_color_status, sizeof(g_color_status), _TRUNCATE, "DLSS5_COLOR_16F=0: %s", kColor16Name[0]);
+        else if (!have)
+        {
+            _snprintf_s(g_color_status, sizeof(g_color_status), _TRUNCATE, "DLSS5_COLOR_16F=%d: %s -- shader textures MISSING", g.color16_mode, kColor16Name[g.color16_mode]);
+            _snprintf_s(g_color_problem, sizeof(g_color_problem), _TRUNCATE,
+                        "DLSS5_COLOR_16F is set to %d but DLSS5_Feed.fx has no DLSS5_Color/DLSS5_Output/DLSS5_Output technique (older shader, or it failed to compile): "
+                        "running the 8-bit backbuffer round trip instead.", g.color16_mode);
+        }
+        else
+        {
+            if (!rt->get_technique_state(g.output_tech))
+            {
+                rt->set_technique_state(g.output_tech, true);
+                Log("[feed] enabled the DLSS5_Output technique (it writes the 16-bit result to the screen)");
+            }
+            _snprintf_s(g_color_status, sizeof(g_color_status), _TRUNCATE, "DLSS5_COLOR_16F=%d: %s (DLSS5_Output technique enabled)", g.color16_mode, kColor16Name[g.color16_mode]);
+        }
+    }
     // Which provider is DLSS5_Feed.fx compiled for, and is a matching provider technique
     // present and enabled? Purely informational, plus a warning when the two disagree
     // (the classic "enabled Launchpad but the shader still reads texMotionVectors").
@@ -2640,7 +2813,8 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     const bool provider_on = g.launchpad.handle && rt->get_technique_state(g.launchpad);
     const int signature = (g.technique.handle ? 1 : 0) | (g.mv_var.handle ? 2 : 0) | (g.depth_var.handle ? 4 : 0) |
                           (g.launchpad.handle ? 8 : 0) | (g.depth_reversed ? 16 : 0) | (provider_on ? 32 : 0) |
-                          (mode << 6) | (other.handle ? 512 : 0) | ((other_mode & 7) << 10) | (provider_broken ? 8192 : 0);
+                          (mode << 6) | (other.handle ? 512 : 0) | ((other_mode & 7) << 10) | (provider_broken ? 8192 : 0) |
+                          (g.color16_mode << 14) | (g.color_var.handle ? 65536 : 0);
     static int last_signature = -1;
     if (signature == last_signature) return;
     last_signature = signature;
@@ -2650,10 +2824,11 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
                 g.launchpad.handle ? (provider_broken ? "FAILED TO COMPILE" : provider_on ? "enabled" : "DISABLED") : "not installed");
     g_mv_problem[0] = '\0';
 
-    Log("[feed] effects: %s technique %s, DLSS5_MV %s, DLSS5_Depth %s, DLSS5_Mask %s, %s, depth reversed=%d",
+    Log("[feed] effects: %s technique %s, DLSS5_MV %s, DLSS5_Depth %s, DLSS5_Mask %s, %s, depth reversed=%d, colour: %s",
         kEffectFile, g.technique.handle ? "found" : "MISSING", g.mv_var.handle ? "found" : "MISSING",
         g.depth_var.handle ? "found" : "MISSING", g.mask_var.handle ? "found" : "absent (older shader: no bias mask)",
-        g_mv_status, g.depth_reversed ? 1 : 0);
+        g_mv_status, g.depth_reversed ? 1 : 0, g_color_status);
+    if (g_color_problem[0]) Warn("%s", g_color_problem);
     if (!g.handles_ok)
         Warn("DLSS5_Feed.fx is not loaded (technique/textures missing) -- install it into reshade-shaders\\Shaders.");
     else if (g.launchpad.handle == 0)
@@ -2708,6 +2883,8 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
     if (g.dev12_owned) ReleaseFrameResources();
     g.runtime = nullptr;
     g.technique = {}; g.launchpad = {}; g.mv_var = {}; g.depth_var = {}; g.mask_var = {};
+    g.color_var = {}; g.output_var = {}; g.output_tech = {}; g.output_active = {};
+    g.color16_ok = false;
     g.handles_ok = false;
 }
 
@@ -2720,7 +2897,21 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
                               reshade::api::command_list *cl, reshade::api::resource_view rtv,
                               reshade::api::resource_view /*rtv_srgb*/)
 {
-    if (rt != g.runtime || g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    if (rt != g.runtime) return;
+    if (g.output_tech.handle != 0 && technique.handle == g.output_tech.handle)
+    {
+        // The output technique just rendered: it must come AFTER the feed in the list, or it
+        // showed last frame's result (and the feed then overwrote nothing visible).
+        if (g.color16_ok && !g.feed_delivered && !g.output_order_bad)
+        {
+            g.output_order_bad = true;
+            Warn("the DLSS5_Output technique is placed ABOVE DLSS 5 Feed: move it below (it shows the previous frame's result otherwise).");
+        }
+        else if (g.feed_delivered) g.output_order_bad = false;
+        g.feed_delivered = false;
+        return;
+    }
+    if (g.technique.handle == 0 || technique.handle != g.technique.handle) return;
     FeedFrame(rt, cl, rtv);
 }
 
@@ -2818,6 +3009,21 @@ static void DrawOverlay(reshade::api::effect_runtime *)
                        "0 texMotionVectors (qUINT, dh_uber_motion), 1 Launchpad, 2 VORT, 3 LumeniteFX Kernel, 4 LumeniteFX QuantMotion.");
     if (ImGui::SliderFloat("MV scale X", &g_cfg.mv_scale_x, 0.0f, 4.0f)) dirty = true;
     if (ImGui::SliderFloat("MV scale Y", &g_cfg.mv_scale_y, 0.0f, 4.0f)) dirty = true;
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Colour");
+    ImGui::TextWrapped("%s", g_color_status);
+    if (g_color_problem[0])
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "%s", g_color_problem);
+    else if (g.color16_mode != 0 && g.session_ready && !g.color16_ok)
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "DLSS5_Color/DLSS5_Output are not backbuffer-sized RGBA16F this frame: 8-bit round trip in use (see the log).");
+    else if (g.color16_ok)
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "DLSS receives and returns 16-bit float colour (%s); the DLSS5_Output technique writes it to the screen.",
+                           g.hdr ? "HDR contract" : "SDR contract");
+    if (g.output_order_bad)
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "The DLSS5_Output technique is ABOVE DLSS 5 Feed in the list: move it below.");
+    ImGui::TextWrapped("Set with DLSS5_Feed.fx's DLSS5_COLOR_16F preprocessor definition: 0 off, 1 16-bit float as displayed, "
+                       "2 16-bit float linearised (HDR contract). Dither: the shader's 'Dither the output' option.");
 
     if (ImGui::CollapsingHeader("Advanced"))
     {

@@ -127,6 +127,21 @@
 #endif
 
 // ---------------------------------------------------------------------------------------------
+// 16-bit float colour round trip (DLSS5_COLOR_16F). Off (0): the add-on hands DLSS the 8-bit
+// backbuffer and writes the result back into it, so DLSS's accumulated history is re-quantised
+// to 8 bits every frame -- slow ramps (a flickering light averaged over frames) come out as
+// visible steps. 1: the frame goes to DLSS as RGBA16F (DLSS5_Color) and its 16F output comes
+// back through DLSS5_Output, which the "DLSS 5 Feed - output" technique (place it BELOW
+// DLSS 5 Feed) writes to the screen, optionally dithered. 2: the same, but the values are
+// linearised on the way in and re-encoded on the way out (the add-on then flags the input as
+// HDR). Both need the 64-bit add-on 0.6.0-beta.2 or later; the 32-bit add-on ignores this.
+// ---------------------------------------------------------------------------------------------
+
+#ifndef DLSS5_COLOR_16F
+    #define DLSS5_COLOR_16F 0
+#endif
+
+// ---------------------------------------------------------------------------------------------
 
 uniform int MV_PROVIDER_INFO <
     ui_type = "radio";
@@ -332,6 +347,28 @@ uniform int DEBUG_VIEW <
     ui_label = "Debug view (DLSS5_Feed_Debug technique)";
 > = 0;
 
+#if DLSS5_COLOR_16F
+uniform bool OUTPUT_DITHER <
+    ui_category = "16-bit colour (DLSS5_COLOR_16F)";
+    ui_label    = "Dither the output";
+    ui_tooltip  = "Adds sub-LSB temporal noise when the 16-bit DLSS result is written to the 8-bit screen, "
+                  "so slow ramps do not show as steps. Triangular-pdf interleaved-gradient noise, "
+                  "different every frame, invisible at 1.0.";
+> = true;
+
+uniform float DITHER_STRENGTH <
+    ui_category = "16-bit colour (DLSS5_COLOR_16F)";
+    ui_type     = "slider"; ui_min = 0.0; ui_max = 2.0; ui_step = 0.05;
+    ui_label    = "Dither amplitude (8-bit steps)";
+    ui_tooltip  = "1.0 = exactly one 8-bit step, the textbook value. More hides stronger banding at the cost of visible grain.";
+> = 1.0;
+
+// Set by the add-on every frame it actually delivered a DLSS result into DLSS5_Output;
+// while false the output technique leaves the screen alone (no black screen without the add-on).
+uniform bool OUTPUT_ACTIVE < hidden = true; > = false;
+uniform int  FRAME_COUNT   < source = "framecount"; >;
+#endif
+
 // Outputs for the add-on
 texture DLSS5_MV    { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F; };
 texture DLSS5_Depth { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R32F;  };
@@ -339,6 +376,11 @@ texture DLSS5_Mask  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R8;
 sampler sDLSS5_MV    { Texture = DLSS5_MV;    MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
 sampler sDLSS5_Depth { Texture = DLSS5_Depth; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
 sampler sDLSS5_Mask  { Texture = DLSS5_Mask;  MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+#if DLSS5_COLOR_16F
+texture DLSS5_Color  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA16F; };   // what DLSS gets
+texture DLSS5_Output { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA16F; };   // what DLSS returns (written by the add-on)
+sampler sDLSS5_Output { Texture = DLSS5_Output; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
+#endif
 
 // Previous-frame history for validation (written at the end of the technique)
 texture DLSS5_PrevLuma  { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R16F;  };
@@ -716,6 +758,41 @@ void PS_StoreHistory(float4 vpos : SV_Position, float2 uv : TEXCOORD,
     mv    = ProviderMV(uv);
 }
 
+#if DLSS5_COLOR_16F
+float SrgbToLinear(float e) { e = saturate(e); return e <= 0.04045 ? e / 12.92 : pow((e + 0.055) / 1.055, 2.4); }
+float LinearToSrgb(float l) { l = saturate(l); return l <= 0.0031308 ? l * 12.92 : 1.055 * pow(l, 1.0 / 2.4) - 0.055; }
+
+// The frame as DLSS should see it: 16-bit, and (mode 2) linear.
+float4 PS_Color(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+    float4 c = tex2Dlod(ReShade::BackBuffer, float4(uv, 0.0, 0.0));
+#if DLSS5_COLOR_16F == 2
+    c.rgb = float3(SrgbToLinear(c.r), SrgbToLinear(c.g), SrgbToLinear(c.b));
+#endif
+    return c;
+}
+
+// DLSS's 16-bit result to the 8-bit screen. Triangular-pdf interleaved-gradient noise, shifted
+// every frame (Jimenez 2014 / the usual 5.588238 * frame offset), so the quantisation error is
+// noise rather than steps and averages out over time.
+float4 PS_Output(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
+{
+    if (!OUTPUT_ACTIVE) discard;
+    float4 c = tex2Dlod(sDLSS5_Output, float4(uv, 0.0, 0.0));
+#if DLSS5_COLOR_16F == 2
+    c.rgb = float3(LinearToSrgb(c.r), LinearToSrgb(c.g), LinearToSrgb(c.b));
+#endif
+    if (OUTPUT_DITHER)
+    {
+        const float2 p = vpos.xy + 5.588238 * float(FRAME_COUNT % 64);
+        const float  n = frac(52.9829189 * frac(0.06711056 * p.x + 0.00583715 * p.y));
+        const float  t = n < 0.5 ? sqrt(2.0 * n) - 1.0 : 1.0 - sqrt(2.0 - 2.0 * n);   // triangular, [-1, 1]
+        c.rgb += t * DITHER_STRENGTH / 255.0;
+    }
+    return c;
+}
+#endif
+
 float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 {
     if (DEBUG_VIEW == 1)
@@ -781,6 +858,9 @@ technique DLSS5_Feed
     ui_label   = "DLSS 5 Feed (place below your motion-vector provider)";
     ui_tooltip = "Prepares motion vectors + depth (+ a trust mask) for the DLSS 5 Feed add-on.\n\n"
                  "Provider: " DLSS5_MV_PROVIDER_NAME "\n"
+#if DLSS5_COLOR_16F
+                 "Colour: 16-bit float round trip (DLSS5_COLOR_16F) -- keep 'DLSS 5 Feed - output' enabled below.\n"
+#endif
                  "Change it with the DLSS5_MV_PROVIDER preprocessor definition (0 texMotionVectors,\n"
                  "1 Launchpad, 2 VORT, 3 LumeniteFX Kernel, 4 LumeniteFX QuantMotion) and enable\n"
                  "that provider's technique ABOVE this one.";
@@ -791,8 +871,24 @@ technique DLSS5_Feed
     pass MotionVectors { VertexShader = PostProcessVS; PixelShader = PS_MotionVectors; RenderTarget0 = DLSS5_MV; RenderTarget1 = DLSS5_Mask; }
     pass Depth         { VertexShader = PostProcessVS; PixelShader = PS_Depth;         RenderTarget  = DLSS5_Depth; }
     pass History       { VertexShader = PostProcessVS; PixelShader = PS_StoreHistory;  RenderTarget0 = DLSS5_PrevLuma; RenderTarget1 = DLSS5_PrevDepth; RenderTarget2 = DLSS5_PrevMV; }
+#if DLSS5_COLOR_16F
+    pass Color         { VertexShader = PostProcessVS; PixelShader = PS_Color;         RenderTarget  = DLSS5_Color; }
+#endif
     DLSS5_MV_REQUEST_PASS   // Launchpad only: ask it to compute optical flow again next frame
 }
+
+#if DLSS5_COLOR_16F
+technique DLSS5_Output
+<
+    ui_label   = "DLSS 5 Feed - output (place below DLSS 5 Feed)";
+    ui_tooltip = "Writes the 16-bit DLSS result (DLSS5_COLOR_16F) to the screen, dithered. Must stay enabled\n"
+                 "and BELOW DLSS 5 Feed; the add-on enables it if you forget. Does nothing while the add-on\n"
+                 "is not delivering frames.";
+>
+{
+    pass { VertexShader = PostProcessVS; PixelShader = PS_Output; }
+}
+#endif
 
 technique DLSS5_Feed_Debug
 <

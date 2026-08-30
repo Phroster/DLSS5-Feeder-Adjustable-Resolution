@@ -185,7 +185,153 @@ static void SafeReleaseFeature(NVSDK_NGX_Handle *f)
 // and the DLSS 5 add-on arms itself, exactly as in a real D3D12 game.
 // ---------------------------------------------------------------------------
 
-static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp) { return DefWindowProcW(w, m, wp, lp); }
+static LRESULT CALLBACK WndProc(HWND w, UINT m, WPARAM wp, LPARAM lp)
+{
+    if (m == WM_CLOSE) { ShowWindow(w, SW_HIDE); return 0; }   // closing only hides; the feed lives on
+    return DefWindowProcW(w, m, wp, lp);
+}
+
+// --- banner: "32-bit DLSS 5 Feeder" rendered once with GDI, copied into every frame ---
+
+static ID3D12Resource             *g_banner;
+static IDXGISwapChain3            *g_swap3;
+static ID3D12CommandAllocator     *g_pump_alloc;
+static ID3D12GraphicsCommandList  *g_pump_list;
+static ID3D12Fence                *g_pump_fence;
+static UINT64                      g_pump_val;
+static HANDLE                      g_pump_ev;
+
+static bool BeginCommands();
+static UINT64 EndCommands();
+static bool WaitFenceValue(ID3D12Fence *f, UINT64 v, DWORD ms);
+
+static void InitBanner()
+{
+    const int W = 960, H = 540;
+
+    // 1. Render the text with GDI into a 32-bit DIB.
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth       = W;
+    bi.bmiHeader.biHeight      = -H;   // top-down
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void *bits = nullptr;
+    HDC dc = CreateCompatibleDC(nullptr);
+    HBITMAP bmp = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (dc == nullptr || bmp == nullptr || bits == nullptr) return;
+    HGDIOBJ old_bmp = SelectObject(dc, bmp);
+
+    RECT full = { 0, 0, W, H };
+    HBRUSH bg = CreateSolidBrush(RGB(18, 18, 22));
+    FillRect(dc, &full, bg);
+    DeleteObject(bg);
+    SetBkMode(dc, TRANSPARENT);
+
+    HFONT fnt_big   = CreateFontW(64, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0,
+                                  CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    HFONT fnt_small = CreateFontW(26, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, 0, 0,
+                                  CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
+    HGDIOBJ old_font = SelectObject(dc, fnt_big);
+    SetTextColor(dc, RGB(118, 185, 0));
+    RECT r1 = { 0, 150, W, 240 };
+    DrawTextW(dc, L"32-bit DLSS 5 Feeder", -1, &r1, DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    SelectObject(dc, fnt_small);
+    SetTextColor(dc, RGB(200, 200, 205));
+    RECT r2 = { 0, 260, W, 300 };
+    DrawTextW(dc, L"DLSS 5 neural rendering runs here for your 32-bit game.", -1, &r2,
+              DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    RECT r3 = { 0, 305, W, 345 };
+    DrawTextW(dc, L"Press  Home  in this window to tune it  \x2022  closing only hides the window", -1, &r3,
+              DT_CENTER | DT_SINGLELINE | DT_VCENTER);
+    SelectObject(dc, old_font);
+    DeleteObject(fnt_big);
+    DeleteObject(fnt_small);
+    GdiFlush();
+
+    // 2. Upload it (BGRA -> RGBA) and keep it as a copy source.
+    D3D12_HEAP_PROPERTIES up = {};
+    up.Type = D3D12_HEAP_TYPE_UPLOAD;
+    const UINT pitch = (W * 4 + 255) & ~255u;
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width            = static_cast<UINT64>(pitch) * H;
+    bd.Height           = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels        = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    ID3D12Resource *staging = nullptr;
+    D3D12_HEAP_PROPERTIES def = {};
+    def.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC td = {};
+    td.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width            = W;
+    td.Height           = H;
+    td.DepthOrArraySize = 1;
+    td.MipLevels        = 1;
+    td.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    if (FAILED(h.dev->CreateCommittedResource(&up, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                              nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&staging))) ||
+        FAILED(h.dev->CreateCommittedResource(&def, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST,
+                                              nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g_banner))))
+    { SelectObject(dc, old_bmp); DeleteObject(bmp); DeleteDC(dc); return; }
+
+    BYTE *dst = nullptr;
+    staging->Map(0, nullptr, reinterpret_cast<void **>(&dst));
+    const BYTE *srcp = static_cast<const BYTE *>(bits);
+    for (int y = 0; y < H; ++y)
+        for (int x = 0; x < W; ++x)
+        {
+            const BYTE *p = srcp + (static_cast<size_t>(y) * W + x) * 4;   // GDI: BGRA
+            BYTE *q = dst + static_cast<size_t>(y) * pitch + static_cast<size_t>(x) * 4;
+            q[0] = p[2]; q[1] = p[1]; q[2] = p[0]; q[3] = 0xFF;
+        }
+    staging->Unmap(0, nullptr);
+    SelectObject(dc, old_bmp);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+
+    if (BeginCommands())
+    {
+        D3D12_TEXTURE_COPY_LOCATION src = {}, dcl = {};
+        src.pResource = staging;
+        src.Type      = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        src.PlacedFootprint.Footprint.Format   = DXGI_FORMAT_R8G8B8A8_UNORM;
+        src.PlacedFootprint.Footprint.Width    = W;
+        src.PlacedFootprint.Footprint.Height   = H;
+        src.PlacedFootprint.Footprint.Depth    = 1;
+        src.PlacedFootprint.Footprint.RowPitch = pitch;
+        dcl.pResource = g_banner;
+        dcl.Type      = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        h.list->CopyTextureRegion(&dcl, 0, 0, 0, &src, nullptr);
+        D3D12_RESOURCE_BARRIER b = {};
+        b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        b.Transition.pResource   = g_banner;
+        b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        h.list->ResourceBarrier(1, &b);
+        const UINT64 v = EndCommands();
+        WaitFenceValue(h.fence, v, 2000);
+    }
+    staging->Release();
+
+    // 3. A tiny allocator/list/fence pair on the pump queue for the per-frame copy.
+    h.dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                  reinterpret_cast<void **>(&g_pump_alloc));
+    if (g_pump_alloc != nullptr)
+        h.dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_pump_alloc, nullptr,
+                                 __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g_pump_list));
+    if (g_pump_list != nullptr) g_pump_list->Close();
+    h.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g_pump_fence));
+    g_pump_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    h.swap->QueryInterface(__uuidof(IDXGISwapChain3), reinterpret_cast<void **>(&g_swap3));
+    Log("[host] banner ready");
+}
 
 typedef HRESULT (WINAPI *PFN_D3D12CreateDevice_)(IUnknown *, D3D_FEATURE_LEVEL, REFIID, void **);
 typedef HRESULT (WINAPI *PFN_CreateDXGIFactory1_)(REFIID, void **);
@@ -194,7 +340,42 @@ static void PumpPresent()
 {
     MSG msg;
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
-    if (h.swap != nullptr) h.swap->Present(0, 0);
+    if (h.swap == nullptr) return;
+
+    // Paint the banner into the backbuffer (ReShade's overlay composites on top at Present).
+    if (g_banner != nullptr && g_pump_list != nullptr && g_swap3 != nullptr)
+    {
+        ID3D12Resource *bb = nullptr;
+        if (SUCCEEDED(g_swap3->GetBuffer(g_swap3->GetCurrentBackBufferIndex(), __uuidof(ID3D12Resource),
+                                         reinterpret_cast<void **>(&bb))) && bb != nullptr)
+        {
+            if (SUCCEEDED(g_pump_alloc->Reset()) && SUCCEEDED(g_pump_list->Reset(g_pump_alloc, nullptr)))
+            {
+                D3D12_RESOURCE_BARRIER b = {};
+                b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource   = bb;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+                b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                g_pump_list->ResourceBarrier(1, &b);
+                g_pump_list->CopyResource(bb, g_banner);
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                b.Transition.StateAfter  = D3D12_RESOURCE_STATE_PRESENT;
+                g_pump_list->ResourceBarrier(1, &b);
+                g_pump_list->Close();
+                ID3D12CommandList *lists[] = { g_pump_list };
+                h.pump_queue->ExecuteCommandLists(1, lists);
+                h.pump_queue->Signal(g_pump_fence, ++g_pump_val);
+                if (g_pump_fence->GetCompletedValue() < g_pump_val && g_pump_ev != nullptr)
+                {
+                    g_pump_fence->SetEventOnCompletion(g_pump_val, g_pump_ev);
+                    WaitForSingleObject(g_pump_ev, 100);
+                }
+            }
+            bb->Release();
+        }
+    }
+    h.swap->Present(0, 0);
 }
 
 static bool InitDisguise()
@@ -263,6 +444,8 @@ static bool InitDisguise()
     h.dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&h.fence));
     h.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
     if (h.list == nullptr || h.fence == nullptr) { Log("[host] list/fence creation failed"); return false; }
+
+    if (g_show_window) InitBanner();
     return true;
 }
 

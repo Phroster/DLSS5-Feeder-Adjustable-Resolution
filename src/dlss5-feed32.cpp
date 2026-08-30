@@ -164,8 +164,11 @@ static bool CfgReload()   // true when a build-affecting value changed
 
 static const char *kEffectFile    = "DLSS5_Feed.fx";
 static const char *kTechnique     = "DLSS5_Feed";
-static const char *kLaunchpadFile = "MartysMods_LAUNCHPAD.fx";
-static const char *kLaunchpadTech = "MartysMods_Launchpad";
+// Known texMotionVectors providers -- a name check only, for the status line.
+static const struct { const char *file, *tech; } kMvProviders[] = {
+    { "MotionEstimation.fx",    "DRME" },
+    { "qUINT_motionvectors.fx", "MotionVectors" },
+};
 
 struct Feed32
 {
@@ -759,7 +762,7 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
         if (!g.missing_reported)
         {
             g.missing_reported = true;
-            Warn("DLSS5_Feed.fx textures not found. Install DLSS5_Feed.fx + MartysMods LaunchPad and enable both.");
+            Warn("DLSS5_Feed.fx textures not found. Install DLSS5_Feed.fx + a texMotionVectors provider and enable both.");
         }
         return;
     }
@@ -864,7 +867,13 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     g.technique = rt->find_technique(kEffectFile, kTechnique);
     g.mv_var    = rt->find_texture_variable(kEffectFile, "DLSS5_MV");
     g.depth_var = rt->find_texture_variable(kEffectFile, "DLSS5_Depth");
-    g.launchpad = rt->find_technique(kLaunchpadFile, kLaunchpadTech);
+    g.launchpad = {};
+    const char *provider = "none";
+    for (const auto &p : kMvProviders)
+    {
+        const reshade::api::effect_technique t = rt->find_technique(p.file, p.tech);
+        if (t.handle != 0) { g.launchpad = t; provider = p.tech; break; }
+    }
 
     g.u_apply     = rt->find_uniform_variable(kEffectFile, "HOST_APPLY");
     g.u_uplift    = rt->find_uniform_variable(kEffectFile, "HOST_NeuralUplift");
@@ -889,10 +898,9 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     static int last_signature = -1;
     if (signature == last_signature) return;
     last_signature = signature;
-    Log("[feed32] effects: technique %s, DLSS5_MV %s, DLSS5_Depth %s, LaunchPad %s, depth reversed=%d",
+    Log("[feed32] effects: technique %s, DLSS5_MV %s, DLSS5_Depth %s, MV provider %s, depth reversed=%d",
         g.technique.handle ? "found" : "MISSING", g.mv_var.handle ? "found" : "MISSING",
-        g.depth_var.handle ? "found" : "MISSING", g.launchpad.handle ? "found" : "MISSING",
-        g.depth_reversed ? 1 : 0);
+        g.depth_var.handle ? "found" : "MISSING", provider, g.depth_reversed ? 1 : 0);
 }
 
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)

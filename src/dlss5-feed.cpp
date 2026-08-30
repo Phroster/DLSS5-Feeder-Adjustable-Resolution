@@ -7,7 +7,7 @@
 // MotionVectors, Output, sizes, jitter, reset...). Nothing in a DLSS-less game ever
 // issues those calls, so this add-on issues them itself: it takes the frame ReShade is
 // processing (the backbuffer), the raw depth and the motion vectors prepared by the
-// companion effect "DLSS5_Feed.fx" (which converts iMMERSE LaunchPad's optical flow),
+// companion effect "DLSS5_Feed.fx" (fed by any texMotionVectors provider),
 // copies the three into textures shared with a private D3D12 device, runs a genuine
 // DLSS DLAA evaluate on that device -- where the DLSS 5 add-on inserts its pass --
 // and copies the result back over the backbuffer, still inside ReShade's effect chain.
@@ -310,8 +310,13 @@ static const char *kSlotName[SLOT_COUNT] = { "Color", "Output", "Depth", "MV" };
 
 static const char *kEffectFile     = "DLSS5_Feed.fx";
 static const char *kTechnique      = "DLSS5_Feed";
-static const char *kLaunchpadFile  = "MartysMods_LAUNCHPAD.fx";
-static const char *kLaunchpadTech  = "MartysMods_Launchpad";
+// Known texMotionVectors providers -- a name check only, used for a helpful status
+// line. The shader consumes the community-standard texMotionVectors texture; any
+// effect that writes it works, listed here or not.
+static const struct { const char *file, *tech; } kMvProviders[] = {
+    { "MotionEstimation.fx",    "DRME" },
+    { "qUINT_motionvectors.fx", "MotionVectors" },
+};
 
 struct Feed
 {
@@ -1609,7 +1614,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
         if (!g.missing_reported)
         {
             g.missing_reported = true;
-            Warn("DLSS5_Feed.fx textures not found (technique %s). Install DLSS5_Feed.fx + MartysMods LaunchPad and enable both.",
+            Warn("DLSS5_Feed.fx textures not found (technique %s). Install DLSS5_Feed.fx + a texMotionVectors provider and enable both.",
                  g.technique.handle ? "found" : "MISSING");
         }
         return;
@@ -2077,7 +2082,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
         if (!g.missing_reported)
         {
             g.missing_reported = true;
-            Warn("DLSS5_Feed.fx textures not found (technique %s). Install DLSS5_Feed.fx + MartysMods LaunchPad and enable both.",
+            Warn("DLSS5_Feed.fx textures not found (technique %s). Install DLSS5_Feed.fx + a texMotionVectors provider and enable both.",
                  g.technique.handle ? "found" : "MISSING");
         }
         return;
@@ -2280,7 +2285,14 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     g.technique = rt->find_technique(kEffectFile, kTechnique);
     g.mv_var    = rt->find_texture_variable(kEffectFile, "DLSS5_MV");
     g.depth_var = rt->find_texture_variable(kEffectFile, "DLSS5_Depth");
-    g.launchpad = rt->find_technique(kLaunchpadFile, kLaunchpadTech);
+    // Which known texMotionVectors provider is present? Purely informational.
+    g.launchpad = {};
+    const char *provider = "none";
+    for (const auto &p : kMvProviders)
+    {
+        const reshade::api::effect_technique t = rt->find_technique(p.file, p.tech);
+        if (t.handle != 0) { g.launchpad = t; provider = p.tech; break; }
+    }
 
     char v[16] = {};
     g.depth_reversed = true;  // ReShade.fxh's own default when the definition is absent
@@ -2299,14 +2311,14 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     if (signature == last_signature) return;
     last_signature = signature;
 
-    Log("[feed] effects: %s technique %s, DLSS5_MV %s, DLSS5_Depth %s, LaunchPad technique %s (%s), depth reversed=%d",
+    Log("[feed] effects: %s technique %s, DLSS5_MV %s, DLSS5_Depth %s, MV provider %s (%s), depth reversed=%d",
         kEffectFile, g.technique.handle ? "found" : "MISSING", g.mv_var.handle ? "found" : "MISSING",
-        g.depth_var.handle ? "found" : "MISSING", g.launchpad.handle ? "found" : "MISSING",
+        g.depth_var.handle ? "found" : "MISSING", provider,
         g.launchpad.handle ? ((signature & 32) ? "enabled" : "DISABLED") : "-", g.depth_reversed ? 1 : 0);
     if (!g.handles_ok)
-        Warn("DLSS5_Feed.fx is not loaded (technique/textures missing) -- install it into reshade-shaders\\Shaders and enable it below MartysMods_Launchpad.");
+        Warn("DLSS5_Feed.fx is not loaded (technique/textures missing) -- install it into reshade-shaders\\Shaders.");
     else if (g.launchpad.handle == 0)
-        Warn("MartysMods_LAUNCHPAD.fx not found: motion vectors will be zero (still images only).");
+        Warn("no known texMotionVectors provider found (e.g. ReshadeMotionEstimation's DRME technique): motion vectors will be zero (still images only).");
 }
 
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)

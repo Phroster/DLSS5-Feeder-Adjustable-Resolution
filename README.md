@@ -66,21 +66,21 @@ in fast motion, softness on thin moving geometry), and the HUD is processed alon
    **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)** download
    **`dlss5-feed.addon64`** and **`DLSS5_Feed.fx`**. Put `dlss5-feed.addon64` next to the game `.exe`
    (same folder as `dxgi.dll`), and `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`.
-3. **Motion vectors** — iMMERSE **LaunchPad** from
-   **https://github.com/martymcmodding/iMMERSE** → green **Code ▸ Download ZIP**. Copy into your
-   game's `reshade-shaders\` folder: `Shaders\MartysMods_LAUNCHPAD.fx`, the whole
-   `Shaders\MartysMods\` folder, and `Textures\iMMERSE_bluenoise_opt.png`.
-   *(Alternative: any provider exposing `texMotionVectors`, e.g.
-   [ReshadeMotionEstimation](https://github.com/JakobPCoder/ReshadeMotionEstimation) — see
-   [Configuration](#configuration).)*
+3. **Motion vectors** — any shader that writes the community-standard `texMotionVectors`
+   texture. The straightforward choice is
+   **[ReshadeMotionEstimation](https://github.com/JakobPCoder/ReshadeMotionEstimation)**
+   (CC BY-NC 4.0): green **Code ▸ Download ZIP**, copy `MotionEstimation.fx` and the three
+   `MotionEstimation*.fxh`/`MotionVectors.fxh` files into `reshade-shaders\Shaders\`.
+   `qUINT_motionvectors` works too. *(Our shader only reads the shared `texMotionVectors`
+   texture — it includes no third-party shader files.)*
 4. **DLSS 5 neural-rendering add-on** — `renodx-dlss5.addon64` and its model `nvngx_dlssnr.dll`.
    Easiest is the **RHI** installer, which downloads and deploys them for you:
    **https://github.com/RankFTW/RHI/releases** (or get them from the RenoDX Discord). Put both next
    to the game `.exe`. Also drop a **`nvngx_dlss.dll`** there (any DLSS game has one, or use
    [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper)).
-5. **Turn it on in-game** — press **Home** for the ReShade overlay, enable **MartysMods_Launchpad**,
-   then enable **DLSS 5 Feed** *below it*, and enable neural rendering in the **DLSS 5 Neural
-   Rendering** panel. Keep the game's MSAA/SSAA **off**.
+5. **Turn it on in-game** — press **Home** for the ReShade overlay, enable your motion-vector
+   provider's technique (e.g. **DRME**), then enable **DLSS 5 Feed** *below it*, and enable
+   neural rendering in the **DLSS 5 Neural Rendering** panel. Keep the game's MSAA/SSAA **off**.
 
 Check `dlss5-feed.log` (next to the game `.exe`) for `feature ready … DLAA` and `frame N delivered`.
 `dlss5-feed.cfg` is created automatically with working defaults.
@@ -107,8 +107,8 @@ all the actual DLSS/NGX work (details in [The 32-bit path](#the-32-bit-path)).
    needs its **own** copies: a 64-bit ReShade `dxgi.dll`, `renodx-dlss5.addon64`, `nvngx_dlssnr.dll`
    and `nvngx_dlss.dll`. (Run the ReShade installer once against any 64-bit game to obtain the x64
    `dxgi.dll`, or extract `ReShade64.dll` from the installer and rename it.)
-4. **Motion vectors** — LaunchPad into the game's `reshade-shaders\`, exactly as in step 3 of the
-   64-bit instructions.
+4. **Motion vectors** — a `texMotionVectors` provider into the game's `reshade-shaders\`,
+   exactly as in step 3 of the 64-bit instructions.
 5. **Turn it on in-game** — as above. The first fed frame spawns `host64\dlss5-feed-host64.exe`,
    which opens a window titled **"32-bit DLSS 5 Feeder"**. **Press Home in that window** (not in the
    game) to reach the DLSS 5 Neural Rendering panel and its tuning sliders — the add-on and the game
@@ -122,7 +122,7 @@ You will have a separate window, that is where you can customize DLSS 5 addon se
 ## Install for a DirectX 9 game (beta)
 
 A real D3D9 device cannot work directly: ReShade on D3D9 caps at Shader Model 3, so **no** motion
-vector provider (LaunchPad, ReshadeMotionEstimation, qUINT — all SM5) can even compile, and D3D9 has
+vector provider (ReshadeMotionEstimation, qUINT, … — all SM5) can even compile, and D3D9 has
 no shared NT handles or fences for the transport. The fix is to translate D3D9 to D3D11 first with
 **[dgVoodoo2](http://dege.freeweb.hu/dgVoodoo2/)**, which turns the game into the ordinary supported
 case — SM5 shaders, shareable textures, real fences.
@@ -218,7 +218,7 @@ at all — none of which exist on real D3D9.
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
 | DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | from its own author; this project does not include it. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
-| A motion vector provider | iMMERSE **LaunchPad** (proprietary, **not** bundled) or any `texMotionVectors` provider such as **ReshadeMotionEstimation** (CC BY-NC 4.0). Install it yourself. |
+| A motion vector provider | any shader writing the community-standard `texMotionVectors`, e.g. **ReshadeMotionEstimation** (CC BY-NC 4.0) or **qUINT_motionvectors**. Install it yourself — nothing third-party is bundled, and our shader includes no third-party files. |
 | `dlss5-feed.addon64` (or `.addon32` + `host64\`) + `DLSS5_Feed.fx` | this project. |
 
 ## Configuration
@@ -242,15 +242,15 @@ at all — none of which exist on real D3D9.
 
 In `DLSS5_Feed.fx`'s own UI:
 
-* **Motion vector provider** — live switch between LaunchPad and a `texMotionVectors` provider.
 * **MV_SIGN** — if the image doubles or smears while moving, flip a component.
 * **DLSS 5 Feed – debug view** technique — shows the vectors/depth being sent (static scene = grey,
   motion = colour).
+* **DLSS 5 host settings** — 32-bit games only: tune the helper's DLSS 5 parameters from the game's
+  own panel and tick APPLY (see the 32-bit install section).
 
-Whether LaunchPad is *installed* is a compile-time choice, because its headers must be `#include`d
-and cannot coexist with `ReShade.fxh`. Set **`DLSS5_MV_SOURCE`** under *Edit ▸ Preprocessor
-definitions*: `0` = LaunchPad installed (default; the runtime dropdown then offers both), `1` =
-`texMotionVectors` provider only.
+The shader consumes exactly one motion-vector interface: the shared `texMotionVectors` texture.
+Switching providers = enabling a different provider technique above `DLSS 5 Feed`; no recompiles,
+no preprocessor definitions.
 
 ## Logs and troubleshooting
 
@@ -263,9 +263,12 @@ definitions*: `0` = LaunchPad installed (default; the runtime dropdown then offe
 
 Common cases:
 
-* **"unknown technique" for DLSS5_Feed / Launchpad** — the shaders are not in
+* **"unknown technique" for DLSS5_Feed / your provider** — the shaders are not in
   `reshade-shaders\Shaders\`, or the runtime is D3D9 and they cannot compile (see
   [the D3D9 section](#install-for-a-directx-9-game-beta)).
+* **Image is static-sharp but smears when moving** — no provider is writing `texMotionVectors`
+  (the feed log then says "no known texMotionVectors provider found"): enable DRME (or another
+  provider) above DLSS 5 Feed.
 * **Nothing happens, no `dlss5-feed.log`** — ReShade's architecture does not match the game's
   (a 64-bit `dxgi.dll` cannot load into a 32-bit game, and vice versa).
 * **"ran out of video memory" with dgVoodoo** — raise `VRAM` in `dgVoodoo.conf`; the default 256 MB
@@ -305,9 +308,11 @@ NGX links against the Release CRT, so the builds use `/MD`.
 
 * **D3D11↔D3D12 shared-texture / fence transport** adapted from NIGos'
   [dlss5-dx11-bridge](https://github.com/NIGos/dlss5-dx11-bridge) (MIT) — not re-hosted here.
-* **Motion vectors:** Pascal Gilcher's iMMERSE LaunchPad, and Jakob Wapenhensch's
-  [ReshadeMotionEstimation](https://github.com/JakobPCoder/ReshadeMotionEstimation) (CC BY-NC 4.0) —
-  both consumed at runtime, neither bundled.
+* **Motion vectors:** interop happens purely through the community-standard `texMotionVectors`
+  convention. Thanks to Jakob Wapenhensch's
+  [ReshadeMotionEstimation](https://github.com/JakobPCoder/ReshadeMotionEstimation) (CC BY-NC 4.0)
+  and the qUINT ecosystem that established that convention. No provider's files are bundled or
+  included by this project's shader.
 * **DLSS 5 neural rendering:** the RenoDX community's `renodx-dlss5` add-on.
 * **ReShade** add-on API by Patrick Mours.
 * **dgVoodoo2** by Dege — the D3D9 translation layer that makes the DirectX 9 path possible.

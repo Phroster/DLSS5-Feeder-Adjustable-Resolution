@@ -96,6 +96,10 @@ all the actual DLSS/NGX work (details in ["How the 32-bit path works"](#how-the-
    add-on and the game never share a ReShade instance. Set `host_window=0` in `dlss5-feed.cfg` once
    you're happy with the settings, to keep the window out of the way (closing it also just hides it).
 
+You will have a separate window, that is where you can customize DLSS 5 addon settings:
+
+<img width="1880" height="1058" alt="image" src="https://github.com/user-attachments/assets/57abd732-94d2-401c-a524-6536006f3c86" />
+
 Logs: `dlss5-feed.log` next to the game exe (the 32-bit side) and `host64\dlss5-feed-host.log` +
 `host64\ReShade.log` (the 64-bit side, where the DLSS 5 add-on's own messages appear).
 

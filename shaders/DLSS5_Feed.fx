@@ -10,21 +10,29 @@
                            with ReShade's RESHADE_DEPTH_INPUT_* orientation fixes applied.
 
     The add-on only ever looks for those two textures, so ANY motion-vector provider works as long
-    as it lands here. Pick one with DLSS5_MV_SOURCE (Edit > Preprocessor definitions in ReShade):
+    as it lands here.
 
-      DLSS5_MV_SOURCE = 0   iMMERSE LaunchPad (default)
-                            needs MartysMods_LAUNCHPAD.fx + MartysMods\*.fxh, and the
-                            "MartysMods_Launchpad" technique enabled ABOVE this one.
+    Choosing a provider happens on two levels, because whether iMMERSE LaunchPad is INSTALLED is a
+    compile-time question (its headers have to be #included, and they cannot coexist with
+    ReShade.fxh), while which installed provider to USE can be a live setting:
+
+      DLSS5_MV_SOURCE = 0   (default) LaunchPad is installed. Both it and any "texMotionVectors"
+                            provider are then selectable at runtime in this effect's UI
+                            ("Motion vector provider" dropdown) -- no recompile.
+                            Needs MartysMods_LAUNCHPAD.fx + MartysMods\*.fxh.
                             https://github.com/martymcmodding/iMMERSE
 
-      DLSS5_MV_SOURCE = 1   any shader exposing the community-standard "texMotionVectors"
-                            (RG16F, full res, delta UV) -- e.g. Jakob Wapenhensch's
-                            ReshadeMotionEstimation (CC BY-NC 4.0), qUINT_motionvectors, ...
-                            Enable that provider's technique ABOVE this one.
+      DLSS5_MV_SOURCE = 1   LaunchPad is NOT installed. Uses the community-standard
+                            "texMotionVectors" (RG16F, full res, delta UV) only -- e.g. Jakob
+                            Wapenhensch's ReshadeMotionEstimation (CC BY-NC 4.0),
+                            qUINT_motionvectors, ...
                             https://github.com/JakobPCoder/ReshadeMotionEstimation
 
-    Both providers use the same convention (prev_uv = uv + mv, normalised UV). If the image doubles
-    or smears while moving, flip a component of MV_SIGN in this effect's UI.
+    Set it in ReShade under Edit > Preprocessor definitions. Whichever provider you use, enable its
+    technique ABOVE this one in the effect list.
+
+    Both conventions match (prev_uv = uv + mv, normalised UV). If the image doubles or smears while
+    moving, flip a component of MV_SIGN in this effect's UI.
 
     The add-on runs DLSS + DLSS 5 neural rendering right after the "DLSS5_Feed" technique has
     rendered, so anything placed below it in the list is applied on top of the neural output.
@@ -49,6 +57,27 @@ sampler DepthInput { Texture = DepthInputTex; };
 #include ".\MartysMods\mmx_math.fxh"
 #include ".\MartysMods\mmx_camera.fxh"
 #include ".\MartysMods\mmx_deferred.fxh"
+
+// Also bind the shared provider texture, so the two can be swapped live below. If nothing writes
+// it, it simply reads back zero (a static image) -- which is what the dropdown will show you.
+texture texMotionVectors < pooled = false; > { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F; };
+sampler sDLSS5_SharedMV
+{
+    Texture = texMotionVectors;
+    AddressU = Clamp; AddressV = Clamp;
+    MipFilter = Point; MinFilter = Point; MagFilter = Point;
+};
+
+uniform int MV_PROVIDER <
+    ui_type  = "combo";
+    ui_items = "iMMERSE LaunchPad\0texMotionVectors provider (ReshadeMotionEstimation, qUINT, ...)\0";
+    ui_label = "Motion vector provider";
+    ui_tooltip = "Live switch between the installed providers.\n\n"
+                 "'texMotionVectors' only produces motion if such a provider's technique is enabled "
+                 "ABOVE this one; otherwise the vectors read zero and DLSS sees a still image.\n\n"
+                 "If LaunchPad is not installed at all, set DLSS5_MV_SOURCE=1 in the preprocessor "
+                 "definitions instead -- its headers must be #included to compile this option in.";
+> = 0;
 
 #else
 
@@ -108,7 +137,8 @@ float2 PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Ta
     // Both sources hand out "delta UV": previous position = uv + mv. DLSS wants the same
     // direction, in pixels.
 #if DLSS5_MV_SOURCE == 0
-    float2 mv = Deferred::get_motion(uv);
+    float2 mv = MV_PROVIDER == 0 ? Deferred::get_motion(uv)
+                                 : tex2Dlod(sDLSS5_SharedMV, float4(uv, 0.0, 0.0)).rg;
     return mv * float2(BUFFER_SCREEN_SIZE) * MV_SIGN * MV_SCALE;
 #else
     float2 mv = tex2Dlod(sDLSS5_SharedMV, float4(uv, 0.0, 0.0)).rg;
@@ -164,9 +194,10 @@ float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 technique DLSS5_Feed
 <
     ui_label   = "DLSS 5 Feed (place below your motion-vector provider)";
-    ui_tooltip = "Prepares motion vectors + depth for the DLSS 5 Feed add-on.\n"
-                 "Set DLSS5_MV_SOURCE in the preprocessor definitions: 0 = iMMERSE LaunchPad, "
-                 "1 = any shader exposing texMotionVectors (ReshadeMotionEstimation, qUINT, ...).";
+    ui_tooltip = "Prepares motion vectors + depth for the DLSS 5 Feed add-on.\n\n"
+                 "Pick the provider in the 'Motion vector provider' dropdown above.\n"
+                 "If iMMERSE LaunchPad is not installed, set DLSS5_MV_SOURCE=1 in the preprocessor "
+                 "definitions (its headers must be #included to offer it at all).";
 >
 {
     pass MotionVectors { VertexShader = VS_Feed; PixelShader = PS_MotionVectors; RenderTarget = DLSS5_MV;    }

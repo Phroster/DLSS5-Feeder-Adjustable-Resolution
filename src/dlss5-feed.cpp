@@ -1264,8 +1264,32 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
         fin ? "OK" : "FAILED", fout ? "OK" : "FAILED");
     if (!fin || !fout)
     {
-        Log("[feed] the runtime/driver would not import a D3D12 fence; the device probably lacks");
-        Log("[feed] VK_KHR_external_semaphore_win32 / timelineSemaphore (see PLAN-VULKAN.md, phase-0 fallback)");
+        // Diagnose A vs B (see PLAN-VULKAN phase-0 fallback): ask the game's VkDevice
+        // itself whether the external-semaphore/memory import entry points resolve.
+        // vkGetDeviceProcAddr returns null for a DEVICE extension that was not enabled
+        // at vkCreateDevice, so this cleanly separates the two failure modes.
+        typedef void *(__stdcall *PFN_gdpa)(void *device, const char *name);
+        void *vkdev = reinterpret_cast<void *>(g.rs_dev->get_native());
+        HMODULE vk = LoadLibraryW(L"vulkan-1.dll");
+        auto gdpa = vk ? reinterpret_cast<PFN_gdpa>(GetProcAddress(vk, "vkGetDeviceProcAddr")) : nullptr;
+        if (gdpa != nullptr && vkdev != nullptr)
+        {
+            const bool sem = gdpa(vkdev, "vkImportSemaphoreWin32HandleKHR") != nullptr;
+            const bool mem = gdpa(vkdev, "vkGetMemoryWin32HandlePropertiesKHR") != nullptr;
+            Log("[feed] PROBE A/B: on the game's VkDevice  external_semaphore_win32=%s  external_memory_win32=%s",
+                sem ? "PRESENT" : "absent", mem ? "PRESENT" : "absent");
+            if (sem || mem)
+                Log("[feed] -> case B: the extensions ARE enabled; ReShade's create_fence will not import a "
+                    "D3D12 handle type. Fix = raw Vulkan import in the add-on (no layer needed).");
+            else
+                Log("[feed] -> case A: the extensions are NOT enabled at vkCreateDevice. Fix = a small Vulkan "
+                    "layer that appends them + the timelineSemaphore feature (PLAN-VULKAN fallback).");
+        }
+        else
+            Log("[feed] PROBE A/B: could not query the VkDevice (vulkan-1.dll=%p gdpa=%p vkdev=%p)",
+                (void *)vk, (void *)gdpa, vkdev);
+
+        Log("[feed] cross-API fence import failed; see the PROBE A/B line above for which fix applies");
         ShutdownSession();
         FeedDisable("cross-API fence import failed (see dlss5-feed.log)");
         return false;

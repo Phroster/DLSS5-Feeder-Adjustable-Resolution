@@ -36,6 +36,63 @@
 
 static char g_log_path[MAX_PATH];
 static bool g_show_window = false;   // visible host window = the user's door to the DLSS 5 panel
+static bool g_renodx_lazy = false;   // DLSS 5 add-on is v45+ (per-present rescan, lazy adoption)
+
+static void Log(const char *fmt, ...);
+
+// Detect the DLSS 5 add-on generation next to this exe: v45+ ('EnableHooks' marker in
+// the binary) rescans every present and adopts missed features lazily, so the warm-up
+// re-create is unnecessary -- and its EnableHooks key should be '2' (NGX-only) for this
+// feeder, written into OUR ReShade.ini before ReShade loads and the add-on reads it.
+static void DetectRenodxAddon()
+{
+    char dir[MAX_PATH], path[MAX_PATH], ini[MAX_PATH];
+    GetModuleFileNameA(nullptr, dir, MAX_PATH);
+    if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
+    sprintf_s(path, "%srenodx-dlss5.addon64", dir);
+    sprintf_s(ini, "%sReShade.ini", dir);
+
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) { Log("[host] renodx-dlss5.addon64 not found next to the host"); return; }
+    const DWORD size = GetFileSize(f, nullptr);
+    DWORD got = 0;
+    char *buf = (size > 0 && size < 8u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
+    if (buf != nullptr && ReadFile(f, buf, size, &got, nullptr) && got == size)
+        for (DWORD i = 0; i + 11 < size; ++i)
+            if (memcmp(buf + i, "EnableHooks", 11) == 0) { g_renodx_lazy = true; break; }
+    free(buf);
+    CloseHandle(f);
+
+    char ver[48] = "?";
+    DWORD dummy = 0;
+    const DWORD vsize = GetFileVersionInfoSizeA(path, &dummy);
+    if (vsize > 0)
+    {
+        void *vdata = malloc(vsize);
+        VS_FIXEDFILEINFO *ffi = nullptr;
+        UINT flen = 0;
+        if (vdata != nullptr && GetFileVersionInfoA(path, 0, vsize, vdata) &&
+            VerQueryValueA(vdata, "\\", reinterpret_cast<void **>(&ffi), &flen) && ffi != nullptr)
+            sprintf_s(ver, "%u.%u.%u.%u", HIWORD(ffi->dwFileVersionMS), LOWORD(ffi->dwFileVersionMS),
+                      HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS));
+        free(vdata);
+    }
+    Log("[host] DLSS 5 add-on: v%s -- %s engine", ver,
+        g_renodx_lazy ? "v45+ (lazy adoption; warm-up skipped)" : "classic (warm-up stays on)");
+
+    if (g_renodx_lazy)
+    {
+        char v[16] = {};
+        GetPrivateProfileStringA("RenoDX.DLSS5", "EnableHooks", "", v, sizeof(v), ini);
+        if (v[0] == '\0')
+        {
+            WritePrivateProfileStringA("RenoDX.DLSS5", "EnableHooks", "2", ini);
+            Log("[host] EnableHooks was unset; wrote EnableHooks=2 into the host's ReShade.ini");
+        }
+        else
+            Log("[host] EnableHooks=%s (user-set; leaving it alone)", v);
+    }
+}
 
 static void Log(const char *fmt, ...)
 {
@@ -666,7 +723,7 @@ static int Serve(DWORD game_pid)
     // not race that (a 15 ms miss latched STANDBY in Blacklist), so hold it briefly.
     UINT64 hold_until = GetTickCount64() + 800;
     UINT64 evaluated  = 0;
-    bool   warm_done  = false;
+    bool   warm_done  = g_renodx_lazy;   // v45+ adopts missed creates on its own
     int    build_fails = 0;
 
     for (;;)
@@ -755,7 +812,7 @@ static int Serve(DWORD game_pid)
             }
 
             evaluated = 0;
-            warm_done = transport_only;   // no warm-up needed without NGX
+            warm_done = transport_only || g_renodx_lazy;   // no warm-up without NGX / with v45+
 
             FeedBuildAck back = {};
             back.ok         = ok ? 1 : 0;
@@ -854,6 +911,8 @@ int main(int argc, char **argv)
         return 1;
     }
     g_show_window = !test && !hide;   // the visible window carries the DLSS 5 add-on's tuning panel
+
+    DetectRenodxAddon();   // must run BEFORE ReShade loads, so an EnableHooks write is read
 
     if (!InitDisguise()) return 1;
     if (!InitNgx()) { Log("[host] NGX unavailable"); return 1; }

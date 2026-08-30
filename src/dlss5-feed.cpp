@@ -128,6 +128,76 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 }
 
 // ---------------------------------------------------------------------------
+// Which DLSS 5 add-on build is installed? Its engine generation changes how we
+// should behave, so detect it instead of assuming:
+//  - classic builds hook the NGX vtable once and can miss the first create (the
+//    STANDBY latch our warm-up re-create medicates),
+//  - v45+ builds rescan every present and adopt missed features lazily from the
+//    evaluate, making the warm-up re-create pure waste (and a small crash surface),
+//    and add the EnableHooks policy key ('2' = NGX-only, correct for this feeder,
+//    since '1' patches Streamline modules at a self-described contested site).
+// The 'EnableHooks' string in the binary is the v45+ marker.
+// ---------------------------------------------------------------------------
+
+static char g_renodx_ver[48] = "not found";
+static bool g_renodx_lazy    = false;
+
+static void DetectRenodxAddon()
+{
+    char path[MAX_PATH];
+    GetModuleFileNameA(g_self, path, MAX_PATH);
+    if (char *s = strrchr(path, '\\'))
+        strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "renodx-dlss5.addon64");
+
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE)
+    {
+        Log("[feed] DLSS 5 add-on: renodx-dlss5.addon64 not found next to this add-on");
+        return;
+    }
+    const DWORD size = GetFileSize(f, nullptr);
+    DWORD got = 0;
+    char *buf = (size > 0 && size < 8u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
+    if (buf != nullptr && ReadFile(f, buf, size, &got, nullptr) && got == size)
+        for (DWORD i = 0; i + 11 < size; ++i)
+            if (memcmp(buf + i, "EnableHooks", 11) == 0) { g_renodx_lazy = true; break; }
+    free(buf);
+    CloseHandle(f);
+
+    DWORD dummy = 0;
+    const DWORD vsize = GetFileVersionInfoSizeA(path, &dummy);
+    if (vsize > 0)
+    {
+        void *vdata = malloc(vsize);
+        VS_FIXEDFILEINFO *ffi = nullptr;
+        UINT flen = 0;
+        if (vdata != nullptr && GetFileVersionInfoA(path, 0, vsize, vdata) &&
+            VerQueryValueA(vdata, "\\", reinterpret_cast<void **>(&ffi), &flen) && ffi != nullptr)
+            sprintf_s(g_renodx_ver, "%u.%u.%u.%u", HIWORD(ffi->dwFileVersionMS), LOWORD(ffi->dwFileVersionMS),
+                      HIWORD(ffi->dwFileVersionLS), LOWORD(ffi->dwFileVersionLS));
+        free(vdata);
+    }
+
+    Log("[feed] DLSS 5 add-on: renodx-dlss5.addon64 v%s -- %s engine", g_renodx_ver,
+        g_renodx_lazy ? "v45+ (per-present rescan, lazy feature adoption; warm-up re-create skipped)"
+                      : "classic (single hook pass; warm-up re-create stays on)");
+
+    if (g_renodx_lazy)
+    {
+        // Write EnableHooks=2 only when the user has not set it themselves.
+        char v[16];
+        size_t n = sizeof(v);
+        if (!reshade::get_config_value(nullptr, "RenoDX.DLSS5", "EnableHooks", v, &n))
+        {
+            reshade::set_config_value(nullptr, "RenoDX.DLSS5", "EnableHooks", "2");
+            Log("[feed] EnableHooks was unset; wrote EnableHooks=2 (NGX-only -- this feeder calls NGX directly, no Streamline)");
+        }
+        else
+            Log("[feed] EnableHooks=%s (user-set; leaving it alone)", v);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Configuration (dlss5-feed.cfg next to the add-on, re-read every 60 frames)
 // ---------------------------------------------------------------------------
 
@@ -1715,7 +1785,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                     // in LOTR: hooks +215 ms), which latches it in STANDBY. One warm-up re-create
                     // fixes that -- and it is safe now: it goes through RecreateFeatureOnly, which
                     // keeps the old feature if the new create fails or crashes.
-                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
                     {
                         g.warmup_done = true;
                         g.frame_ready = false;
@@ -1967,7 +2037,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
                     Log("[feed] frame %llu delivered (%ux%u, reset=%d, Vulkan transport)", fn, g.width, g.height, reset);
 
-                if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
                 {
                     g.warmup_done = true;
                     g.frame_ready = false;
@@ -2169,7 +2239,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
 
                     // The DLSS 5 add-on sometimes latches STANDBY/FAILED on the very first create and only
                     // recovers on a fresh one; re-create once after the pipeline has settled.
-                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
                     {
                         g.warmup_done = true;
                         g.frame_ready = false;
@@ -2330,6 +2400,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         }
         CfgWriteDefault();
         CfgReload();
+        DetectRenodxAddon();
 
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);

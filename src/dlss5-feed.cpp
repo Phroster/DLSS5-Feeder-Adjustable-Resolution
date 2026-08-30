@@ -1,6 +1,6 @@
 ﻿// dlss5-feed - ReShade add-on
 //
-// NR50 modifications Copyright (c) 2026 Phroster.
+// Resolution-scale modifications Copyright (c) 2026 Phroster.
 // Derived from DLSS5-Feeder by Jean-Laurent ROUZIES and dlss5-dx11-bridge by NIGos.
 // Distributed under the MIT license; see ../LICENSE and ../THIRD_PARTY_NOTICES.md.
 //
@@ -13,7 +13,7 @@
 // processing, the downsampled color/raw depth and motion vectors prepared by the
 // companion effect "DLSS5_Feed.fx" (which converts iMMERSE LaunchPad's optical flow),
 // copies the three into textures shared with a private D3D12 device, runs a genuine
-// native-resolution DLAA evaluate at 50% dimensions on that device -- where the
+// native-resolution DLAA evaluate at the selected dimensions on that device -- where the
 // DLSS 5 add-on inserts its native-resolution Neural Rendering pass --
 // and copies the result back over the backbuffer, still inside ReShade's effect chain.
 //
@@ -43,14 +43,14 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
-#define FEED_VERSION "0.1.0-nr50"
+#define FEED_VERSION "0.2.0-scale"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Feeds DLSS 5 neural rendering with ReShade's depth and LaunchPad motion vectors in games "
-    "without DLSS: runs DLAA plus native Neural Rendering at 50% dimensions on a private D3D12 device, then "
+    "without DLSS: runs DLAA plus native Neural Rendering at a selectable resolution on a private D3D12 device, then "
     "upscales the completed result into the native backbuffer. Needs DLSS5_Feed.fx + MartysMods LaunchPad. "
-    "Settings in dlss5-feed.cfg, re-read while the game runs.";
+    "A 50-100% resolution slider is available in the ReShade overlay; diagnostics remain in dlss5-feed.cfg.";
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -233,6 +233,71 @@ static const char *kEffectFile     = "DLSS5_Feed.fx";
 static const char *kTechnique      = "DLSS5_Feed";
 static const char *kLaunchpadFile  = "MartysMods_LAUNCHPAD.fx";
 static const char *kLaunchpadTech  = "MartysMods_Launchpad";
+static const char *kScaleSection   = "DLSS5Feeder";
+static const char *kScaleKey       = "ResolutionPercent";
+
+static const int kScaleMin = 50;
+static const int kScaleMax = 100;
+static const ULONGLONG kScaleDebounceMs = 400;
+static int       g_scale_percent = 50;
+static int       g_requested_scale_percent = 0;
+static ULONGLONG g_scale_apply_after = 0;
+static bool      g_scale_reload_pending = false;
+
+static bool IsScaleValid(int percent)
+{
+    return percent >= kScaleMin && percent <= kScaleMax;
+}
+
+static void LoadScaleSetting(reshade::api::effect_runtime *rt)
+{
+    int configured = 50;
+    if (!reshade::get_config_value<int>(rt, kScaleSection, kScaleKey, configured) || !IsScaleValid(configured))
+    {
+        configured = 50;
+        reshade::set_config_value<int>(rt, kScaleSection, kScaleKey, configured);
+    }
+    g_scale_percent = configured;
+    g_requested_scale_percent = 0;
+    g_scale_apply_after = 0;
+}
+
+static void ApplyScaleDefinition(reshade::api::effect_runtime *rt, bool reload)
+{
+    if (rt == nullptr) return;
+    char desired[8] = {};
+    sprintf_s(desired, "%d", g_scale_percent);
+    char current[16] = {};
+    const bool differs = !rt->get_preprocessor_definition_for_effect(kEffectFile, "DLSS5_RESOLUTION_PERCENT", current) ||
+                         strcmp(current, desired) != 0;
+    if (!differs) return;
+
+    rt->set_preprocessor_definition_for_effect(kEffectFile, "DLSS5_RESOLUTION_PERCENT", desired);
+    if (reload)
+    {
+        g_scale_reload_pending = true;
+        rt->reload_effect_next_frame(kEffectFile);
+    }
+    Log("[feed] resolution scale set to %d%%%s", g_scale_percent, reload ? "; reloading DLSS5_Feed.fx" : "");
+}
+
+// Returns true when a settled slider value was committed and this frame should stop
+// while ReShade recompiles the effect. Dragging only updates the deadline, so a single
+// shader/NGX rebuild happens after the user pauses for 400 ms.
+static bool ApplyPendingScale(reshade::api::effect_runtime *rt)
+{
+    if (g_requested_scale_percent == 0 || GetTickCount64() < g_scale_apply_after) return false;
+
+    const int next = g_requested_scale_percent;
+    g_requested_scale_percent = 0;
+    g_scale_apply_after = 0;
+    if (next == g_scale_percent) return false;
+
+    g_scale_percent = next;
+    reshade::set_config_value<int>(rt, kScaleSection, kScaleKey, g_scale_percent);
+    ApplyScaleDefinition(rt, true);
+    return true;
+}
 
 struct Feed
 {
@@ -243,6 +308,7 @@ struct Feed
     reshade::api::effect_texture_variable  color_var;
     reshade::api::effect_texture_variable  mv_var;
     reshade::api::effect_texture_variable  depth_var;
+    reshade::api::effect_uniform_variable  scale_var;
     bool                                   depth_reversed;
     bool                                   handles_ok;
     bool                                   missing_reported;
@@ -668,7 +734,7 @@ static bool BuildResources(UINT render_w, UINT render_h, UINT backbuffer_w, UINT
 
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
-    // Native DLAA contract at 50% dimensions. The RenoDX add-on therefore runs
+    // Native DLAA contract at the selected dimensions. The RenoDX add-on therefore runs
     // Feature 18 natively at this cheaper resolution; only the completed result
     // is spatially expanded to the unchanged game backbuffer.
     int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
@@ -714,8 +780,8 @@ static bool BuildResources(UINT render_w, UINT render_h, UINT backbuffer_w, UINT
         return false;
     }
 
-    Log("[feed] feature ready: %ux%u DLAA/NR50 -> %ux%u backbuffer, flags=%d (%s%s%s%s), color %s -> output %s, depth R32_FLOAT%s, mv R16G16_FLOAT",
-        render_w, render_h, backbuffer_w, backbuffer_h, flags,
+    Log("[feed] feature ready: %ux%u DLAA/NR at %d%% -> %ux%u backbuffer, flags=%d (%s%s%s%s), color %s -> output %s, depth R32_FLOAT%s, mv R16G16_FLOAT",
+        render_w, render_h, g_scale_percent, backbuffer_w, backbuffer_h, flags,
         (flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) ? "HDR " : "SDR ",
         (flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) ? "MVLowRes " : "",
         (flags & NVSDK_NGX_DLSS_Feature_Flags_DepthInverted) ? "DepthInverted " : "",
@@ -965,6 +1031,7 @@ static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *d
 
 static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
+    if (ApplyPendingScale(rt)) return;
     if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
 
     LARGE_INTEGER t0, t1;
@@ -993,7 +1060,7 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
         if (!g.missing_reported)
         {
             g.missing_reported = true;
-            Warn("DLSS5_Feed.fx textures not found (technique %s). Install the matching NR50 DLSS5_Feed.fx + MartysMods LaunchPad and enable both.",
+            Warn("DLSS5_Feed.fx textures not found (technique %s). Install the matching resolution-scale DLSS5_Feed.fx + MartysMods LaunchPad and enable both.",
                  g.technique.handle ? "found" : "MISSING");
         }
         return;
@@ -1054,8 +1121,8 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
                bd.Width != g.backbuffer_width || bd.Height != g.backbuffer_height || bd.Format != g.bb_fmt ||
                TypedColorFormat(cd.Format) != g.color_fmt))
     {
-        Log("[feed] building NR50: %ux%u DLAA/NR inputs -> %ux%u backbuffer %s (color %s, mv %s, depth %s, depth reversed=%d)",
-            cd.Width, cd.Height, bd.Width, bd.Height, FormatName(bd.Format), FormatName(cd.Format),
+        Log("[feed] building %d%% scale: %ux%u DLAA/NR inputs -> %ux%u backbuffer %s (color %s, mv %s, depth %s, depth reversed=%d)",
+            g_scale_percent, cd.Width, cd.Height, bd.Width, bd.Height, FormatName(bd.Format), FormatName(cd.Format),
             FormatName(md.Format), FormatName(dd.Format), g.depth_reversed ? 1 : 0);
         ok = BuildResources(cd.Width, cd.Height, bd.Width, bd.Height, cd.Format, bd.Format);
         if (!ok) FeedFail("resource build");
@@ -1142,8 +1209,8 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
                     const UINT64 n = ++g.frames_done;
                     g.consecutive_fails = 0;
                     if (n <= static_cast<UINT64>(g_cfg.log_frames) || (n % 1800) == 0)
-                        Log("[feed] frame %llu delivered (%ux%u DLAA/NR50 -> %ux%u backbuffer, reset=%d)", n,
-                            g.render_width, g.render_height, g.backbuffer_width, g.backbuffer_height, reset);
+                        Log("[feed] frame %llu delivered (%ux%u DLAA/NR at %d%% -> %ux%u backbuffer, reset=%d)", n,
+                            g.render_width, g.render_height, g_scale_percent, g.backbuffer_width, g.backbuffer_height, reset);
 
                     // The DLSS 5 add-on sometimes latches STANDBY/FAILED on the very first create and only
                     // recovers on a fresh one; re-create once after the pipeline has settled.
@@ -1177,7 +1244,19 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     g.color_var = rt->find_texture_variable(kEffectFile, "DLSS5_Color");
     g.mv_var    = rt->find_texture_variable(kEffectFile, "DLSS5_MV");
     g.depth_var = rt->find_texture_variable(kEffectFile, "DLSS5_Depth");
+    g.scale_var = rt->find_uniform_variable(kEffectFile, "RESOLUTION_PERCENT");
     g.launchpad = rt->find_technique(kLaunchpadFile, kLaunchpadTech);
+
+    if (g.scale_var.handle != 0)
+    {
+        int32_t current_percent = 50;
+        rt->get_uniform_value_int(g.scale_var, &current_percent, 1);
+        if (current_percent != g_scale_percent)
+        {
+            const int32_t selected_value = static_cast<int32_t>(g_scale_percent);
+            rt->set_uniform_value_int(g.scale_var, &selected_value, 1);
+        }
+    }
 
     char v[16] = {};
     g.depth_reversed = true;  // ReShade.fxh's own default when the definition is absent
@@ -1186,6 +1265,10 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
 
     g.handles_ok = g.technique.handle != 0 && g.color_var.handle != 0 && g.mv_var.handle != 0 && g.depth_var.handle != 0;
     g.missing_reported = false;
+
+    // ReShade briefly invalidates all effect handles while applying one of our requested
+    // recompiles. That is an expected transition, not a missing-installation error.
+    if (!g.handles_ok && g_scale_reload_pending) return;
 
     // Games can recreate the swapchain (and ReShade its runtime) dozens of times per second;
     // only say something when the situation actually changed.
@@ -1211,6 +1294,8 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
     g.runtime = rt;
+    LoadScaleSetting(rt);
+    ApplyScaleDefinition(rt, true);
     ResolveHandles(rt);
     // A recreated runtime means the DLSS 5 add-on has re-armed its hooks: give it a fresh feature.
     if (g.session_ready) g.frame_ready = false;
@@ -1226,13 +1311,24 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
     if (++destroys <= 8) Log("[feed] effect runtime %p destroyed", (void *)rt);
     ReleaseFrameResources();
     g.runtime = nullptr;
-    g.technique = {}; g.launchpad = {}; g.color_var = {}; g.mv_var = {}; g.depth_var = {};
+    g.technique = {}; g.launchpad = {}; g.color_var = {}; g.mv_var = {}; g.depth_var = {}; g.scale_var = {};
     g.handles_ok = false;
 }
 
 static void OnReloadedEffects(reshade::api::effect_runtime *rt)
 {
-    if (rt == g.runtime || g.runtime == nullptr) { g.runtime = rt; ResolveHandles(rt); }
+    if (rt == g.runtime || g.runtime == nullptr)
+    {
+        g.runtime = rt;
+        ResolveHandles(rt);
+        if (g_scale_reload_pending && g.handles_ok)
+        {
+            g_scale_reload_pending = false;
+            g.frame_ready = false;
+            g.need_reset = true;
+            Log("[feed] %d%% resolution scale compiled; the DLSS/NR contract will rebuild on the next frame", g_scale_percent);
+        }
+    }
 }
 
 static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::effect_technique technique,
@@ -1250,6 +1346,28 @@ static void OnDestroyDevice(reshade::api::device *dev)
         Log("[feed] D3D11 device destroyed; shutting the session down");
         ShutdownSession();
     }
+}
+
+static bool OnSetUniformValue(reshade::api::effect_runtime *rt, reshade::api::effect_uniform_variable variable,
+                              const void *data, size_t size)
+{
+    if (rt != g.runtime || variable.handle == 0 || variable.handle != g.scale_var.handle ||
+        data == nullptr || size < sizeof(int32_t)) return false;
+
+    int32_t next_percent = 50;
+    memcpy(&next_percent, data, sizeof(next_percent));
+    if (!IsScaleValid(next_percent)) return true;
+
+    if (next_percent == g_scale_percent)
+    {
+        g_requested_scale_percent = 0;
+        g_scale_apply_after = 0;
+        return false;
+    }
+
+    g_requested_scale_percent = next_percent;
+    g_scale_apply_after = GetTickCount64() + kScaleDebounceMs;
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1283,6 +1401,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        reshade::register_event<reshade::addon_event::reshade_set_uniform_value>(OnSetUniformValue);
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
@@ -1291,6 +1410,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        reshade::unregister_event<reshade::addon_event::reshade_set_uniform_value>(OnSetUniformValue);
         ShutdownSession();
         reshade::unregister_addon(module);
         Log("shut down cleanly.");

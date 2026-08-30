@@ -42,12 +42,13 @@ if ((Test-Path -LiteralPath $feedLog -PathType Leaf) -and (Test-Path -LiteralPat
     $feedText = Get-Content -LiteralPath $feedLog -Raw
     $reshadeText = Get-Content -LiteralPath $reshadeLog -Raw
 
-    $feedMatches = [regex]::Matches($feedText, 'feature ready:\s*(\d+)x(\d+)\s+DLAA/NR50\s*->\s*(\d+)x(\d+)\s+backbuffer', 'IgnoreCase')
+    $feedPattern = 'feature ready:\s*(?<w>\d+)x(?<h>\d+)\s+DLAA/NR(?:50|\s+at\s+(?<scale>\d+)%)\s*->\s*(?<bw>\d+)x(?<bh>\d+)\s+backbuffer'
+    $feedMatches = [regex]::Matches($feedText, $feedPattern, 'IgnoreCase')
     $renoMatches = [regex]::Matches($reshadeText, 'feature 18 created.*?NR input\s+(\d+)x(\d+)\s*->\s*output\s+(\d+)x(\d+)\s+with guides\s+(\d+)x(\d+)', 'IgnoreCase')
     $evalMatches = [regex]::Matches($reshadeText, 'inline feature 18 evaluation succeeded', 'IgnoreCase')
 
     if ($feedMatches.Count -eq 0) {
-        Fail 'Feeder did not report a ready NR50 contract in dlss5-feed.log.'
+        Fail 'Feeder did not report a ready DLAA/NR resolution contract in dlss5-feed.log.'
     }
     if ($renoMatches.Count -eq 0) {
         Fail 'RenoDX did not report creation of the expected Feature 18 contract in ReShade.log.'
@@ -61,13 +62,24 @@ if ((Test-Path -LiteralPath $feedLog -PathType Leaf) -and (Test-Path -LiteralPat
     if (($feedMatches.Count -gt 0) -and ($renoMatches.Count -gt 0)) {
         $f = $feedMatches[$feedMatches.Count - 1]
         $r = $renoMatches[$renoMatches.Count - 1]
-        $feedInput = "$($f.Groups[1].Value)x$($f.Groups[2].Value)"
-        $backbuffer = "$($f.Groups[3].Value)x$($f.Groups[4].Value)"
+        $feedWidth = [int]$f.Groups['w'].Value
+        $feedHeight = [int]$f.Groups['h'].Value
+        $backbufferWidth = [int]$f.Groups['bw'].Value
+        $backbufferHeight = [int]$f.Groups['bh'].Value
+        $scale = if ($f.Groups['scale'].Success) { [int]$f.Groups['scale'].Value } else { 50 }
+        $feedInput = "${feedWidth}x${feedHeight}"
+        $backbuffer = "${backbufferWidth}x${backbufferHeight}"
         $renoInput = "$($r.Groups[1].Value)x$($r.Groups[2].Value)"
         $renoOutput = "$($r.Groups[3].Value)x$($r.Groups[4].Value)"
         $renoGuides = "$($r.Groups[5].Value)x$($r.Groups[6].Value)"
         if (($feedInput -eq $renoInput) -and ($feedInput -eq $renoOutput) -and ($feedInput -eq $renoGuides)) {
-            Pass "Matched contract: $feedInput DLAA/NR50 -> $backbuffer backbuffer."
+            $expectedWidth = if ($scale -eq 100) { $backbufferWidth } else { ([int][math]::Floor(($backbufferWidth * $scale) / 100.0)) -band -2 }
+            $expectedHeight = if ($scale -eq 100) { $backbufferHeight } else { ([int][math]::Floor(($backbufferHeight * $scale) / 100.0)) -band -2 }
+            if (($feedWidth -eq $expectedWidth) -and ($feedHeight -eq $expectedHeight)) {
+                Pass "Matched $scale% contract: $feedInput DLAA/NR -> $backbuffer backbuffer."
+            } else {
+                Fail "Scale mismatch: $scale% of $backbuffer should be ${expectedWidth}x${expectedHeight}, but Feeder used $feedInput."
+            }
         } else {
             Fail "Contract mismatch: Feeder=$feedInput, RenoDX input=$renoInput, output=$renoOutput, guides=$renoGuides."
         }
@@ -83,8 +95,8 @@ if ((Test-Path -LiteralPath $feedLog -PathType Leaf) -and (Test-Path -LiteralPat
 }
 
 if ($failed) {
-    Write-Host 'NR50 verification failed.' -ForegroundColor Red
+    Write-Host 'DLSS5 Feeder resolution-scale verification failed.' -ForegroundColor Red
     exit 1
 }
-Write-Host 'NR50 verification passed.' -ForegroundColor Green
+Write-Host 'DLSS5 Feeder resolution-scale verification passed.' -ForegroundColor Green
 exit 0

@@ -25,6 +25,7 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 - [Install for a 32-bit game](#install-for-a-32-bit-game-beta)
 - [Install for a DirectX 9 game](#install-for-a-directx-9-game-beta)
 - [Install for a Vulkan game](#install-for-a-vulkan-game)
+- [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider)
 - [How it works](#how-it-works)
   - [The 32-bit path](#the-32-bit-path)
   - [The DirectX 9 path](#the-directx-9-path)
@@ -60,6 +61,19 @@ D3D9 via a wrapper.
 **This is beta software.** Expect the temporal quality of *estimated* motion vectors (some ghosting
 in fast motion, softness on thin moving geometry), and the HUD is processed along with the scene.
 
+> ### 0.6.0-beta: read this before installing
+>
+> **The motion-vector provider is now chosen with a preprocessor definition** (`DLSS5_MV_PROVIDER`)
+> instead of being whichever shader happens to write `texMotionVectors`. Five providers are
+> supported and the recommended one is **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX)
+> Kernel** — see [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider).
+>
+> **If you installed a release up to 0.5.2 and followed the old instructions, your feed has most
+> likely been running on zero motion vectors.** ReshadeMotionEstimation (DRME), which those releases
+> recommended, **does not compile on ReShade 6.8** (`error X3020: cannot sample from texture that is
+> also used as render target`). ReShade still lists it as an enabled technique, so nothing looked
+> wrong — but it wrote nothing. This release detects that and says so in the overlay and the log.
+
 ## Install for a 64-bit game
 
 1. **ReShade with add-on support** — from **https://reshade.me**, run the installer, pick your game's
@@ -69,23 +83,32 @@ in fast motion, softness on thin moving geometry), and the HUD is processed alon
    **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)** download
    **`dlss5-feed.addon64`** and **`DLSS5_Feed.fx`**. Put `dlss5-feed.addon64` next to the game `.exe`
    (same folder as `dxgi.dll`), and `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`.
-3. **Motion vectors** — any shader that writes the community-standard `texMotionVectors`
-   texture. The straightforward choice is
-   **[ReshadeMotionEstimation](https://github.com/JakobPCoder/ReshadeMotionEstimation)**
-   (CC BY-NC 4.0): green **Code ▸ Download ZIP**, copy `MotionEstimation.fx` and the three
-   `MotionEstimation*.fxh`/`MotionVectors.fxh` files into `reshade-shaders\Shaders\`.
-   `qUINT_motionvectors` works too. *(Our shader only reads the shared `texMotionVectors`
-   texture — it includes no third-party shader files.)*
+3. **Motion vectors** — the recommended provider is
+   **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX)** (its own repository; nothing of it
+   is bundled here). Green **Code ▸ Download ZIP**, then copy
+   - everything in its `Shaders\` — the `lumenite_*.fx` files **and** the `include\` folder —
+     into `reshade-shaders\Shaders\`
+   - `Textures\lumenite_bluenoise256.png` into `reshade-shaders\Textures\`
+
+   Four other providers are supported; see
+   [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider).
+   *(Our shader only reads the provider's output texture — it includes no third-party shader files.)*
 4. **DLSS 5 neural-rendering add-on** — `renodx-dlss5.addon64` and its model `nvngx_dlssnr.dll`.
    Easiest is the **RHI** installer, which downloads and deploys them for you:
    **https://github.com/RankFTW/RHI/releases** (or get them from the RenoDX Discord). Put both next
    to the game `.exe`. Also drop a **`nvngx_dlss.dll`** there (any DLSS game has one, or use
    [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper)).
-5. **Turn it on in-game** — press **Home** for the ReShade overlay, enable your motion-vector
-   provider's technique (e.g. **DRME**), then enable **DLSS 5 Feed** *below it*, and enable
-   neural rendering in the **DLSS 5 Neural Rendering** panel. Keep the game's MSAA/SSAA **off**.
+5. **Point the shader at that provider** — press **Home** for the ReShade overlay, select
+   `DLSS5_Feed.fx`, and in its **Preprocessor definitions** set **`DLSS5_MV_PROVIDER` = `3`**
+   (LumeniteFX Kernel), then reload effects. The shader's panel then reads
+   *"Motion vector provider: LumeniteFX Kernel"*.
+6. **Turn it on in-game** — enable **"LUMENITE: Kernel 2.0"**, then enable **DLSS 5 Feed**
+   *below it*, and enable neural rendering in the **DLSS 5 Neural Rendering** panel. Keep the
+   game's MSAA/SSAA **off**.
 
-Check `dlss5-feed.log` (next to the game `.exe`) for `feature ready … DLAA` and `frame N delivered`.
+Check `dlss5-feed.log` (next to the game `.exe`) for `feature ready … DLAA`, `frame N delivered`,
+and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`. The overlay's
+**Motion vectors** section shows the same, in red if the shader and the enabled provider disagree.
 `dlss5-feed.cfg` is created automatically with working defaults.
 
 > **Do I need the DLSS 5 DX11 *bridge*?** **No.** DLSS5-Feeder does the bridge's job for games that
@@ -110,8 +133,8 @@ all the actual DLSS/NGX work (details in [The 32-bit path](#the-32-bit-path)).
    needs its **own** copies: a 64-bit ReShade `dxgi.dll`, `renodx-dlss5.addon64`, `nvngx_dlssnr.dll`
    and `nvngx_dlss.dll`. (Run the ReShade installer once against any 64-bit game to obtain the x64
    `dxgi.dll`, or extract `ReShade64.dll` from the installer and rename it.)
-4. **Motion vectors** — a `texMotionVectors` provider into the game's `reshade-shaders\`,
-   exactly as in step 3 of the 64-bit instructions.
+4. **Motion vectors** — a provider into the game's `reshade-shaders\`, and the matching
+   `DLSS5_MV_PROVIDER` definition, exactly as in steps 3 and 5 of the 64-bit instructions.
 5. **Turn it on in-game** — as above, and check **ReShade's overlay → Add-ons tab → DLSS 5 Feed**:
    the day-to-day DLSS 5 settings (neural uplift, NR intensity/style, …) are right there with an
    **Apply** button — see [Configuration](#configuration). Set `host_window=0` on that page once
@@ -173,7 +196,7 @@ Same pieces as a 64-bit game — with two differences.
    gates it per-application, so make sure your game's exe is in that list (ReShade's installer adds
    it when you point it at the exe). The add-ons still go next to the game exe, and the game's
    `ReShade.ini` needs `AddonPath=.\` under `[ADDON]` so they are found there.
-2. **Everything else is identical** — `dlss5-feed.addon64`, `DLSS5_Feed.fx`, a `texMotionVectors`
+2. **Everything else is identical** — `dlss5-feed.addon64`, `DLSS5_Feed.fx`, a motion-vector
    provider, `renodx-dlss5.addon64` + the `nvngx_*.dll` files, exactly as in the
    [64-bit instructions](#install-for-a-64-bit-game). The DLSS evaluate runs on a private D3D12
    device (see [The Vulkan path](#the-vulkan-path)); nothing extra is needed for that.
@@ -196,13 +219,65 @@ layer\run-with-feed-layer.bat "E:\path\to\game.exe"
 
 See [`layer/README.md`](layer/README.md). It does the same job from outside the process.
 
+## Motion vectors: choosing a provider
+
+DLSS5-Feeder does not estimate motion itself — it reads the output of a motion-vector shader you
+install. Which one it reads is fixed **at compile time** by the `DLSS5_MV_PROVIDER` preprocessor
+definition on `DLSS5_Feed.fx` (ReShade overlay → select `DLSS5_Feed.fx` → *Preprocessor
+definitions* → reload effects):
+
+| Value | Provider | Enable this technique | Notes |
+| --- | --- | --- | --- |
+| `0` *(default)* | Anything writing the shared **`texMotionVectors`** — qUINT, `dh_uber_motion`, DRME | that shader's own | The old convention. **DRME does not compile on ReShade 6.8** (see below). |
+| `1` | **iMMERSE Launchpad** (MartysMods) | `Launchpad` | Also files Launchpad's per-frame optical-flow request, so it works without iMMERSE RTGI running. Warping around flames/transparents is worst here. |
+| `2` | **VORT** | `vort_Motion` | MIT. |
+| **`3`** | **LumeniteFX Kernel** ← **recommended** | `LUMENITE: Kernel 2.0` | 1/8-resolution flow **plus a confidence map**, which the feed uses. The configuration this beta was tuned on. |
+| `4` | **LumeniteFX QuantMotion** | `LUMENITE: QuantMotion` | Same shape as Kernel, different estimator. |
+
+Rules that apply to all of them:
+
+* The provider's technique must be **enabled and above `DLSS 5 Feed`** in the technique list.
+* Only **one** provider should be enabled. The add-on warns (overlay + log) when the shader is
+  compiled for one provider while a different one is enabled — the classic silent failure.
+* Nothing of any provider is bundled or `#include`d here: the shader declares the provider's output
+  texture **identically** to the provider itself, so ReShade binds the same resource. Only the
+  selected provider's texture is allocated.
+
+> **ReshadeMotionEstimation (DRME) does not compile on ReShade 6.8**
+> (`error X3020: 'V__texCur0': cannot sample from texture that is also used as render target`).
+> It still appears as a technique and can be "enabled", but it writes nothing, so DLSS runs with no
+> motion vectors at all. Releases up to 0.5.2 recommended it. This release reads the compiler error
+> out of `ReShade.log` and reports it in the overlay and `dlss5-feed.log`.
+
+### Are the vectors actually arriving?
+
+Two independent checks, both new in 0.6.0:
+
+* The overlay's **Motion vectors** section states the mode, the provider found, and its state
+  (`enabled` / `DISABLED` / `FAILED TO COMPILE` / `not installed`), in red when something is wrong.
+* An **MV probe** reads back the vectors *actually handed to DLSS* every 600 frames and logs their
+  mean/max magnitude and non-zero share: `MV probe … N% non-zero`. While you move, that must not
+  be 0%.
+
+### Validation and the trust mask
+
+Every provider here is *optical flow*: it answers a lighting change — a flickering light, a flame —
+with a confident vector pointing at whatever happened to match, and DLSS then warps history in from
+there. `DLSS5_Feed.fx` now reprojects each vector into the previous frame and checks it: depth
+(disocclusion), vector consistency, and a *static-hypothesis* test asking whether "did not move"
+explains the pixel better, on illumination-normalised structure. Vectors that fail are zeroed, and
+the pixel is flagged in a `DLSS5_Mask` texture the add-on passes to DLSS as its
+**bias-current-colour mask** — DLSS's own mechanism for "don't trust history for this pixel"
+(all three transports; the 32-bit add-on does not pass it yet). The defaults are the tuned ones.
+
 ## How it works
 
-* `DLSS5_Feed.fx` (companion effect) converts the provider's motion vectors (delta-UV,
-  `prev_uv = uv + mv`) into `DLSS5_MV` (RG16F, **pixels**), and copies the raw hardware depth with
-  ReShade's orientation fixes into `DLSS5_Depth` (R32F).
+* `DLSS5_Feed.fx` (companion effect) converts the selected provider's motion vectors (delta-UV,
+  `prev_uv = uv + mv`) into `DLSS5_MV` (RG16F, **pixels**), copies the raw hardware depth with
+  ReShade's orientation fixes into `DLSS5_Depth` (R32F), and flags every vector it does not trust
+  in `DLSS5_Mask` (R8).
 * `dlss5-feed.addon64` registers with the ReShade add-on API. After the `DLSS5_Feed` technique
-  renders, it takes the backbuffer + those two textures and runs `NGX_D3D12_EVALUATE_DLSS` in DLAA
+  renders, it takes the backbuffer + those textures and runs `NGX_D3D12_EVALUATE_DLSS` in DLAA
   mode (render size = output size, no jitter). The DLSS 5 neural-rendering add-on
   (`renodx-dlss5.addon64`) detours that D3D12 evaluate and inserts its neural pass — it cannot tell
   the contract is synthetic.
@@ -285,7 +360,7 @@ down. The hook is removed on DLL unload, since ReShade reloads add-ons per Vulka
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
 | DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | from its own author; this project does not include it. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
-| A motion vector provider | any shader writing the community-standard `texMotionVectors`, e.g. **ReshadeMotionEstimation** (CC BY-NC 4.0) or **qUINT_motionvectors**. Install it yourself — nothing third-party is bundled, and our shader includes no third-party files. |
+| A motion vector provider | one of five, selected with the `DLSS5_MV_PROVIDER` definition — **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) Kernel is recommended** (`=3`); also iMMERSE Launchpad, VORT, LumeniteFX QuantMotion, or anything writing `texMotionVectors` (qUINT, `dh_uber_motion`). **Not DRME — it does not compile on ReShade 6.8.** See [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider). Install it yourself — nothing third-party is bundled, and our shader includes no third-party files. |
 | `dlss5-feed.addon64` (or `.addon32` + `host64\`) + `DLSS5_Feed.fx` | this project. |
 
 ## Configuration
@@ -317,15 +392,26 @@ if you prefer editing the file directly:
 | `mv_scale_x/y` | 1.0 | extra motion-vector multiplier. |
 | `host_window` | 1 | **32-bit games only.** 1 shows the helper's window; 0 hides it (its own settings are now on the overlay page above, so you rarely need it). |
 
-In `DLSS5_Feed.fx`'s own UI (a handful of settings that only make sense per-shader, not per-session):
+In `DLSS5_Feed.fx`'s own UI (settings that only make sense per-shader, not per-session):
 
 * **MV_SIGN** — if the image doubles or smears while moving, flip a component.
-* **DLSS 5 Feed – debug view** technique — shows the vectors/depth being sent (static scene = grey,
-  motion = colour).
+* **Validation** — *Validate motion vectors* and its four tests (static hypothesis, luma, depth,
+  consistency) with their thresholds. **The defaults are the tuned ones**; the usual reason to
+  touch them is diagnosis. Setting *Depth tolerance* to `0` does not mean "strict" — it rejects
+  effectively every vector, which is stable but motionless.
+* **Use geometry vectors** — **experimental, off, not recommended.** Fits a camera model from the
+  provider's flow + depth and derives static pixels' vectors from geometry. It removes the
+  flame/flicker warping by construction, but the fit is noisy frame to frame and the HUD, which is
+  not part of the 3D world, gets camera vectors it should not have.
+* **DLSS 5 Feed – debug view** technique — nine views: the vectors/depth being sent (static scene =
+  grey, motion = colour), the provider's confidence map, the validation mask alone and over the
+  image, which test fired, and the three geometry views.
 
-The shader consumes exactly one motion-vector interface: the shared `texMotionVectors` texture.
-Switching providers = enabling a different provider technique above `DLSS 5 Feed`; no recompiles,
-no preprocessor definitions.
+Preprocessor definitions on the shader (overlay → *Preprocessor definitions* → reload effects):
+
+| Definition | Default | Meaning |
+| --- | --- | --- |
+| `DLSS5_MV_PROVIDER` | `0` | Which provider's output to read — see [the provider table](#motion-vectors-choosing-a-provider). |
 
 ## Logs and troubleshooting
 
@@ -341,9 +427,15 @@ Common cases:
 * **"unknown technique" for DLSS5_Feed / your provider** — the shaders are not in
   `reshade-shaders\Shaders\`, or the runtime is D3D9 and they cannot compile (see
   [the D3D9 section](#install-for-a-directx-9-game-beta)).
-* **Image is static-sharp but smears when moving** — no provider is writing `texMotionVectors`
-  (the feed log then says "no known texMotionVectors provider found"): enable DRME (or another
-  provider) above DLSS 5 Feed.
+* **Image is static-sharp but smears when moving** — no vectors are reaching DLSS. The overlay's
+  **Motion vectors** section says which of the four causes it is: the provider is not installed,
+  it is installed but **disabled**, it **failed to compile** (DRME on ReShade 6.8 — use LumeniteFX
+  Kernel instead), or a *different* provider is enabled than the one `DLSS5_MV_PROVIDER` selects.
+  The `MV probe … 0% non-zero` line in `dlss5-feed.log` confirms it independently.
+* **Warping / smearing around flames, flickering lights or transparents** — optical flow answers a
+  lighting change with a wrong-but-confident vector. Keep validation on (default), try provider
+  `3` (LumeniteFX Kernel) rather than Launchpad, and try `preset=5` or `6` in `dlss5-feed.cfg`
+  (the legacy CNN presets clamp history harder).
 * **Nothing happens, no `dlss5-feed.log`** — ReShade's architecture does not match the game's
   (a 64-bit `dxgi.dll` cannot load into a 32-bit game, and vice versa).
 * **"ran out of video memory" with dgVoodoo** — raise `VRAM` in `dgVoodoo.conf`; the default 256 MB
@@ -380,6 +472,11 @@ NGX links against the Release CRT, so the builds use `/MD`.
   gain yet; a jittered render-at-lower / output-at-higher upscaling mode is future work.
 * Estimated motion vectors → temporal artifacts in fast motion; the UI is processed with the scene
   (a UI mask / pre-UI colour capture is future work).
+* **Geometry vectors are experimental and off.** The camera-model fit is derived from the provider's
+  own flow, so it inherits that noise, and it has no way to know the HUD is not part of the scene.
+  Doing it properly needs the game's real view-projection matrices, not a fit.
+* A light that flickers faster than DLSS's history converges is averaged into a slow pulse. The
+  trust mask reduces it; nothing available to a post-process feed removes it.
 * Exclusive-fullscreen swapchain churn can make some games reload effects repeatedly; windowed is
   smoother.
 * Depends on a closed-source, community-distributed DLSS 5 add-on and the NGX runtime; both can change.
@@ -391,11 +488,15 @@ NGX links against the Release CRT, so the builds use `/MD`.
 
 * **D3D11↔D3D12 shared-texture / fence transport** adapted from NIGos'
   [dlss5-dx11-bridge](https://github.com/NIGos/dlss5-dx11-bridge) (MIT) — not re-hosted here.
-* **Motion vectors:** interop happens purely through the community-standard `texMotionVectors`
-  convention. Thanks to Jakob Wapenhensch's
-  [ReshadeMotionEstimation](https://github.com/JakobPCoder/ReshadeMotionEstimation) (CC BY-NC 4.0)
-  and the qUINT ecosystem that established that convention. No provider's files are bundled or
-  included by this project's shader.
+* **Motion vectors:** interop happens purely by declaring each provider's output texture
+  identically, so ReShade binds the same resource — the mechanism `dh_uber_rt` and VORT use. Thanks
+  to **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX)** (Umar Afzaal), **iMMERSE
+  Launchpad** (MartysMods), **VORT** (MIT), Jakob Wapenhensch's
+  [ReshadeMotionEstimation](https://github.com/JakobPCoder/ReshadeMotionEstimation) (CC BY-NC 4.0),
+  the qUINT ecosystem that established the `texMotionVectors` convention, and
+  [AlucardDH's dh-reshade-shaders](https://github.com/AlucardDH/dh-reshade-shaders) for the
+  provider-switch pattern. **No provider's files are bundled or included by this project's shader**
+  — install them from their own repositories, under their own licenses.
 * **DLSS 5 neural rendering:** the RenoDX community's `renodx-dlss5` add-on.
 * **ReShade** add-on API by Patrick Mours.
 * **dgVoodoo2** by Dege — the D3D9 translation layer that makes the DirectX 9 path possible.

@@ -22,6 +22,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <string>
 
 #define ImTextureID ImU64   // required by reshade_overlay.hpp before including imgui.h
 #include <imgui.h>
@@ -29,14 +30,15 @@
 
 #include "feed_ipc.h"
 
-#define FEED_VERSION "0.5.2"
+#define FEED_VERSION "0.6.0-beta.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Feeds DLSS 5 neural rendering in 32-bit D3D11 games without DLSS: ships the frame, depth and "
     "motion vectors to a 64-bit helper process (host64\\dlss5-feed-host64.exe) over cross-process "
-    "shared GPU textures, and blits the neural result back. Needs DLSS5_Feed.fx and a texMotionVectors "
-    "provider (e.g. ReshadeMotionEstimation). Settings in dlss5-feed.cfg.";
+    "shared GPU textures, and blits the neural result back. Needs DLSS5_Feed.fx and a motion-vector "
+    "provider (DRME, qUINT, Launchpad, VORT or LumeniteFX; pick it with the DLSS5_MV_PROVIDER definition). "
+    "Settings in dlss5-feed.cfg.";
 
 // ---------------------------------------------------------------------------
 // Logging (same shape as the 64-bit add-on)
@@ -182,11 +184,77 @@ static bool CfgReload()   // true when a build-affecting value changed
 
 static const char *kEffectFile    = "DLSS5_Feed.fx";
 static const char *kTechnique     = "DLSS5_Feed";
-// Known texMotionVectors providers -- a name check only, for the status line.
-static const struct { const char *file, *tech; } kMvProviders[] = {
-    { "MotionEstimation.fx",    "DRME" },
-    { "qUINT_motionvectors.fx", "MotionVectors" },
+// Known motion-vector providers, keyed by the DLSS5_MV_PROVIDER value DLSS5_Feed.fx
+// was compiled with (0 texMotionVectors, 1 Launchpad, 2 VORT, 3 LumeniteFX Kernel,
+// 4 LumeniteFX QuantMotion). Name checks only, for the status line and a mismatch warning.
+static const struct { int mode; const char *file, *tech; } kMvProviders[] = {
+    { 0, "MotionEstimation.fx",     "DRME" },
+    { 0, "qUINT_motionvectors.fx",  "MotionVectors" },
+    { 0, "dh_uber_motion.fx",       "DH_UBER_MOTION_020" },
+    { 1, "MartysMods_LAUNCHPAD.fx", "MartysMods_Launchpad" },
+    { 2, "vort_Motion.fx",          "vort_MotionEffects" },
+    { 3, "lumenite_Kernel.fx",      "Lumenite_Kernel" },
+    { 4, "lumenite_QuantMotion.fx", "Lumenite_QuantMotion" },
 };
+static const char *kMvModeName[] = { "texMotionVectors", "Launchpad", "VORT", "LumeniteFX Kernel", "LumeniteFX QuantMotion" };
+static const int   kMvModeCount  = static_cast<int>(sizeof(kMvModeName) / sizeof(kMvModeName[0]));
+
+static char g_mv_status[192]  = "not checked yet";
+static char g_mv_problem[640] = "";
+
+// A provider whose effect failed to compile is still listed (and can be "enabled") but writes
+// nothing. ReShade logs the compiler error next to the game; the last line about that file
+// -- an error or a "Successfully compiled" -- is the current state. Same as the 64-bit add-on.
+static bool ProviderCompileError(const char *file, char *out, size_t out_size)
+{
+    out[0] = '\0';
+    char path[MAX_PATH];
+    GetModuleFileNameA(g_self, path, MAX_PATH);
+    if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "ReShade.log");
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "rb") != 0 || f == nullptr) return false;
+    fseek(f, 0, SEEK_END);
+    const long size = ftell(f);
+    const long take = size < 512 * 1024 ? size : 512 * 1024;
+    fseek(f, size - take, SEEK_SET);
+    std::string buf(static_cast<size_t>(take), '\0');
+    const size_t got = fread(buf.data(), 1, buf.size(), f);
+    fclose(f);
+    buf.resize(got);
+
+    char needle_err[MAX_PATH], needle_ok[MAX_PATH];
+    _snprintf_s(needle_err, sizeof(needle_err), _TRUNCATE, "\\%s(", file);
+    _snprintf_s(needle_ok,  sizeof(needle_ok),  _TRUNCATE, "\\%s'",  file);
+    bool failed = false;
+    size_t pos = 0;
+    while (pos < buf.size())
+    {
+        size_t eol = buf.find('\n', pos);
+        if (eol == std::string::npos) eol = buf.size();
+        const std::string line = buf.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (line.find(needle_ok) != std::string::npos && line.find("Successfully compiled") != std::string::npos)
+            failed = false;
+        else if (const size_t at = line.find(needle_err); at != std::string::npos && line.find("error") != std::string::npos)
+        {
+            failed = true;
+            std::string msg = line.substr(at + 1);
+            while (!msg.empty() && (msg.back() == '\r' || msg.back() == ' ')) msg.pop_back();
+            strncpy_s(out, out_size, msg.c_str(), _TRUNCATE);
+        }
+    }
+    return failed;
+}
+
+static int ReadMvProviderMode(reshade::api::effect_runtime *rt)
+{
+    char v[16] = {};
+    int mode = 0;
+    if (rt->get_preprocessor_definition_for_effect(kEffectFile, "DLSS5_MV_PROVIDER", v) ||
+        rt->get_preprocessor_definition("DLSS5_MV_PROVIDER", v))
+        mode = atoi(v);
+    return (mode < 0 || mode >= kMvModeCount) ? 0 : mode;
+}
 
 struct Feed32
 {
@@ -845,13 +913,26 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     g.technique = rt->find_technique(kEffectFile, kTechnique);
     g.mv_var    = rt->find_texture_variable(kEffectFile, "DLSS5_MV");
     g.depth_var = rt->find_texture_variable(kEffectFile, "DLSS5_Depth");
+    const int mode = ReadMvProviderMode(rt);
     g.launchpad = {};
     const char *provider = "none";
+    const char *provider_file = nullptr;
+    reshade::api::effect_technique other = {};
+    const char *other_tech = nullptr;
+    int other_mode = -1;
     for (const auto &p : kMvProviders)
     {
         const reshade::api::effect_technique t = rt->find_technique(p.file, p.tech);
-        if (t.handle != 0) { g.launchpad = t; provider = p.tech; break; }
+        if (t.handle == 0) continue;
+        const bool on = rt->get_technique_state(t);
+        if (p.mode == mode)
+        {
+            if (g.launchpad.handle == 0 || on) { g.launchpad = t; provider = p.tech; provider_file = p.file; }
+        }
+        else if (on && other.handle == 0) { other = t; other_tech = p.tech; other_mode = p.mode; }
     }
+    char compile_error[512] = {};
+    const bool provider_broken = provider_file != nullptr && ProviderCompileError(provider_file, compile_error, sizeof(compile_error));
 
     if (!g_host_nr_loaded)
     {
@@ -870,14 +951,41 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     g.handles_ok = g.technique.handle != 0 && g.mv_var.handle != 0 && g.depth_var.handle != 0;
     g.missing_reported = false;
 
+    const bool provider_on = g.launchpad.handle && rt->get_technique_state(g.launchpad);
     const int signature = (g.technique.handle ? 1 : 0) | (g.mv_var.handle ? 2 : 0) | (g.depth_var.handle ? 4 : 0) |
-                          (g.launchpad.handle ? 8 : 0) | (g.depth_reversed ? 16 : 0);
+                          (g.launchpad.handle ? 8 : 0) | (g.depth_reversed ? 16 : 0) | (provider_on ? 32 : 0) |
+                          (mode << 6) | (other.handle ? 512 : 0) | ((other_mode & 7) << 10) | (provider_broken ? 8192 : 0);
     static int last_signature = -1;
     if (signature == last_signature) return;
     last_signature = signature;
-    Log("[feed32] effects: technique %s, DLSS5_MV %s, DLSS5_Depth %s, MV provider %s, depth reversed=%d",
+
+    _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> %s (%s)",
+                mode, kMvModeName[mode], provider,
+                g.launchpad.handle ? (provider_broken ? "FAILED TO COMPILE" : provider_on ? "enabled" : "DISABLED") : "not installed");
+    g_mv_problem[0] = '\0';
+    Log("[feed32] effects: technique %s, DLSS5_MV %s, DLSS5_Depth %s, %s, depth reversed=%d",
         g.technique.handle ? "found" : "MISSING", g.mv_var.handle ? "found" : "MISSING",
-        g.depth_var.handle ? "found" : "MISSING", provider, g.depth_reversed ? 1 : 0);
+        g.depth_var.handle ? "found" : "MISSING", g_mv_status, g.depth_reversed ? 1 : 0);
+    if (g.handles_ok && g.launchpad.handle == 0)
+        _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
+                    "DLSS5_Feed.fx is compiled for motion-vector provider %d (%s) but no known %s shader is installed: motion vectors will be zero. "
+                    "Install one, or change the DLSS5_MV_PROVIDER preprocessor definition.", mode, kMvModeName[mode], kMvModeName[mode]);
+    else if (g.handles_ok && provider_broken)
+        _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
+                    "motion-vector provider %s FAILED TO COMPILE, so it writes nothing and DLSS runs on zero vectors. ReShade.log: %s -- use another provider (VORT: DLSS5_MV_PROVIDER=2).",
+                    provider, compile_error);
+    else if (g.handles_ok && !provider_on)
+        _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
+                    "motion-vector provider %s is installed but DISABLED: enable it above DLSS 5 Feed.", provider);
+    if (other.handle != 0)
+    {
+        char more[320];
+        _snprintf_s(more, sizeof(more), _TRUNCATE,
+                    "%s%s is enabled, but DLSS5_Feed.fx is compiled for provider %d (%s) and does not read it -- set the DLSS5_MV_PROVIDER preprocessor definition to %d to use it.",
+                    g_mv_problem[0] ? " " : "", other_tech, mode, kMvModeName[mode], other_mode);
+        strncat_s(g_mv_problem, sizeof(g_mv_problem), more, _TRUNCATE);
+    }
+    if (g_mv_problem[0]) Warn("%s", g_mv_problem);
 }
 
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
@@ -958,6 +1066,9 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Text("Feed: %s", g.disabled ? "disabled (see dlss5-feed.log)" : g.built ? "built" : "not built");
     ImGui::Text("Host process: %s", HostAlive() ? "running" : "not running");
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
+    ImGui::TextWrapped("Motion vectors: %s", g_mv_status);
+    if (g_mv_problem[0])
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "%s", g_mv_problem);
     if (g.disabled && ImGui::Button("Re-enable"))
     {
         g.disabled = false;

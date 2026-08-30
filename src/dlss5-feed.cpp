@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <string>
 
 #define ImTextureID ImU64   // required by reshade_overlay.hpp before including imgui.h
 #include <imgui.h>
@@ -46,14 +47,14 @@
 #include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 
-#define FEED_VERSION "0.5.2"
+#define FEED_VERSION "0.6.0-beta.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Feeds DLSS 5 neural rendering with ReShade's depth and estimated motion vectors in D3D11 and "
     "D3D12 games without DLSS: runs a real DLSS DLAA pass where the DLSS 5 add-on hooks in (a private "
     "D3D12 device for D3D11 games, the game's own device for D3D12) and writes the result back into "
-    "the frame. Needs DLSS5_Feed.fx and a texMotionVectors provider (e.g. ReshadeMotionEstimation). "
+    "the frame. Needs DLSS5_Feed.fx and a motion-vector provider (DRME, qUINT, Launchpad, VORT or LumeniteFX; pick it with the DLSS5_MV_PROVIDER definition). "
     "Settings in dlss5-feed.cfg.";
 
 // ---------------------------------------------------------------------------
@@ -333,18 +334,95 @@ static void CfgSave()
 // State
 // ---------------------------------------------------------------------------
 
-enum { SLOT_COLOR = 0, SLOT_OUTPUT, SLOT_DEPTH, SLOT_MV, SLOT_COUNT };
-static const char *kSlotName[SLOT_COUNT] = { "Color", "Output", "Depth", "MV" };
+// SLOT_MASK: the shader's DLSS5_Mask (R8, 1 = the motion vector there failed validation), handed
+// to DLSS as its "bias current colour" mask so it favours the current frame instead of warping
+// history in. Optional: an older DLSS5_Feed.fx without it simply means no mask is passed.
+enum { SLOT_COLOR = 0, SLOT_OUTPUT, SLOT_DEPTH, SLOT_MV, SLOT_MASK, SLOT_COUNT };
+static const char *kSlotName[SLOT_COUNT] = { "Color", "Output", "Depth", "MV", "Mask" };
 
 static const char *kEffectFile     = "DLSS5_Feed.fx";
 static const char *kTechnique      = "DLSS5_Feed";
-// Known texMotionVectors providers -- a name check only, used for a helpful status
-// line. The shader consumes the community-standard texMotionVectors texture; any
-// effect that writes it works, listed here or not.
-static const struct { const char *file, *tech; } kMvProviders[] = {
-    { "MotionEstimation.fx",    "DRME" },
-    { "qUINT_motionvectors.fx", "MotionVectors" },
+// Known motion-vector providers, keyed by the DLSS5_MV_PROVIDER value DLSS5_Feed.fx
+// was compiled with (0 texMotionVectors, 1 Launchpad, 2 VORT, 3 LumeniteFX Kernel,
+// 4 LumeniteFX QuantMotion). Name checks only, for the status line and a mismatch
+// warning: the shader itself binds the selected provider's output texture, and any
+// effect that writes that texture works, listed here or not.
+static const struct { int mode; const char *file, *tech; } kMvProviders[] = {
+    { 0, "MotionEstimation.fx",     "DRME" },
+    { 0, "qUINT_motionvectors.fx",  "MotionVectors" },
+    { 0, "dh_uber_motion.fx",       "DH_UBER_MOTION_020" },
+    { 1, "MartysMods_LAUNCHPAD.fx", "MartysMods_Launchpad" },
+    { 2, "vort_Motion.fx",          "vort_MotionEffects" },
+    { 3, "lumenite_Kernel.fx",      "Lumenite_Kernel" },
+    { 4, "lumenite_QuantMotion.fx", "Lumenite_QuantMotion" },
 };
+static const char *kMvModeName[] = { "texMotionVectors", "Launchpad", "VORT", "LumeniteFX Kernel", "LumeniteFX QuantMotion" };
+static const int   kMvModeCount  = static_cast<int>(sizeof(kMvModeName) / sizeof(kMvModeName[0]));
+
+// What the overlay shows under "Motion vectors": the resolved provider line, and the problem
+// with it if there is one (empty when everything lines up).
+static char g_mv_status[192]  = "not checked yet";
+static char g_mv_problem[640] = "";
+
+// ReShade keeps a technique of an effect that FAILED to compile in its list, and it can even
+// be "enabled" -- it just never runs. ReshadeMotionEstimation on ReShade 6.8 is the textbook
+// case ("cannot sample from texture that is also used as render target"): the feed then gets
+// all-zero vectors and DLSS quietly degrades to a still-image contract. There is no add-on
+// API for compile status, but ReShade writes every compiler error to its own log next to the
+// game as "<path>\<file>(line, col): error ...", and a success as "Successfully compiled
+// '<path>\<file>'". Whichever of the two came LAST for that file is the current state.
+static bool ProviderCompileError(const char *file, char *out, size_t out_size)
+{
+    out[0] = '\0';
+    char path[MAX_PATH];
+    GetModuleFileNameA(g_self, path, MAX_PATH);
+    if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "ReShade.log");
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "rb") != 0 || f == nullptr) return false;
+    fseek(f, 0, SEEK_END);
+    const long size = ftell(f);
+    const long take = size < 512 * 1024 ? size : 512 * 1024;   // the tail is where the last reload is
+    fseek(f, size - take, SEEK_SET);
+    std::string buf(static_cast<size_t>(take), '\0');
+    const size_t got = fread(buf.data(), 1, buf.size(), f);
+    fclose(f);
+    buf.resize(got);
+
+    char needle_err[MAX_PATH], needle_ok[MAX_PATH];
+    _snprintf_s(needle_err, sizeof(needle_err), _TRUNCATE, "\\%s(", file);
+    _snprintf_s(needle_ok,  sizeof(needle_ok),  _TRUNCATE, "\\%s'",  file);
+    bool failed = false;
+    size_t pos = 0;
+    while (pos < buf.size())
+    {
+        size_t eol = buf.find('\n', pos);
+        if (eol == std::string::npos) eol = buf.size();
+        const std::string line = buf.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (line.find(needle_ok) != std::string::npos && line.find("Successfully compiled") != std::string::npos)
+            failed = false;
+        else if (const size_t at = line.find(needle_err); at != std::string::npos && line.find("error") != std::string::npos)
+        {
+            failed = true;
+            std::string msg = line.substr(at + 1);
+            while (!msg.empty() && (msg.back() == '\r' || msg.back() == ' ')) msg.pop_back();
+            strncpy_s(out, out_size, msg.c_str(), _TRUNCATE);
+        }
+    }
+    return failed;
+}
+
+// The DLSS5_MV_PROVIDER value DLSS5_Feed.fx is compiled with: the effect's own
+// definition first, then the global list, else the shader's default of 0.
+static int ReadMvProviderMode(reshade::api::effect_runtime *rt)
+{
+    char v[16] = {};
+    int mode = 0;
+    if (rt->get_preprocessor_definition_for_effect(kEffectFile, "DLSS5_MV_PROVIDER", v) ||
+        rt->get_preprocessor_definition("DLSS5_MV_PROVIDER", v))
+        mode = atoi(v);
+    return (mode < 0 || mode >= kMvModeCount) ? 0 : mode;
+}
 
 struct Feed
 {
@@ -354,6 +432,8 @@ struct Feed
     reshade::api::effect_technique         launchpad;
     reshade::api::effect_texture_variable  mv_var;
     reshade::api::effect_texture_variable  depth_var;
+    reshade::api::effect_texture_variable  mask_var;      // DLSS5_Mask; handle 0 with an older shader
+    bool                                   mask_ok;       // this frame: DLSS5_Mask present, right size/format, copied
     bool                                   depth_reversed;
     bool                                   handles_ok;
     bool                                   missing_reported;
@@ -617,9 +697,12 @@ static void CloseListGuarded()
 // NGX crashed while recording into our list: it may hold half-written commands, and
 // executing those is what actually takes the game down (the driver faults later on
 // another thread). Close it guarded, throw it away WITHOUT executing, replace it.
+static void MvProbeAbort();   // defined with the motion-vector probe below
+
 static void AbortCommands()
 {
     if (g.list == nullptr) return;
+    MvProbeAbort();   // a probe copy recorded into this list will never execute
     CloseListGuarded();
     SafeRelease(g.list);
     if (g.alloc[g.frame_slot] != nullptr && g.dev12 != nullptr &&
@@ -628,6 +711,117 @@ static void AbortCommands()
         g.list->Close();
     else
         Log("[feed] could not replace the aborted command list");
+}
+
+// ---------------------------------------------------------------------------
+// Motion-vector probe. Every kMvProbeEvery frames, copy a 64x64 block from the centre of
+// the MV texture DLSS is about to read into a readback buffer, and analyse the PREVIOUS
+// probe's block -- submitted hundreds of frames ago, so the map never stalls the GPU.
+// It answers, in pixels, the question no other signal can: is the selected provider
+// actually delivering vectors, or is DLSS being fed zeros?
+// ---------------------------------------------------------------------------
+
+static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOURCE_STATES to);   // defined below
+
+static const UINT kMvProbeSize  = 64;
+static const UINT kMvProbePitch = 256;   // 64 texels of R16G16_FLOAT = 256 bytes = the D3D12 row-pitch alignment
+static const UINT kMvProbeEvery = 600;
+
+static ID3D12Resource *g_mv_probe_buf;
+static UINT64          g_mv_probe_fence;    // fence value that completes the pending copy; 0 = nothing pending
+static UINT64          g_mv_probe_frames;
+static char            g_mv_probe[200] = "no motion-vector probe yet (first one after 600 frames)";
+
+static float HalfToFloat(uint16_t h)
+{
+    const uint32_t s = (h & 0x8000u) << 16, e = (h >> 10) & 0x1F, m = h & 0x3FF;
+    uint32_t bits;
+    if (e == 0)       bits = m == 0 ? s : 0;                      // zero / denormal (treated as 0)
+    else if (e == 31) bits = s | 0x7F800000u | (m << 13);        // inf / nan
+    else              bits = s | ((e + 112) << 23) | (m << 13);
+    float f; memcpy(&f, &bits, 4);
+    return f;
+}
+
+static void MvProbeAnalyse()
+{
+    void *p = nullptr;
+    const D3D12_RANGE read = { 0, kMvProbePitch * kMvProbeSize };
+    if (FAILED(g_mv_probe_buf->Map(0, &read, &p)) || p == nullptr) return;
+    double sum = 0.0, maxlen = 0.0;
+    int nonzero = 0;
+    for (UINT y = 0; y < kMvProbeSize; ++y)
+    {
+        const uint16_t *row = reinterpret_cast<const uint16_t *>(static_cast<const uint8_t *>(p) + y * kMvProbePitch);
+        for (UINT x = 0; x < kMvProbeSize; ++x)
+        {
+            const float mx = HalfToFloat(row[x * 2]), my = HalfToFloat(row[x * 2 + 1]);
+            const double len = sqrt(static_cast<double>(mx) * mx + static_cast<double>(my) * my);
+            if (len != len) continue;   // NaN
+            sum += len;
+            if (len > maxlen) maxlen = len;
+            if (len > 1e-4) ++nonzero;
+        }
+    }
+    const D3D12_RANGE none = { 0, 0 };
+    g_mv_probe_buf->Unmap(0, &none);
+    const int total = static_cast<int>(kMvProbeSize * kMvProbeSize);
+    _snprintf_s(g_mv_probe, sizeof(g_mv_probe), _TRUNCATE,
+                "MV probe (centre 64x64, frame %llu): mean |mv| %.3f px, max %.2f px, %d%% non-zero%s",
+                static_cast<unsigned long long>(g_mv_probe_frames), sum / total, maxlen, nonzero * 100 / total,
+                nonzero * 100 / total < 2 ? "  <-- DLSS is getting (almost) no motion vectors" : "");
+    Log("[feed] %s", g_mv_probe);
+}
+
+// Call while recording, with the MV texture in 'state' (it is returned to that state).
+static void MvProbeRecord(ID3D12Resource *mv, D3D12_RESOURCE_STATES state)
+{
+    if (mv == nullptr || g.dev12 == nullptr || g.list == nullptr || g.fence12 == nullptr) return;
+    if ((++g_mv_probe_frames % kMvProbeEvery) != 0) return;
+    if (g.width < kMvProbeSize || g.height < kMvProbeSize) return;
+
+    if (g_mv_probe_fence != 0)
+    {
+        if (g.fence12->GetCompletedValue() < g_mv_probe_fence) return;   // still in flight (should not happen at this cadence)
+        MvProbeAnalyse();
+        g_mv_probe_fence = 0;
+    }
+    if (g_mv_probe_buf == nullptr)
+    {
+        D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+        D3D12_RESOURCE_DESC   rd = {};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; rd.Width = kMvProbePitch * kMvProbeSize;
+        rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1; rd.SampleDesc.Count = 1;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                    __uuidof(ID3D12Resource), reinterpret_cast<void **>(&g_mv_probe_buf))))
+            return;
+    }
+
+    D3D12_TEXTURE_COPY_LOCATION src = {};
+    src.pResource = mv; src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; src.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = g_mv_probe_buf; dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dst.PlacedFootprint.Offset = 0;
+    dst.PlacedFootprint.Footprint = { DXGI_FORMAT_R16G16_FLOAT, kMvProbeSize, kMvProbeSize, 1, kMvProbePitch };
+    const UINT x0 = (g.width - kMvProbeSize) / 2, y0 = (g.height - kMvProbeSize) / 2;
+    const D3D12_BOX box = { x0, y0, 0, x0 + kMvProbeSize, y0 + kMvProbeSize, 1 };
+
+    if (state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(mv, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    g.list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+    if (state != D3D12_RESOURCE_STATE_COPY_SOURCE) Barrier(mv, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
+    g_mv_probe_fence = g.fence_value + 1;   // exactly what EndCommands() signals for this list
+}
+
+static void MvProbeAbort()
+{
+    g_mv_probe_fence = 0;
+}
+
+static void MvProbeShutdown()
+{
+    SafeRelease(g_mv_probe_buf);
+    g_mv_probe_fence = 0;
 }
 
 static void SafeReleaseFeature(NVSDK_NGX_Handle *f)
@@ -848,7 +1042,8 @@ static bool BuildResources(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     bool ok = MakeSharedPair(dev1, SLOT_COLOR,  w, h, g.color_fmt,           false) &&
               MakeSharedPair(dev1, SLOT_OUTPUT, w, h, g.output_fmt,          true)  &&
               MakeSharedPair(dev1, SLOT_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT, false) &&
-              MakeSharedPair(dev1, SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false);
+              MakeSharedPair(dev1, SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false) &&
+              MakeSharedPair(dev1, SLOT_MASK,   w, h, DXGI_FORMAT_R8_UNORM, false);
     dev1->Release();
     if (!ok) { ReleaseFrameResources(); return false; }
 
@@ -1074,6 +1269,7 @@ static void ShutdownSession()
     if (g.fence_event != nullptr) { CloseHandle(g.fence_event); g.fence_event = nullptr; }
     SafeRelease(g.list);
     for (int i = 0; i < Feed::kFrames; ++i) SafeRelease(g.alloc[i]);
+    MvProbeShutdown();
     SafeRelease(g.queue);
     SafeRelease(g.dev12);
     g.session_ready = false;
@@ -1512,7 +1708,8 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     if (!MakeSharedTexVk(SLOT_COLOR,  w, h, g.color_fmt,             false, copy_rw, reshade::api::resource_usage::copy_dest) ||
         !MakeSharedTexVk(SLOT_OUTPUT, w, h, g.output_fmt,            true,  copy_rw, reshade::api::resource_usage::copy_source) ||
         !MakeSharedTexVk(SLOT_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,   false, copy_rw, reshade::api::resource_usage::copy_dest) ||
-        !MakeSharedTexVk(SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false, copy_rw, reshade::api::resource_usage::copy_dest))
+        !MakeSharedTexVk(SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false, copy_rw, reshade::api::resource_usage::copy_dest) ||
+        !MakeSharedTexVk(SLOT_MASK,   w, h, DXGI_FORMAT_R8_UNORM,     false, copy_rw, reshade::api::resource_usage::copy_dest))
     {
         ReleaseFrameResources();
         return false;
@@ -1670,6 +1867,21 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
     auto *depth = reinterpret_cast<ID3D12Resource *>(dev_api->get_resource_from_view(d_srv).handle);
     if (bb == nullptr || mv == nullptr || depth == nullptr) return;
 
+    // Optional validation mask (older shaders have none); zero-copy like mv/depth.
+    ID3D12Resource *mask = nullptr;
+    g.mask_ok = false;
+    if (g.mask_var.handle != 0)
+    {
+        resource_view m_srv = {}, m_srgb = {};
+        rt->get_texture_binding(g.mask_var, &m_srv, &m_srgb);
+        if (m_srv.handle != 0) mask = reinterpret_cast<ID3D12Resource *>(dev_api->get_resource_from_view(m_srv).handle);
+        if (mask != nullptr)
+        {
+            const D3D12_RESOURCE_DESC kd = mask->GetDesc();
+            g.mask_ok = kd.Width == bb->GetDesc().Width && kd.Height == bb->GetDesc().Height && kd.Format == DXGI_FORMAT_R8_UNORM;
+        }
+    }
+
     const D3D12_RESOURCE_DESC cd = bb->GetDesc(), md = mv->GetDesc(), dd = depth->GetDesc();
     const UINT w = static_cast<UINT>(cd.Width), h = cd.Height;
     if (cd.Width != md.Width || h != md.Height || cd.Width != dd.Width || h != dd.Height ||
@@ -1770,12 +1982,16 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
                 g.need_reset = false;
 
+                // ReShade parked the effect textures as shader_resource (both SR states on D3D12).
+                MvProbeRecord(mv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
                 NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
                 ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
                 ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
                 ep.Feature.InSharpness = 0.0f;
                 ep.pInDepth          = depth;   // the effect textures themselves: zero-copy
                 ep.pInMotionVectors  = mv;
+                ep.pInBiasCurrentColorMask = g.mask_ok ? mask : nullptr;   // the shader's validation mask
                 ep.InJitterOffsetX   = 0.0f;
                 ep.InJitterOffsetY   = 0.0f;
                 ep.InRenderSubrectDimensions.Width  = g.width;
@@ -1895,6 +2111,23 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     const resource depth_res = dev_api->get_resource_from_view(d_srv);
     if (bb_res.handle == 0 || mv_res.handle == 0 || depth_res.handle == 0) return;
 
+    // Optional validation mask (older shaders have none).
+    resource mask_res = {};
+    g.mask_ok = false;
+    if (g.mask_var.handle != 0)
+    {
+        resource_view m_srv = {}, m_srgb = {};
+        rt->get_texture_binding(g.mask_var, &m_srv, &m_srgb);
+        if (m_srv.handle != 0) mask_res = dev_api->get_resource_from_view(m_srv);
+        if (mask_res.handle != 0)
+        {
+            const resource_desc kd = dev_api->get_resource_desc(mask_res);
+            const resource_desc bd = dev_api->get_resource_desc(bb_res);
+            g.mask_ok = kd.texture.width == bd.texture.width && kd.texture.height == bd.texture.height &&
+                        kd.texture.format == format::r8_unorm;
+        }
+    }
+
     const resource_desc cd = dev_api->get_resource_desc(bb_res);
     const resource_desc md = dev_api->get_resource_desc(mv_res);
     const resource_desc dd = dev_api->get_resource_desc(depth_res);
@@ -1967,6 +2200,24 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
         FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MV],    VK_IMAGE_LAYOUT_GENERAL, w, h);
         FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
+        if (g.mask_ok)
+        {
+            // The mask goes the same way, and is handed straight back to shader_resource here.
+            VkImage mk_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(mask_res.handle));
+            {
+                const resource       res[1]  = { mask_res };
+                const resource_usage from[1] = { resource_usage::shader_resource };
+                const resource_usage to[1]   = { resource_usage::copy_source };
+                cl->barrier(1, res, from, to);
+            }
+            FeedVkCopyImage(&g.vk, cb, mk_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MASK], VK_IMAGE_LAYOUT_GENERAL, w, h);
+            {
+                const resource       res[1]  = { mask_res };
+                const resource_usage from[1] = { resource_usage::copy_source };
+                const resource_usage to[1]   = { resource_usage::shader_resource };
+                cl->barrier(1, res, from, to);
+            }
+        }
 
         if (g_cfg.mode == 1)
         {
@@ -2014,6 +2265,8 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                MvProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
                 NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
@@ -2022,6 +2275,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 ep.Feature.InSharpness = 0.0f;
                 ep.pInDepth          = g.tex12[SLOT_DEPTH];
                 ep.pInMotionVectors  = g.tex12[SLOT_MV];
+                ep.pInBiasCurrentColorMask = g.mask_ok ? g.tex12[SLOT_MASK] : nullptr;   // the shader's validation mask
                 ep.InJitterOffsetX   = 0.0f;
                 ep.InJitterOffsetY   = 0.0f;
                 ep.InRenderSubrectDimensions.Width  = g.width;
@@ -2047,6 +2301,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                     Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                     Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
                     EndCommands();
                     if (NVSDK_NGX_FAILED(re))
@@ -2137,15 +2392,26 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     auto *depth_res = reinterpret_cast<ID3D11Resource *>(dev_api->get_resource_from_view(d_srv).handle);
     auto *rtv11     = reinterpret_cast<ID3D11RenderTargetView *>(rtv.handle);
 
-    D3D11_TEXTURE2D_DESC cd = {}, md = {}, dd = {};
+    // Optional validation mask (older shaders have none).
+    ID3D11Resource *mask_res = nullptr;
+    if (g.mask_var.handle != 0)
+    {
+        reshade::api::resource_view m_srv = {}, m_srgb = {};
+        rt->get_texture_binding(g.mask_var, &m_srv, &m_srgb);
+        if (m_srv.handle != 0) mask_res = reinterpret_cast<ID3D11Resource *>(dev_api->get_resource_from_view(m_srv).handle);
+    }
+
+    D3D11_TEXTURE2D_DESC cd = {}, md = {}, dd = {}, kd = {};
     ID3D11Texture2D *color = AsTexture2D(color_res, &cd);
     ID3D11Texture2D *mv    = AsTexture2D(mv_res, &md);
     ID3D11Texture2D *depth = AsTexture2D(depth_res, &dd);
+    ID3D11Texture2D *mask  = mask_res != nullptr ? AsTexture2D(mask_res, &kd) : nullptr;
     if (color == nullptr || mv == nullptr || depth == nullptr)
     {
-        SafeRelease(color); SafeRelease(mv); SafeRelease(depth);
+        SafeRelease(color); SafeRelease(mv); SafeRelease(depth); SafeRelease(mask);
         return;
     }
+    g.mask_ok = mask != nullptr && kd.Width == cd.Width && kd.Height == cd.Height && kd.Format == DXGI_FORMAT_R8_UNORM;
 
     bool ok = true;
     if (cd.Width != md.Width || cd.Height != md.Height || cd.Width != dd.Width || cd.Height != dd.Height ||
@@ -2207,6 +2473,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
         ctx->CopyResource(g.tex11[SLOT_COLOR], color);
         ctx->CopyResource(g.tex11[SLOT_DEPTH], depth);
         ctx->CopyResource(g.tex11[SLOT_MV], mv);
+        if (g.mask_ok) ctx->CopyResource(g.tex11[SLOT_MASK], mask);
 
         if (g_cfg.mode == 1)
         {
@@ -2228,6 +2495,8 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                MvProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
                 const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
@@ -2239,6 +2508,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 ep.Feature.InSharpness = 0.0f;
                 ep.pInDepth          = g.tex12[SLOT_DEPTH];
                 ep.pInMotionVectors  = g.tex12[SLOT_MV];
+                ep.pInBiasCurrentColorMask = g.mask_ok ? g.tex12[SLOT_MASK] : nullptr;   // the shader's validation mask
                 ep.InJitterOffsetX   = 0.0f;
                 ep.InJitterOffsetY   = 0.0f;
                 ep.InRenderSubrectDimensions.Width  = g.width;
@@ -2266,6 +2536,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                 Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                 Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
                 const UINT64 v_out = EndCommands();
 
@@ -2303,6 +2574,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     SafeRelease(color);
     SafeRelease(mv);
     SafeRelease(depth);
+    SafeRelease(mask);
 
     QueryPerformanceCounter(&t1);
     TimingTick(t0.QuadPart, t1.QuadPart);
@@ -2329,14 +2601,31 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     g.technique = rt->find_technique(kEffectFile, kTechnique);
     g.mv_var    = rt->find_texture_variable(kEffectFile, "DLSS5_MV");
     g.depth_var = rt->find_texture_variable(kEffectFile, "DLSS5_Depth");
-    // Which known texMotionVectors provider is present? Purely informational.
+    g.mask_var  = rt->find_texture_variable(kEffectFile, "DLSS5_Mask");
+    // Which provider is DLSS5_Feed.fx compiled for, and is a matching provider technique
+    // present and enabled? Purely informational, plus a warning when the two disagree
+    // (the classic "enabled Launchpad but the shader still reads texMotionVectors").
+    const int mode = ReadMvProviderMode(rt);
     g.launchpad = {};
     const char *provider = "none";
+    const char *provider_file = nullptr;
+    reshade::api::effect_technique other = {};
+    const char *other_tech = nullptr;
+    int other_mode = -1;
     for (const auto &p : kMvProviders)
     {
         const reshade::api::effect_technique t = rt->find_technique(p.file, p.tech);
-        if (t.handle != 0) { g.launchpad = t; provider = p.tech; break; }
+        if (t.handle == 0) continue;
+        const bool on = rt->get_technique_state(t);
+        if (p.mode == mode)
+        {
+            // Several providers can serve one mode (mode 0 especially); prefer the enabled one.
+            if (g.launchpad.handle == 0 || on) { g.launchpad = t; provider = p.tech; provider_file = p.file; }
+        }
+        else if (on && other.handle == 0) { other = t; other_tech = p.tech; other_mode = p.mode; }
     }
+    char compile_error[512] = {};
+    const bool provider_broken = provider_file != nullptr && ProviderCompileError(provider_file, compile_error, sizeof(compile_error));
 
     char v[16] = {};
     g.depth_reversed = true;  // ReShade.fxh's own default when the definition is absent
@@ -2348,21 +2637,45 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
 
     // Games can recreate the swapchain (and ReShade its runtime) dozens of times per second;
     // only say something when the situation actually changed.
+    const bool provider_on = g.launchpad.handle && rt->get_technique_state(g.launchpad);
     const int signature = (g.technique.handle ? 1 : 0) | (g.mv_var.handle ? 2 : 0) | (g.depth_var.handle ? 4 : 0) |
-                          (g.launchpad.handle ? 8 : 0) | (g.depth_reversed ? 16 : 0) |
-                          ((g.launchpad.handle && rt->get_technique_state(g.launchpad)) ? 32 : 0);
+                          (g.launchpad.handle ? 8 : 0) | (g.depth_reversed ? 16 : 0) | (provider_on ? 32 : 0) |
+                          (mode << 6) | (other.handle ? 512 : 0) | ((other_mode & 7) << 10) | (provider_broken ? 8192 : 0);
     static int last_signature = -1;
     if (signature == last_signature) return;
     last_signature = signature;
 
-    Log("[feed] effects: %s technique %s, DLSS5_MV %s, DLSS5_Depth %s, MV provider %s (%s), depth reversed=%d",
+    _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> %s (%s)",
+                mode, kMvModeName[mode], provider,
+                g.launchpad.handle ? (provider_broken ? "FAILED TO COMPILE" : provider_on ? "enabled" : "DISABLED") : "not installed");
+    g_mv_problem[0] = '\0';
+
+    Log("[feed] effects: %s technique %s, DLSS5_MV %s, DLSS5_Depth %s, DLSS5_Mask %s, %s, depth reversed=%d",
         kEffectFile, g.technique.handle ? "found" : "MISSING", g.mv_var.handle ? "found" : "MISSING",
-        g.depth_var.handle ? "found" : "MISSING", provider,
-        g.launchpad.handle ? ((signature & 32) ? "enabled" : "DISABLED") : "-", g.depth_reversed ? 1 : 0);
+        g.depth_var.handle ? "found" : "MISSING", g.mask_var.handle ? "found" : "absent (older shader: no bias mask)",
+        g_mv_status, g.depth_reversed ? 1 : 0);
     if (!g.handles_ok)
         Warn("DLSS5_Feed.fx is not loaded (technique/textures missing) -- install it into reshade-shaders\\Shaders.");
     else if (g.launchpad.handle == 0)
-        Warn("no known texMotionVectors provider found (e.g. ReshadeMotionEstimation's DRME technique): motion vectors will be zero (still images only).");
+        _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
+                    "DLSS5_Feed.fx is compiled for motion-vector provider %d (%s) but no known %s shader is installed: motion vectors will be zero (still images only). "
+                    "Install one, or change the DLSS5_MV_PROVIDER preprocessor definition.", mode, kMvModeName[mode], kMvModeName[mode]);
+    else if (provider_broken)
+        _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
+                    "motion-vector provider %s FAILED TO COMPILE, so it writes nothing and DLSS runs on zero vectors. ReShade.log: %s -- use another provider (VORT: DLSS5_MV_PROVIDER=2).",
+                    provider, compile_error);
+    else if (!provider_on)
+        _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
+                    "motion-vector provider %s is installed but DISABLED: enable it above DLSS 5 Feed.", provider);
+    if (other.handle != 0)
+    {
+        char more[320];
+        _snprintf_s(more, sizeof(more), _TRUNCATE,
+                    "%s%s is enabled, but DLSS5_Feed.fx is compiled for provider %d (%s) and does not read it -- set the DLSS5_MV_PROVIDER preprocessor definition to %d to use it.",
+                    g_mv_problem[0] ? " " : "", other_tech, mode, kMvModeName[mode], other_mode);
+        strncat_s(g_mv_problem, sizeof(g_mv_problem), more, _TRUNCATE);
+    }
+    if (g_mv_problem[0]) Warn("%s", g_mv_problem);
 }
 
 static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
@@ -2394,7 +2707,7 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
     // the fewer creates, the better.
     if (g.dev12_owned) ReleaseFrameResources();
     g.runtime = nullptr;
-    g.technique = {}; g.launchpad = {}; g.mv_var = {}; g.depth_var = {};
+    g.technique = {}; g.launchpad = {}; g.mv_var = {}; g.depth_var = {}; g.mask_var = {};
     g.handles_ok = false;
 }
 
@@ -2495,6 +2808,14 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
     ImGui::Separator();
     ImGui::TextUnformatted("Motion vectors");
+    ImGui::TextWrapped("%s", g_mv_status);
+    if (g_mv_problem[0])
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "%s", g_mv_problem);
+    else if (g.handles_ok)
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "provider matches the shader's DLSS5_MV_PROVIDER");
+    ImGui::TextWrapped("%s", g_mv_probe);
+    ImGui::TextWrapped("Change the provider with DLSS5_Feed.fx's DLSS5_MV_PROVIDER preprocessor definition: "
+                       "0 texMotionVectors (qUINT, dh_uber_motion), 1 Launchpad, 2 VORT, 3 LumeniteFX Kernel, 4 LumeniteFX QuantMotion.");
     if (ImGui::SliderFloat("MV scale X", &g_cfg.mv_scale_x, 0.0f, 4.0f)) dirty = true;
     if (ImGui::SliderFloat("MV scale Y", &g_cfg.mv_scale_y, 0.0f, 4.0f)) dirty = true;
 

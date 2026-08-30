@@ -215,6 +215,7 @@ static VkFormat FeedVkFormat(DXGI_FORMAT f)
     case DXGI_FORMAT_R11G11B10_FLOAT:       return VK_FORMAT_B10G11R11_UFLOAT_PACK32;
     case DXGI_FORMAT_R32_FLOAT:             return VK_FORMAT_R32_SFLOAT;
     case DXGI_FORMAT_R16G16_FLOAT:          return VK_FORMAT_R16G16_SFLOAT;
+    case DXGI_FORMAT_R8_UNORM:              return VK_FORMAT_R8_UNORM;
     default:                                return VK_FORMAT_UNDEFINED;
     }
 }

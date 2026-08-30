@@ -7,11 +7,11 @@
     It turns what ReShade already has into the two guide textures DLSS needs, in the exact
     layout the add-on expects, and asks iMMERSE LaunchPad to keep its optical flow running:
 
-      DLSS5_Color  RGBA8   Selected-resolution SDR color sampled from the completed game frame.
-      DLSS5_MV     RG16F   Selected-resolution motion vectors in PIXELS, pointing from the current pixel to where it was
+      DLSS5_Color  RGBA8   Full-resolution SDR color sampled from the completed game frame.
+      DLSS5_MV     RG16F   Full-resolution motion vectors in PIXELS, pointing from the current pixel to where it was
                            in the previous frame (DLSS convention). Source: LaunchPad's
                            Deferred::MotionVectorsTex ("delta UV": prev_uv = uv + mv).
-      DLSS5_Depth  R32F    the game's raw hardware depth (not linearised), sampled at the selected work size,
+      DLSS5_Depth  R32F    the game's raw hardware depth (not linearised), sampled at backbuffer size,
                            with ReShade's RESHADE_DEPTH_INPUT_* orientation fixes applied.
 
     Requirements: iMMERSE "MartysMods_LAUNCHPAD.fx" + its MartysMods\*.fxh headers installed, and the
@@ -40,9 +40,9 @@ sampler DepthInput { Texture = DepthInputTex; };
 uniform int RESOLUTION_PERCENT <
     ui_type = "slider";
     ui_min = 50; ui_max = 100; ui_step = 1;
-    ui_label = "DLAA / Neural Rendering resolution";
-    ui_tooltip = "Changes only the DLAA and Neural Rendering work size; the game and UI stay native.\n"
-                 "After you stop moving the slider, the shader and NGX feature rebuild once. 50% is the original NR50 behavior.";
+    ui_label = "DLSS resolution scale";
+    ui_tooltip = "Controls the shared native DLSS/DLAA and Neural Rendering work resolution.\n"
+                 "The add-on resizes private inputs after you stop moving the slider; ReShade itself is not reloaded.";
 > = 50;
 
 uniform float2 MV_SIGN <
@@ -66,23 +66,9 @@ uniform int DEBUG_VIEW <
     ui_label = "Debug view (DLSS5_Feed_Debug technique)";
 > = 0;
 
-#ifndef DLSS5_RESOLUTION_PERCENT
-    #define DLSS5_RESOLUTION_PERCENT 50
-#endif
-
-// Reduced scales are rounded down to even extents so the FX resources and NGX contract
-// always agree. At 100%, preserve the backbuffer extent exactly.
-#if DLSS5_RESOLUTION_PERCENT >= 100
-    #define DLSS5_FEED_WIDTH  BUFFER_WIDTH
-    #define DLSS5_FEED_HEIGHT BUFFER_HEIGHT
-#else
-    #define DLSS5_FEED_WIDTH  ((BUFFER_WIDTH  * DLSS5_RESOLUTION_PERCENT / 100) / 2 * 2)
-    #define DLSS5_FEED_HEIGHT ((BUFFER_HEIGHT * DLSS5_RESOLUTION_PERCENT / 100) / 2 * 2)
-#endif
-
-texture DLSS5_Color { Width = DLSS5_FEED_WIDTH; Height = DLSS5_FEED_HEIGHT; Format = RGBA8; };
-texture DLSS5_MV    { Width = DLSS5_FEED_WIDTH; Height = DLSS5_FEED_HEIGHT; Format = RG16F; };
-texture DLSS5_Depth { Width = DLSS5_FEED_WIDTH; Height = DLSS5_FEED_HEIGHT; Format = R32F;  };
+texture DLSS5_Color { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RGBA8; };
+texture DLSS5_MV    { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = RG16F; };
+texture DLSS5_Depth { Width = BUFFER_WIDTH; Height = BUFFER_HEIGHT; Format = R32F;  };
 sampler sDLSS5_Color { Texture = DLSS5_Color; MinFilter = LINEAR; MagFilter = LINEAR; MipFilter = POINT; };
 sampler sDLSS5_MV    { Texture = DLSS5_MV;    MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
 sampler sDLSS5_Depth { Texture = DLSS5_Depth; MinFilter = POINT; MagFilter = POINT; MipFilter = POINT; };
@@ -98,7 +84,7 @@ float2 PS_MotionVectors(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Ta
 {
     // LaunchPad: "delta UV", previous position = uv + mv. DLSS wants the same direction, in pixels.
     float2 mv = Deferred::get_motion(uv);
-    return mv * float2(DLSS5_FEED_WIDTH, DLSS5_FEED_HEIGHT) * MV_SIGN * MV_SCALE;
+    return mv * float2(BUFFER_WIDTH, BUFFER_HEIGHT) * MV_SIGN * MV_SCALE;
 }
 
 float4 PS_Color(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
@@ -133,7 +119,7 @@ float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 technique DLSS5_Feed
 <
     ui_label   = "DLSS 5 Feed Resolution Scale (place below MartysMods_Launchpad)";
-    ui_tooltip = "Runs DLAA and Neural Rendering at the add-on's selected dimensions, then upscales the completed result to the native backbuffer.";
+    ui_tooltip = "Supplies full-resolution color/depth/motion guides; the add-on applies one shared DLSS/DLAA/NR scale without reloading ReShade.";
 >
 {
     pass Color         { VertexShader = VS_Feed; PixelShader = PS_Color;         RenderTarget = DLSS5_Color; }

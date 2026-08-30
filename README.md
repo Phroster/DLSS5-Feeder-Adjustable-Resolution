@@ -15,10 +15,11 @@ MGS4 2560x1440
   -> linear upscale to the 2560x1440 backbuffer
 ```
 
-The game, UI, and backbuffer remain native 1440p at every slider position. Only the
-DLAA and Neural Rendering work textures change. Example positions are:
+The game, UI, and backbuffer remain native 1440p at every slider position. The add-on
+now creates its own work textures from full-resolution ReShade guides, so scale changes
+do not recompile the effect or reset the ReShade interface. Example dimensions are:
 
-| Preset | Work resolution at 1440p | Relative pixel work |
+| Scale | Resolution at 1440p | Relative pixel count |
 | --- | ---: | ---: |
 | 100% | 2560x1440 | 100% |
 | 75% | 1920x1080 | 56.25% |
@@ -27,10 +28,12 @@ DLAA and Neural Rendering work textures change. Example positions are:
 
 ## Status
 
-- Version 0.2.0 provides a native ReShade slider from 50% through 100% in one-percent
-  steps. Reduced sizes are rounded down to even dimensions for NGX.
-- Slider input is debounced: approximately 0.4 seconds after movement stops, only
-  `DLSS5_Feed.fx` recompiles and the NGX feature safely rebuilds.
+- Version 0.3.1 provides one shared 50-100% DLSS/DLAA plus Neural Rendering slider.
+- Slider input is debounced for approximately 0.4 seconds. The add-on resizes its own
+  resources and rebuilds NGX without reloading `DLSS5_Feed.fx` or resetting ReShade's UI.
+- Reduced sizes are rounded down to even dimensions for NGX.
+- The DLSS/DLAA input, output, depth, motion vectors, and RenoDX Feature 18 contract all
+  use the same selected native work resolution.
 - The final spatial expansion still uses a linear sampler.
 - The add-on was validated on the author's MGS4/ReShade/RenoDX setup. Other games and
   versions are not currently supported.
@@ -61,16 +64,14 @@ If `-GameDir` is omitted, a folder picker opens. The installer checks every
 prerequisite, refuses to operate while MGS4 is running, backs up each target, installs
 the add-on and shader, and puts LaunchPad before the Feeder in the active preset.
 
-In the RenoDX overlay, keep **Enable Upscaling WIP** disabled. The Feeder supplies the
-reduced Neural Rendering extent itself.
+Keep RenoDX **Enable Upscaling (WIP)** disabled.
 
-## Select a resolution
+## Select the resolution
 
-Open ReShade's **Home** tab, expand **DLSS 5 Feed Resolution Scale**, and choose
-**DLAA / Neural Rendering resolution**. Move the slider anywhere from 50% to 100%.
-The add-on persists the selection in ReShade's configuration, waits until dragging
-stops, reloads the companion effect once, and rebuilds the DLSS/NR contract. A value of
-50% is the original NR50 behavior.
+Open ReShade's **Home** tab, expand **DLSS 5 Feed Resolution Scale**, and move
+**DLSS resolution scale**. It ranges from 50% to 100% and is persisted. Approximately
+0.4 seconds after you stop moving it, the add-on rebuilds only its private textures and NGX feature.
+The ReShade effect list, selected panel, and scroll position remain intact.
 
 ## Verify
 
@@ -81,8 +82,8 @@ After launching the game and reaching a rendered scene, close the game and run:
 ```
 
 A healthy result reports the selected percentage and work resolution, a matching
-Feeder/RenoDX contract, a successful inline Feature 18 evaluation, and no fallback
-marker.
+Feeder/RenoDX native contract, a successful inline Feature 18 evaluation, and no
+fallback marker.
 
 ## Roll back
 
@@ -98,10 +99,11 @@ not vendored.
 
 ## What this project owns
 
-The project delta is the selectable-resolution color/depth/motion-vector preparation,
-motion-vector correction, independent render/output/backbuffer extents, native ReShade
-slider control, debounced shader/NGX rebuilding, matched DLAA contract used by RenoDX
-Feature 18, native-backbuffer upscale, lifecycle logging, and installer/verifier tooling.
+The project delta is full-resolution guide capture, add-on-side color/depth/motion-vector
+resampling, motion-vector correction, separate work/backbuffer extents,
+one native ReShade slider, debounced resource/NGX rebuilding without effect reloads,
+the synthetic DLAA/DLSS carrier used by RenoDX Feature 18, native-backbuffer expansion,
+lifecycle logging, and installer/verifier tooling.
 
 The NGX host, shared D3D11/D3D12 transport, DLSS implementation, RenoDX injection,
 ReShade, iMMERSE, and MGS4 belong to their respective authors. See [LICENSE](LICENSE)

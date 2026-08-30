@@ -43,14 +43,14 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
-#define FEED_VERSION "0.2.0-scale"
+#define FEED_VERSION "0.3.1-single"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Feeds DLSS 5 neural rendering with ReShade's depth and LaunchPad motion vectors in games "
-    "without DLSS: runs DLAA plus native Neural Rendering at a selectable resolution on a private D3D12 device, then "
-    "upscales the completed result into the native backbuffer. Needs DLSS5_Feed.fx + MartysMods LaunchPad. "
-    "A 50-100% resolution slider is available in the ReShade overlay; diagnostics remain in dlss5-feed.cfg.";
+    "without DLSS: dynamically resizes full-resolution ReShade guides into one shared native DLSS/DLAA plus NR "
+    "contract on a private D3D12 device, then expands the result into the native backbuffer. Needs DLSS5_Feed.fx + "
+    "MartysMods LaunchPad. One 50-100% slider applies without reloading ReShade; diagnostics remain in dlss5-feed.cfg.";
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -235,6 +235,7 @@ static const char *kLaunchpadFile  = "MartysMods_LAUNCHPAD.fx";
 static const char *kLaunchpadTech  = "MartysMods_Launchpad";
 static const char *kScaleSection   = "DLSS5Feeder";
 static const char *kScaleKey       = "ResolutionPercent";
+static const char *kOldDlaaKey     = "DLAAResolutionPercent";
 
 static const int kScaleMin = 50;
 static const int kScaleMax = 100;
@@ -242,52 +243,37 @@ static const ULONGLONG kScaleDebounceMs = 400;
 static int       g_scale_percent = 50;
 static int       g_requested_scale_percent = 0;
 static ULONGLONG g_scale_apply_after = 0;
-static bool      g_scale_reload_pending = false;
 
 static bool IsScaleValid(int percent)
 {
     return percent >= kScaleMin && percent <= kScaleMax;
 }
 
+static UINT ScaledExtent(UINT native_extent, int percent)
+{
+    if (percent >= 100) return native_extent;
+    UINT extent = (native_extent * static_cast<UINT>(percent)) / 100u;
+    extent &= ~1u;
+    return extent >= 2u ? extent : 2u;
+}
+
 static void LoadScaleSetting(reshade::api::effect_runtime *rt)
 {
     int configured = 50;
     if (!reshade::get_config_value<int>(rt, kScaleSection, kScaleKey, configured) || !IsScaleValid(configured))
-    {
-        configured = 50;
-        reshade::set_config_value<int>(rt, kScaleSection, kScaleKey, configured);
-    }
+        if (!reshade::get_config_value<int>(rt, kScaleSection, kOldDlaaKey, configured) || !IsScaleValid(configured))
+            configured = 50;
+
     g_scale_percent = configured;
     g_requested_scale_percent = 0;
     g_scale_apply_after = 0;
+    reshade::set_config_value<int>(rt, kScaleSection, kScaleKey, g_scale_percent);
 }
 
-static void ApplyScaleDefinition(reshade::api::effect_runtime *rt, bool reload)
-{
-    if (rt == nullptr) return;
-    char desired[8] = {};
-    sprintf_s(desired, "%d", g_scale_percent);
-    char current[16] = {};
-    const bool differs = !rt->get_preprocessor_definition_for_effect(kEffectFile, "DLSS5_RESOLUTION_PERCENT", current) ||
-                         strcmp(current, desired) != 0;
-    if (!differs) return;
-
-    rt->set_preprocessor_definition_for_effect(kEffectFile, "DLSS5_RESOLUTION_PERCENT", desired);
-    if (reload)
-    {
-        g_scale_reload_pending = true;
-        rt->reload_effect_next_frame(kEffectFile);
-    }
-    Log("[feed] resolution scale set to %d%%%s", g_scale_percent, reload ? "; reloading DLSS5_Feed.fx" : "");
-}
-
-// Returns true when a settled slider value was committed and this frame should stop
-// while ReShade recompiles the effect. Dragging only updates the deadline, so a single
-// shader/NGX rebuild happens after the user pauses for 400 ms.
+// The add-on rebuilds its private resources once after the user pauses the slider.
 static bool ApplyPendingScale(reshade::api::effect_runtime *rt)
 {
     if (g_requested_scale_percent == 0 || GetTickCount64() < g_scale_apply_after) return false;
-
     const int next = g_requested_scale_percent;
     g_requested_scale_percent = 0;
     g_scale_apply_after = 0;
@@ -295,7 +281,7 @@ static bool ApplyPendingScale(reshade::api::effect_runtime *rt)
 
     g_scale_percent = next;
     reshade::set_config_value<int>(rt, kScaleSection, kScaleKey, g_scale_percent);
-    ApplyScaleDefinition(rt, true);
+    Log("[feed] settled shared DLSS/DLAA/NR scale=%d%%; rebuilding add-on resources only", g_scale_percent);
     return true;
 }
 
@@ -346,8 +332,9 @@ struct Feed
     ID3D11Texture2D *tex11[SLOT_COUNT];
     HANDLE           shared[SLOT_COUNT];
     ID3D11ShaderResourceView *output_srv;   // on tex11[SLOT_OUTPUT], for the copy-back blit
+    ID3D11RenderTargetView   *input_rtv[SLOT_COUNT];
     UINT        render_width, render_height;
-    UINT        output_width, output_height;       // DLAA/NR output (same as render size)
+    UINT        output_width, output_height;       // DLSS target and NR output extent
     UINT        backbuffer_width, backbuffer_height;
     DXGI_FORMAT color_fmt, output_fmt;      // shared texture formats
     DXGI_FORMAT bb_fmt;                     // the backbuffer's format, to notice swaps
@@ -357,7 +344,10 @@ struct Feed
     // copy-back blit
     ID3D11VertexShader *blit_vs;
     ID3D11PixelShader  *blit_ps;
+    ID3D11PixelShader  *resample_ps;
     ID3D11SamplerState *blit_sampler;
+    ID3D11SamplerState *point_sampler;
+    ID3D11Buffer       *resample_cb;
 
     UINT64 frames_done;
 
@@ -566,6 +556,7 @@ static void ReleaseFrameResources()
     SafeRelease(g.output_srv);
     for (int i = 0; i < SLOT_COUNT; ++i)
     {
+        SafeRelease(g.input_rtv[i]);
         SafeRelease(g.tex11[i]);
         SafeRelease(g.tex12[i]);
         if (g.shared[i] != nullptr) { CloseHandle(g.shared[i]); g.shared[i] = nullptr; }
@@ -581,7 +572,7 @@ static void ReleaseFrameResources()
 
 // One texture visible to both APIs: created on D3D12 and opened on D3D11, or the other
 // way round if the driver refuses (WD2's driver only accepted the second route).
-static bool MakeSharedPair(ID3D11Device1 *dev1, int i, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
+static bool MakeSharedPair(ID3D11Device1 *dev1, int i, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, bool render_target)
 {
     D3D12_HEAP_PROPERTIES hp = {};
     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -595,7 +586,8 @@ static bool MakeSharedPair(ID3D11Device1 *dev1, int i, UINT w, UINT h, DXGI_FORM
     rd.SampleDesc.Count = 1;
     rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
-                          (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
+                          (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE) |
+                          (render_target ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE);
 
     HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
                                                   nullptr, __uuidof(ID3D12Resource),
@@ -622,7 +614,9 @@ static bool MakeSharedPair(ID3D11Device1 *dev1, int i, UINT w, UINT h, DXGI_FORM
     td.Format           = fmt;
     td.SampleDesc.Count = 1;
     td.Usage            = D3D11_USAGE_DEFAULT;
-    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE | (uav ? D3D11_BIND_UNORDERED_ACCESS : 0);
+    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE |
+                          (uav ? D3D11_BIND_UNORDERED_ACCESS : 0) |
+                          (render_target ? D3D11_BIND_RENDER_TARGET : 0);
     td.MiscFlags        = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
     hr = dev1->CreateTexture2D(&td, nullptr, &g.tex11[i]);
     if (FAILED(hr)) { Log("[feed] %s: CreateTexture2D failed 0x%08X", kSlotName[i], hr); return false; }
@@ -649,32 +643,47 @@ static bool MakeSharedPair(ID3D11Device1 *dev1, int i, UINT w, UINT h, DXGI_FORM
 
 static bool MakeBlitShaders()
 {
-    if (g.blit_vs != nullptr && g.blit_ps != nullptr) return true;
+    if (g.blit_vs != nullptr && g.blit_ps != nullptr && g.resample_ps != nullptr &&
+        g.blit_sampler != nullptr && g.point_sampler != nullptr && g.resample_cb != nullptr) return true;
 
     static const char kSrc[] =
-        "Texture2D<float4> src : register(t0);\n"
-        "SamplerState smp : register(s0);\n"
+        "Texture2D<float4> src_color : register(t0);\n"
+        "Texture2D<float2> src_mv : register(t1);\n"
+        "Texture2D<float> src_depth : register(t2);\n"
+        "SamplerState linear_smp : register(s0);\n"
+        "SamplerState point_smp : register(s1);\n"
+        "cbuffer ResampleConstants : register(b0) { float2 mv_scale; float2 _pad; };\n"
         "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
         "VSOut vs(uint id : SV_VertexID) { VSOut o; float2 uv = float2((id << 1) & 2, id & 2);\n"
         "  o.uv = uv; o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
-        "float4 ps(VSOut i) : SV_Target { return float4(src.Sample(smp, i.uv).rgb, 1.0); }\n";
+        "float4 ps(VSOut i) : SV_Target { return float4(src_color.Sample(linear_smp, i.uv).rgb, 1.0); }\n"
+        "struct ResampleOut { float4 color : SV_Target0; float2 mv : SV_Target1; float depth : SV_Target2; };\n"
+        "ResampleOut ps_resample(VSOut i) { ResampleOut o;\n"
+        "  o.color = src_color.SampleLevel(linear_smp, i.uv, 0);\n"
+        "  o.mv = src_mv.SampleLevel(point_smp, i.uv, 0) * mv_scale;\n"
+        "  o.depth = src_depth.SampleLevel(point_smp, i.uv, 0); return o; }\n";
 
     HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
     auto compile = m != nullptr ? reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
     if (compile == nullptr) { Log("[feed] d3dcompiler_47.dll unavailable"); return false; }
 
-    ID3DBlob *vs = nullptr, *ps = nullptr, *err = nullptr;
+    ID3DBlob *vs = nullptr, *ps = nullptr, *resample = nullptr, *err = nullptr;
     HRESULT hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, &err);
     if (FAILED(hr)) { Log("[feed] blit VS compile failed 0x%08X: %s", hr, err ? (const char *)err->GetBufferPointer() : ""); SafeRelease(err); return false; }
     SafeRelease(err);
     hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, &err);
     if (FAILED(hr)) { Log("[feed] blit PS compile failed 0x%08X: %s", hr, err ? (const char *)err->GetBufferPointer() : ""); SafeRelease(err); SafeRelease(vs); return false; }
     SafeRelease(err);
+    hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "ps_resample", "ps_5_0", 0, 0, &resample, &err);
+    if (FAILED(hr)) { Log("[feed] resample PS compile failed 0x%08X: %s", hr, err ? (const char *)err->GetBufferPointer() : ""); SafeRelease(err); SafeRelease(vs); SafeRelease(ps); return false; }
+    SafeRelease(err);
 
     hr = g.dev11->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &g.blit_vs);
     if (SUCCEEDED(hr)) hr = g.dev11->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &g.blit_ps);
+    if (SUCCEEDED(hr)) hr = g.dev11->CreatePixelShader(resample->GetBufferPointer(), resample->GetBufferSize(), nullptr, &g.resample_ps);
     vs->Release();
     ps->Release();
+    resample->Release();
     if (FAILED(hr)) { Log("[feed] blit shader creation failed 0x%08X", hr); return false; }
 
     D3D11_SAMPLER_DESC sd = {};
@@ -682,11 +691,21 @@ static bool MakeBlitShaders()
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.MaxLOD   = D3D11_FLOAT32_MAX;
     if (FAILED(g.dev11->CreateSamplerState(&sd, &g.blit_sampler))) { Log("[feed] blit sampler failed"); return false; }
-    Log("[feed] copy-back blit shaders ready");
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    if (FAILED(g.dev11->CreateSamplerState(&sd, &g.point_sampler))) { Log("[feed] point sampler failed"); return false; }
+
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.ByteWidth = 16;
+    cbd.Usage = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(g.dev11->CreateBuffer(&cbd, nullptr, &g.resample_cb))) { Log("[feed] resample constant buffer failed"); return false; }
+    Log("[feed] copy-back and dynamic input-resample shaders ready");
     return true;
 }
 
-static bool BuildResources(UINT render_w, UINT render_h, UINT backbuffer_w, UINT backbuffer_h,
+static bool BuildResources(UINT render_w, UINT render_h, UINT output_w, UINT output_h,
+                           UINT backbuffer_w, UINT backbuffer_h,
                            DXGI_FORMAT input_fmt, DXGI_FORMAT bb_fmt)
 {
     Breadcrumb("building shared textures");
@@ -698,8 +717,8 @@ static bool BuildResources(UINT render_w, UINT render_h, UINT backbuffer_w, UINT
 
     g.render_width  = render_w;
     g.render_height = render_h;
-    g.output_width  = render_w;
-    g.output_height = render_h;
+    g.output_width  = output_w;
+    g.output_height = output_h;
     g.backbuffer_width  = backbuffer_w;
     g.backbuffer_height = backbuffer_h;
     g.bb_fmt     = bb_fmt;
@@ -716,12 +735,23 @@ static bool BuildResources(UINT render_w, UINT render_h, UINT backbuffer_w, UINT
         return false;
     }
 
-    bool ok = MakeSharedPair(dev1, SLOT_COLOR,  render_w, render_h, g.color_fmt,             false) &&
-              MakeSharedPair(dev1, SLOT_OUTPUT, render_w, render_h, g.output_fmt,             true)  &&
-              MakeSharedPair(dev1, SLOT_DEPTH,  render_w, render_h, DXGI_FORMAT_R32_FLOAT,   false) &&
-              MakeSharedPair(dev1, SLOT_MV,     render_w, render_h, DXGI_FORMAT_R16G16_FLOAT, false);
+    bool ok = MakeSharedPair(dev1, SLOT_COLOR,  render_w, render_h, g.color_fmt,               false, true)  &&
+              MakeSharedPair(dev1, SLOT_OUTPUT, output_w, output_h, g.output_fmt,               true, false) &&
+              MakeSharedPair(dev1, SLOT_DEPTH,  render_w, render_h, DXGI_FORMAT_R32_FLOAT,     false, true)  &&
+              MakeSharedPair(dev1, SLOT_MV,     render_w, render_h, DXGI_FORMAT_R16G16_FLOAT, false, true);
     dev1->Release();
     if (!ok) { ReleaseFrameResources(); return false; }
+
+    const int input_slots[] = { SLOT_COLOR, SLOT_MV, SLOT_DEPTH };
+    for (const int slot : input_slots)
+    {
+        D3D11_RENDER_TARGET_VIEW_DESC rv = {};
+        rv.Format = slot == SLOT_COLOR ? g.color_fmt :
+                    (slot == SLOT_MV ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R32_FLOAT);
+        rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+        if (FAILED(g.dev11->CreateRenderTargetView(g.tex11[slot], &rv, &g.input_rtv[slot])))
+        { Log("[feed] %s input RTV creation failed", kSlotName[slot]); ReleaseFrameResources(); return false; }
+    }
 
     D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
     sv.Format              = g.output_fmt;
@@ -734,9 +764,8 @@ static bool BuildResources(UINT render_w, UINT render_h, UINT backbuffer_w, UINT
 
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
-    // Native DLAA contract at the selected dimensions. The RenoDX add-on therefore runs
-    // Feature 18 natively at this cheaper resolution; only the completed result
-    // is spatially expanded to the unchanged game backbuffer.
+    // Equal extents create a native DLAA contract. Unequal extents use a DLSS
+    // super-resolution carrier so RenoDX can observe distinct input/NR-output sizes.
     int flags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     if (inverted) flags |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     if (g.hdr)    flags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
@@ -746,9 +775,19 @@ static bool BuildResources(UINT render_w, UINT render_h, UINT backbuffer_w, UINT
     NVSDK_NGX_DLSS_Create_Params cp = {};
     cp.Feature.InWidth            = render_w;
     cp.Feature.InHeight           = render_h;
-    cp.Feature.InTargetWidth      = render_w;
-    cp.Feature.InTargetHeight     = render_h;
-    cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+    cp.Feature.InTargetWidth      = output_w;
+    cp.Feature.InTargetHeight     = output_h;
+    if (render_w == output_w && render_h == output_h)
+        cp.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_DLAA;
+    else
+    {
+        const float ratio_x = static_cast<float>(output_w) / static_cast<float>(render_w);
+        const float ratio_y = static_cast<float>(output_h) / static_cast<float>(render_h);
+        const float ratio = ratio_x > ratio_y ? ratio_x : ratio_y;
+        cp.Feature.InPerfQualityValue = ratio <= 1.5f ? NVSDK_NGX_PerfQuality_Value_MaxQuality :
+                                             (ratio <= 1.8f ? NVSDK_NGX_PerfQuality_Value_Balanced :
+                                                             NVSDK_NGX_PerfQuality_Value_MaxPerf);
+    }
     cp.InFeatureCreateFlags       = flags;
     cp.InEnableOutputSubrects     = false;
 
@@ -780,7 +819,7 @@ static bool BuildResources(UINT render_w, UINT render_h, UINT backbuffer_w, UINT
         return false;
     }
 
-    Log("[feed] feature ready: %ux%u DLAA/NR at %d%% -> %ux%u backbuffer, flags=%d (%s%s%s%s), color %s -> output %s, depth R32_FLOAT%s, mv R16G16_FLOAT",
+    Log("[feed] feature ready: %ux%u shared DLSS/DLAA/NR at %d%% -> %ux%u backbuffer, flags=%d (%s%s%s%s), color %s -> output %s, depth R32_FLOAT%s, mv R16G16_FLOAT",
         render_w, render_h, g_scale_percent, backbuffer_w, backbuffer_h, flags,
         (flags & NVSDK_NGX_DLSS_Feature_Flags_IsHDR) ? "HDR " : "SDR ",
         (flags & NVSDK_NGX_DLSS_Feature_Flags_MVLowRes) ? "MVLowRes " : "",
@@ -913,7 +952,10 @@ static void ShutdownSession()
     if (g.ngx_inited && g.dev12 != nullptr) { NVSDK_NGX_D3D12_Shutdown1(g.dev12); g.ngx_inited = false; }
     SafeRelease(g.blit_vs);
     SafeRelease(g.blit_ps);
+    SafeRelease(g.resample_ps);
     SafeRelease(g.blit_sampler);
+    SafeRelease(g.point_sampler);
+    SafeRelease(g.resample_cb);
     SafeRelease(g.ctx4);
     SafeRelease(g.fence11);
     SafeRelease(g.fence12);
@@ -927,8 +969,111 @@ static void ShutdownSession()
 }
 
 // ---------------------------------------------------------------------------
-// Copy-back: shared Output -> the backbuffer ReShade handed us (any format, raw values)
+// Dynamic input preparation and copy-back
 // ---------------------------------------------------------------------------
+
+static bool CopyOrResampleInputs(ID3D11DeviceContext *ctx,
+                                 ID3D11Texture2D *color, ID3D11Texture2D *mv, ID3D11Texture2D *depth,
+                                 ID3D11ShaderResourceView *color_srv, ID3D11ShaderResourceView *mv_srv,
+                                 ID3D11ShaderResourceView *depth_srv, UINT source_w, UINT source_h)
+{
+    if (source_w == g.render_width && source_h == g.render_height)
+    {
+        ctx->CopyResource(g.tex11[SLOT_COLOR], color);
+        ctx->CopyResource(g.tex11[SLOT_DEPTH], depth);
+        ctx->CopyResource(g.tex11[SLOT_MV], mv);
+        return true;
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(ctx->Map(g.resample_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+    { Log("[feed] resample constant-buffer map failed"); return false; }
+    float constants[4] = {
+        static_cast<float>(g.render_width) / static_cast<float>(source_w),
+        static_cast<float>(g.render_height) / static_cast<float>(source_h), 0.0f, 0.0f
+    };
+    memcpy(mapped.pData, constants, sizeof(constants));
+    ctx->Unmap(g.resample_cb, 0);
+
+    ID3D11RenderTargetView *old_rtvs[3] = {};
+    ID3D11DepthStencilView *old_dsv = nullptr;
+    ID3D11VertexShader *old_vs = nullptr;
+    ID3D11PixelShader *old_ps = nullptr;
+    ID3D11ShaderResourceView *old_srvs[3] = {};
+    ID3D11SamplerState *old_samplers[2] = {};
+    ID3D11Buffer *old_cb = nullptr;
+    ID3D11InputLayout *old_il = nullptr;
+    ID3D11BlendState *old_bs = nullptr; FLOAT old_bf[4] = {}; UINT old_mask = 0;
+    ID3D11DepthStencilState *old_ds = nullptr; UINT old_sref = 0;
+    ID3D11RasterizerState *old_rs = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY old_topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    UINT nvp = 1; D3D11_VIEWPORT old_vp = {};
+
+    ctx->OMGetRenderTargets(3, old_rtvs, &old_dsv);
+    ctx->VSGetShader(&old_vs, nullptr, nullptr);
+    ctx->PSGetShader(&old_ps, nullptr, nullptr);
+    ctx->PSGetShaderResources(0, 3, old_srvs);
+    ctx->PSGetSamplers(0, 2, old_samplers);
+    ctx->PSGetConstantBuffers(0, 1, &old_cb);
+    ctx->IAGetInputLayout(&old_il);
+    ctx->IAGetPrimitiveTopology(&old_topo);
+    ctx->OMGetBlendState(&old_bs, old_bf, &old_mask);
+    ctx->OMGetDepthStencilState(&old_ds, &old_sref);
+    ctx->RSGetState(&old_rs);
+    ctx->RSGetViewports(&nvp, &old_vp);
+
+    D3D11_VIEWPORT vp = {};
+    vp.Width = static_cast<float>(g.render_width);
+    vp.Height = static_cast<float>(g.render_height);
+    vp.MaxDepth = 1.0f;
+    ID3D11RenderTargetView *rtvs[3] = { g.input_rtv[SLOT_COLOR], g.input_rtv[SLOT_MV], g.input_rtv[SLOT_DEPTH] };
+    ID3D11ShaderResourceView *srvs[3] = { color_srv, mv_srv, depth_srv };
+    ID3D11SamplerState *samplers[2] = { g.blit_sampler, g.point_sampler };
+    ID3D11BlendState *null_bs = nullptr;
+    ID3D11DepthStencilState *null_ds = nullptr;
+    ID3D11RasterizerState *null_rs = nullptr;
+
+    ctx->RSSetViewports(1, &vp);
+    ctx->OMSetRenderTargets(3, rtvs, nullptr);
+    ctx->OMSetBlendState(null_bs, nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(null_ds, 0);
+    ctx->RSSetState(null_rs);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(g.blit_vs, nullptr, 0);
+    ctx->PSSetShader(g.resample_ps, nullptr, 0);
+    ctx->PSSetShaderResources(0, 3, srvs);
+    ctx->PSSetSamplers(0, 2, samplers);
+    ctx->PSSetConstantBuffers(0, 1, &g.resample_cb);
+    ctx->Draw(3, 0);
+
+    ID3D11ShaderResourceView *null_srvs[3] = {};
+    ID3D11RenderTargetView *null_rtvs[3] = {};
+    ctx->PSSetShaderResources(0, 3, null_srvs);
+    ctx->OMSetRenderTargets(3, null_rtvs, nullptr);
+
+    ctx->OMSetRenderTargets(3, old_rtvs, old_dsv);
+    ctx->VSSetShader(old_vs, nullptr, 0);
+    ctx->PSSetShader(old_ps, nullptr, 0);
+    ctx->PSSetShaderResources(0, 3, old_srvs);
+    ctx->PSSetSamplers(0, 2, old_samplers);
+    ctx->PSSetConstantBuffers(0, 1, &old_cb);
+    ctx->IASetInputLayout(old_il);
+    ctx->IASetPrimitiveTopology(old_topo);
+    ctx->OMSetBlendState(old_bs, old_bf, old_mask);
+    ctx->OMSetDepthStencilState(old_ds, old_sref);
+    ctx->RSSetState(old_rs);
+    if (nvp != 0) ctx->RSSetViewports(1, &old_vp);
+
+    for (auto *p : old_rtvs) SafeRelease(p);
+    SafeRelease(old_dsv); SafeRelease(old_vs); SafeRelease(old_ps);
+    for (auto *p : old_srvs) SafeRelease(p);
+    for (auto *p : old_samplers) SafeRelease(p);
+    SafeRelease(old_cb); SafeRelease(old_il); SafeRelease(old_bs); SafeRelease(old_ds); SafeRelease(old_rs);
+    return true;
+}
+
+// Copy-back: shared Output -> the backbuffer ReShade handed us (any format, raw values)
 
 static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv)
 {
@@ -1031,7 +1176,15 @@ static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *d
 
 static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
-    if (ApplyPendingScale(rt)) return;
+    if (ApplyPendingScale(rt))
+    {
+        g.frame_ready = false;
+        g.need_reset = true;
+        g.disabled = false;
+        g.consecutive_fails = 0;
+        const int32_t value = static_cast<int32_t>(g_scale_percent);
+        if (g.scale_var.handle != 0) rt->set_uniform_value_int(g.scale_var, &value, 1);
+    }
     if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
 
     LARGE_INTEGER t0, t1;
@@ -1085,6 +1238,7 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
 
     bool ok = true;
     if (cd.Width != md.Width || cd.Height != md.Height || cd.Width != dd.Width || cd.Height != dd.Height ||
+        cd.Width != bd.Width || cd.Height != bd.Height ||
         cd.SampleDesc.Count != 1 || bd.SampleDesc.Count != 1 || md.Format != DXGI_FORMAT_R16G16_FLOAT ||
         dd.Format != DXGI_FORMAT_R32_FLOAT)
     {
@@ -1117,33 +1271,42 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
         }
     }
 
-    if (ok && (!g.frame_ready || cd.Width != g.render_width || cd.Height != g.render_height ||
+    UINT desired_render_w = ScaledExtent(bd.Width, g_scale_percent);
+    UINT desired_render_h = ScaledExtent(bd.Height, g_scale_percent);
+    UINT desired_output_w = desired_render_w;
+    UINT desired_output_h = desired_render_h;
+    if (g_cfg.mode == 1) { desired_output_w = desired_render_w; desired_output_h = desired_render_h; }
+
+    if (ok && (!g.frame_ready || desired_render_w != g.render_width || desired_render_h != g.render_height ||
+               desired_output_w != g.output_width || desired_output_h != g.output_height ||
                bd.Width != g.backbuffer_width || bd.Height != g.backbuffer_height || bd.Format != g.bb_fmt ||
                TypedColorFormat(cd.Format) != g.color_fmt))
     {
-        Log("[feed] building %d%% scale: %ux%u DLAA/NR inputs -> %ux%u backbuffer %s (color %s, mv %s, depth %s, depth reversed=%d)",
-            g_scale_percent, cd.Width, cd.Height, bd.Width, bd.Height, FormatName(bd.Format), FormatName(cd.Format),
+        Log("[feed] building shared %d%% contract: %ux%u DLSS/DLAA/NR -> %ux%u backbuffer %s (source color %s, mv %s, depth %s, depth reversed=%d)",
+            g_scale_percent, desired_render_w, desired_render_h, bd.Width, bd.Height, FormatName(bd.Format), FormatName(cd.Format),
             FormatName(md.Format), FormatName(dd.Format), g.depth_reversed ? 1 : 0);
-        ok = BuildResources(cd.Width, cd.Height, bd.Width, bd.Height, cd.Format, bd.Format);
+        ok = BuildResources(desired_render_w, desired_render_h, desired_output_w, desired_output_h,
+                            bd.Width, bd.Height, cd.Format, bd.Format);
         if (!ok) FeedFail("resource build");
         else g.consecutive_fails = 0;
     }
 
     if (ok)
     {
-        Breadcrumb("copying inputs");
-        ctx->CopyResource(g.tex11[SLOT_COLOR], color);
-        ctx->CopyResource(g.tex11[SLOT_DEPTH], depth);
-        ctx->CopyResource(g.tex11[SLOT_MV], mv);
+        Breadcrumb("preparing dynamic-resolution inputs");
+        auto *color_srv11 = reinterpret_cast<ID3D11ShaderResourceView *>(color_srv.handle);
+        auto *mv_srv11 = reinterpret_cast<ID3D11ShaderResourceView *>(mv_srv.handle);
+        auto *depth_srv11 = reinterpret_cast<ID3D11ShaderResourceView *>(d_srv.handle);
+        ok = CopyOrResampleInputs(ctx, color, mv, depth, color_srv11, mv_srv11, depth_srv11, cd.Width, cd.Height);
 
-        if (g_cfg.mode == 1)
+        if (ok && g_cfg.mode == 1)
         {
             // Transport test: what went out comes straight back, through the same copy-back path.
             ctx->CopyResource(g.tex11[SLOT_OUTPUT], g.tex11[SLOT_COLOR]);
             BlitOutputToBackbuffer(ctx, rtv11);
             ++g.frames_done;
         }
-        else
+        else if (ok)
         {
             const UINT64 v_in = ++g.fence_value;
             g.ctx4->Signal(g.fence11, v_in);
@@ -1209,8 +1372,9 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
                     const UINT64 n = ++g.frames_done;
                     g.consecutive_fails = 0;
                     if (n <= static_cast<UINT64>(g_cfg.log_frames) || (n % 1800) == 0)
-                        Log("[feed] frame %llu delivered (%ux%u DLAA/NR at %d%% -> %ux%u backbuffer, reset=%d)", n,
-                            g.render_width, g.render_height, g_scale_percent, g.backbuffer_width, g.backbuffer_height, reset);
+                        Log("[feed] frame %llu delivered (%ux%u shared DLSS/DLAA/NR at %d%% -> %ux%u backbuffer, reset=%d)", n,
+                            g.render_width, g.render_height, g_scale_percent,
+                            g.backbuffer_width, g.backbuffer_height, reset);
 
                     // The DLSS 5 add-on sometimes latches STANDBY/FAILED on the very first create and only
                     // recovers on a fresh one; re-create once after the pipeline has settled.
@@ -1266,10 +1430,6 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
     g.handles_ok = g.technique.handle != 0 && g.color_var.handle != 0 && g.mv_var.handle != 0 && g.depth_var.handle != 0;
     g.missing_reported = false;
 
-    // ReShade briefly invalidates all effect handles while applying one of our requested
-    // recompiles. That is an expected transition, not a missing-installation error.
-    if (!g.handles_ok && g_scale_reload_pending) return;
-
     // Games can recreate the swapchain (and ReShade its runtime) dozens of times per second;
     // only say something when the situation actually changed.
     const int signature = (g.technique.handle ? 1 : 0) | (g.color_var.handle ? 2 : 0) |
@@ -1295,7 +1455,6 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
 {
     g.runtime = rt;
     LoadScaleSetting(rt);
-    ApplyScaleDefinition(rt, true);
     ResolveHandles(rt);
     // A recreated runtime means the DLSS 5 add-on has re-armed its hooks: give it a fresh feature.
     if (g.session_ready) g.frame_ready = false;
@@ -1311,7 +1470,8 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
     if (++destroys <= 8) Log("[feed] effect runtime %p destroyed", (void *)rt);
     ReleaseFrameResources();
     g.runtime = nullptr;
-    g.technique = {}; g.launchpad = {}; g.color_var = {}; g.mv_var = {}; g.depth_var = {}; g.scale_var = {};
+    g.technique = {}; g.launchpad = {}; g.color_var = {}; g.mv_var = {}; g.depth_var = {};
+    g.scale_var = {};
     g.handles_ok = false;
 }
 
@@ -1321,13 +1481,6 @@ static void OnReloadedEffects(reshade::api::effect_runtime *rt)
     {
         g.runtime = rt;
         ResolveHandles(rt);
-        if (g_scale_reload_pending && g.handles_ok)
-        {
-            g_scale_reload_pending = false;
-            g.frame_ready = false;
-            g.need_reset = true;
-            Log("[feed] %d%% resolution scale compiled; the DLSS/NR contract will rebuild on the next frame", g_scale_percent);
-        }
     }
 }
 
@@ -1351,8 +1504,9 @@ static void OnDestroyDevice(reshade::api::device *dev)
 static bool OnSetUniformValue(reshade::api::effect_runtime *rt, reshade::api::effect_uniform_variable variable,
                               const void *data, size_t size)
 {
-    if (rt != g.runtime || variable.handle == 0 || variable.handle != g.scale_var.handle ||
-        data == nullptr || size < sizeof(int32_t)) return false;
+    if (rt != g.runtime || variable.handle == 0 || data == nullptr || size < sizeof(int32_t)) return false;
+
+    if (variable.handle != g.scale_var.handle) return false;
 
     int32_t next_percent = 50;
     memcpy(&next_percent, data, sizeof(next_percent));

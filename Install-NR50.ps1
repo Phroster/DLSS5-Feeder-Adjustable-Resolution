@@ -132,7 +132,7 @@ $manifest = [ordered]@{
     schema = 1
     createdUtc = [DateTime]::UtcNow.ToString('o')
     gameDir = $game
-    packageVersion = '0.2.0'
+    packageVersion = '0.3.1'
     entries = $entries
 }
 $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $backupDir 'manifest.json') -Encoding utf8
@@ -204,9 +204,10 @@ try {
 }
 
 $installedHash = (Get-FileHash -LiteralPath $addonTarget -Algorithm SHA256).Hash
-Write-Host 'DLSS5 Feeder Resolution Scale 0.2.0 installed successfully.' -ForegroundColor Green
+Write-Host 'DLSS5 Feeder Single Resolution Slider 0.3.1 installed successfully.' -ForegroundColor Green
 Write-Host "Game:     $game"
 Write-Host "Preset:   $presetPath"
 Write-Host "Backup:   $backupDir"
 Write-Host "SHA-256:  $installedHash"
-Write-Host 'Keep RenoDX "Enable Upscaling WIP" disabled, launch a scene, then run Verify-NR50.ps1.'
+Write-Host 'Keep RenoDX "Enable Upscaling WIP" disabled. The Feeder uses one shared native DLSS/DLAA/NR scale.'
+Write-Host 'Launch a scene, then run Verify-NR50.ps1.'

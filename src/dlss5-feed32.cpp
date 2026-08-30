@@ -29,7 +29,7 @@
 
 #include "feed_ipc.h"
 
-#define FEED_VERSION "0.5.0"
+#define FEED_VERSION "0.5.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =

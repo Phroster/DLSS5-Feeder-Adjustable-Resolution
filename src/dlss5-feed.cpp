@@ -139,11 +139,12 @@ struct Cfg
     int   warmup_rebuild;  // frames after the first successful evaluate at which the feature is re-created once (0 = never)
     int   rebuild;         // any change of this number re-creates the feature once (manual trigger)
     int   log_frames;      // how many first frames get a full parameter dump in the log
+    int   create_delay;    // frames to hold the FIRST feature create (the DLSS 5 add-on arms its NGX hooks asynchronously)
     float mv_scale_x;      // multiplier applied to the motion vectors (the FX already outputs pixels)
     float mv_scale_y;
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 180, 0, 3, 60, 1.0f, 1.0f };
 
 static void CfgPath(char *out)
 {
@@ -169,10 +170,11 @@ static void CfgWriteDefault()
             "warmup_rebuild=%d\n"
             "rebuild=%d\n"
             "log_frames=%d\n"
+            "create_delay=%d\n"
             "mv_scale_x=%.3f\n"
             "mv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
     Log("[feed] wrote default config to %s", path);
 }
@@ -202,6 +204,7 @@ static bool CfgReload()
         else if (_stricmp(key, "warmup_rebuild") == 0) next.warmup_rebuild = iv;
         else if (_stricmp(key, "rebuild")        == 0) next.rebuild        = iv;
         else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
+        else if (_stricmp(key, "create_delay")   == 0) next.create_delay   = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
@@ -214,9 +217,9 @@ static bool CfgReload()
     if (!changed) return false;
     g_cfg = next;
     Log("[feed] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d warmup_rebuild=%d "
-        "rebuild=%d log_frames=%d mv_scale=%.3f,%.3f",
+        "rebuild=%d log_frames=%d create_delay=%d mv_scale=%.3f,%.3f",
         g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-        g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+        g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     return rebuild;
 }
 
@@ -251,6 +254,7 @@ struct Feed
     bool warmup_done;
     int  consecutive_fails;
     int  cfg_rebuild_seen;
+    int  create_grace;     // frames counted while holding the first feature create
 
     // D3D12 side
     ID3D12Device              *dev12;
@@ -535,7 +539,8 @@ static void ReleaseFrameResources()
         SafeReleaseFeature(g.feature);
         g.feature = nullptr;
     }
-    g.frame_ready = false;
+    g.frame_ready  = false;
+    g.create_grace = 0;
 }
 
 // One texture visible to both APIs: created on D3D12 and opened on D3D11, or the other
@@ -1263,6 +1268,16 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
     }
     bool ok = g.session_ready || InitSession12(rt);
 
+    // Same hook-arming grace as the D3D11 path: never call into NGX while the DLSS 5
+    // add-on may still be patching its vtable (that has crashed the process at EXEC 0x0).
+    if (ok && !g.frame_ready && g.feature == nullptr && g.create_grace < g_cfg.create_delay)
+    {
+        if (++g.create_grace == 1)
+            Log("[feed] holding the first feature create for %d frames (the DLSS 5 add-on arms its hooks asynchronously)",
+                g_cfg.create_delay);
+        ok = false;
+    }
+
     if (ok && (!g.frame_ready || w != g.width || h != g.height || cd.Format != g.bb_fmt))
     {
         Log("[feed] building: %ux%u backbuffer %s (same-device D3D12, depth reversed=%d)", w, h,
@@ -1492,6 +1507,17 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
             if (!g.session_ready) ok = InitSession(dev, ctx);
             dev->Release();
         }
+    }
+
+    // The DLSS 5 add-on arms its NGX hooks asynchronously (~300 ms after NGX loads); calling
+    // into NGX while the vtable is being patched has crashed the process (EXEC at 0x0 on a
+    // worker thread, outside any SEH). Hold the first feature create until it settled.
+    if (ok && !g.frame_ready && g.feature == nullptr && g.create_grace < g_cfg.create_delay)
+    {
+        if (++g.create_grace == 1)
+            Log("[feed] holding the first feature create for %d frames (the DLSS 5 add-on arms its hooks asynchronously)",
+                g_cfg.create_delay);
+        ok = false;
     }
 
     if (ok && (!g.frame_ready || cd.Width != g.width || cd.Height != g.height || cd.Format != g.bb_fmt))

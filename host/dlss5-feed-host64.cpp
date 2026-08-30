@@ -457,6 +457,7 @@ static int Serve(DWORD game_pid)
     DuplicateHandle(GetCurrentProcess(), hout, hgame, &game_out, 0, FALSE, DUPLICATE_SAME_ACCESS);
 
     int flags_active = 0;
+    bool transport_only = false;
     float mvsx = 1.0f, mvsy = 1.0f;
     UINT64 hold_until = 0;   // hook-arming grace, in GetTickCount64 ms
 
@@ -503,15 +504,24 @@ static int Serve(DWORD game_pid)
                 h.color_fmt  = static_cast<DXGI_FORMAT>(b.color_fmt);
                 h.output_fmt = static_cast<DXGI_FORMAT>(b.output_fmt);
                 mvsx = b.mv_scale_x; mvsy = b.mv_scale_y;
+                transport_only = b.transport != 0;
                 flags_active = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
                 if (b.depth_inverted) flags_active |= NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
                 if (b.hdr)            flags_active |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
                 if (b.flags_override >= 0) flags_active = b.flags_override;
 
-                const UINT64 now = GetTickCount64();
-                if (now < hold_until) Sleep(static_cast<DWORD>(hold_until - now));  // hook-arming grace
-                ok = CreateFeature(b.width, b.height, flags_active, &rf);
-                hold_until = GetTickCount64() + 1000;   // next create not before +1 s
+                if (transport_only)
+                {
+                    rf = static_cast<NVSDK_NGX_Result>(1);   // no NGX in the loop at all
+                    Log("[host] transport-only mode: Color will be copied to Output, no evaluate");
+                }
+                else
+                {
+                    const UINT64 now = GetTickCount64();
+                    if (now < hold_until) Sleep(static_cast<DWORD>(hold_until - now));  // hook-arming grace
+                    ok = CreateFeature(b.width, b.height, flags_active, &rf);
+                    hold_until = GetTickCount64() + 1000;   // next create not before +1 s
+                }
             }
 
             FeedBuildAck back = {};
@@ -525,14 +535,27 @@ static int Serve(DWORD game_pid)
         {
             FeedFrameMsg fm = {};
             if (!ReadFull(pipe, &fm, sizeof(fm))) break;
-            if (h.feature == nullptr) continue;
+            if (h.feature == nullptr && !transport_only) { h.fence_out->Signal(fm.n); continue; }
 
             if (!WaitFenceValue(h.fence_in, fm.n, 2000))
-            { Log("[host] frame %llu: in-fence never arrived", (unsigned long long)fm.n); continue; }
+            { Log("[host] frame %llu: in-fence never arrived", (unsigned long long)fm.n); h.fence_out->Signal(fm.n); continue; }
             h.queue->Wait(h.fence_in, fm.n);   // belt and braces on the GPU timeline
 
-            if (Evaluate(h.tex[FEED_COLOR], h.tex[FEED_OUTPUT], h.tex[FEED_DEPTH], h.tex[FEED_MV],
-                         h.width, h.height, fm.reset ? 1 : 0, mvsx, mvsy))
+            bool done = false;
+            if (transport_only)
+            {
+                if (BeginCommands())
+                {
+                    h.list->CopyResource(h.tex[FEED_OUTPUT], h.tex[FEED_COLOR]);
+                    EndCommands();
+                    done = true;
+                }
+            }
+            else
+                done = Evaluate(h.tex[FEED_COLOR], h.tex[FEED_OUTPUT], h.tex[FEED_DEPTH], h.tex[FEED_MV],
+                                h.width, h.height, fm.reset ? 1 : 0, mvsx, mvsy);
+
+            if (done)
                 h.queue->Signal(h.fence_out, fm.n);
             else
                 h.fence_out->Signal(fm.n);     // CPU-signal so the game never hangs on us

@@ -43,6 +43,7 @@ struct FeedBuild        // game -> host, on every resolution/format change
     int32_t  hdr;                // resolved flags, not cfg values
     int32_t  depth_inverted;
     int32_t  flags_override;     // -1 = none
+    int32_t  transport;          // 1 = no NGX: host copies Color -> Output (cross-process transport test)
     float    mv_scale_x, mv_scale_y;
     uint64_t tex[FEED_SLOTS];    // NT-handle VALUES in the game process (host duplicates them out)
 };

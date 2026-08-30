@@ -28,4 +28,5 @@ host/nvngx_*.dll
 host/reshade.ini
 host/ReShade.ini
 host/ReShadePreset.ini
-external/vulkan/
+external/vulkan/vulkan/
+external/vulkan/vk_video/

@@ -1387,9 +1387,16 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                     if (n <= static_cast<UINT64>(g_cfg.log_frames) || (n % 1800) == 0)
                         Log("[feed] frame %llu delivered (%ux%u, reset=%d, same-device)", n, g.width, g.height, reset);
 
-                    // No warm-up rebuild on the same-device path: the DLSS 5 add-on watches the
-                    // game's device from the first frame (its native scenario), and re-creating a
-                    // live feature is exactly where it has crashed. The cfg `rebuild` knob remains.
+                    // The DLSS 5 add-on arms its NGX hooks a moment AFTER our first create (seen
+                    // in LOTR: hooks +215 ms), which latches it in STANDBY. One warm-up re-create
+                    // fixes that -- and it is safe now: it goes through RecreateFeatureOnly, which
+                    // keeps the old feature if the new create fails or crashes.
+                    if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && n >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                    {
+                        g.warmup_done = true;
+                        g.frame_ready = false;
+                        Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu, same-device)", n);
+                    }
                 }
             }
 

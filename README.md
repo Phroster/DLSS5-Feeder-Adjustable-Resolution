@@ -2,7 +2,7 @@
 
 # DLSS5-Feeder
 
-**DLSS 5 neural rendering in games that ship without any DLSS — D3D11, D3D12, 32-bit, even DirectX 9.**
+**DLSS 5 neural rendering in games that ship without any DLSS — D3D11, D3D12, Vulkan, 32-bit, even DirectX 9.**
 
 DLSS 5's neural-rendering add-on only works by hooking a game's own DLSS calls. A game that has no
 DLSS never makes those calls, so the add-on sits idle. **DLSS5-Feeder makes the calls itself.** It
@@ -24,9 +24,11 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 - [Install for a 64-bit game](#install-for-a-64-bit-game)
 - [Install for a 32-bit game](#install-for-a-32-bit-game-beta)
 - [Install for a DirectX 9 game](#install-for-a-directx-9-game-beta)
+- [Install for a Vulkan game](#install-for-a-vulkan-game)
 - [How it works](#how-it-works)
   - [The 32-bit path](#the-32-bit-path)
   - [The DirectX 9 path](#the-directx-9-path)
+  - [The Vulkan path](#the-vulkan-path)
 - [Requirements](#requirements)
 - [Configuration](#configuration)
 - [Logs and troubleshooting](#logs-and-troubleshooting)
@@ -37,7 +39,7 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 
 ## Status
 
-Proven working in five games covering every supported path:
+Proven working in six games covering every supported path:
 
 | Game | Bitness / API | Result |
 | --- | --- | --- |
@@ -46,13 +48,14 @@ Proven working in five games covering every supported path:
 | **Splinter Cell: Blacklist** | 32-bit D3D11 | 60 fps, cross-process host |
 | **BioShock Remastered** | 32-bit D3D11 (D3D9→D3D11 wrapper) | 4K, Luma HDR |
 | **Fable Anniversary** | 32-bit **D3D9** via dgVoodoo2 | 1440p, 60 fps |
+| **DOOM (2016)** | 64-bit **Vulkan** | 4K, D3D12 evaluate via cross-API interop |
 
 In each, the DLSS 5 add-on reports `feature 18 created … inline feature 18 evaluation succeeded`,
 driven entirely by ReShade depth + estimated motion vectors.
 
-It is not game-specific: any D3D11 or D3D12 game with a working ReShade depth buffer and a motion
-vector provider should work — 64-bit directly, 32-bit via a bundled 64-bit helper process, D3D9 via
-a wrapper.
+It is not game-specific: any D3D11, D3D12 or Vulkan game with a working ReShade depth buffer and a
+motion vector provider should work — 64-bit directly, 32-bit via a bundled 64-bit helper process,
+D3D9 via a wrapper.
 
 **This is beta software.** Expect the temporal quality of *estimated* motion vectors (some ghosting
 in fast motion, softness on thin moving geometry), and the HUD is processed along with the scene.
@@ -109,13 +112,15 @@ all the actual DLSS/NGX work (details in [The 32-bit path](#the-32-bit-path)).
    `dxgi.dll`, or extract `ReShade64.dll` from the installer and rename it.)
 4. **Motion vectors** — a `texMotionVectors` provider into the game's `reshade-shaders\`,
    exactly as in step 3 of the 64-bit instructions.
-5. **Turn it on in-game** — as above. The first fed frame spawns `host64\dlss5-feed-host64.exe`,
-   which opens a window titled **"32-bit DLSS 5 Feeder"**. **Press Home in that window** (not in the
-   game) to reach the DLSS 5 Neural Rendering panel and its tuning sliders — the add-on and the game
-   never share a ReShade instance, so that window *is* the tuning UI. Set `host_window=0` in
-   `dlss5-feed.cfg` once you are happy, to keep it out of the way (closing it also just hides it).
+5. **Turn it on in-game** — as above, and check **ReShade's overlay → Add-ons tab → DLSS 5 Feed**:
+   the day-to-day DLSS 5 settings (neural uplift, NR intensity/style, …) are right there with an
+   **Apply** button — see [Configuration](#configuration). Set `host_window=0` on that page once
+   you are happy, since you should rarely need the separate window below.
 
-You will have a separate window, that is where you can customize DLSS 5 addon settings:
+The first fed frame also spawns `host64\dlss5-feed-host64.exe`, which opens a window titled
+**"32-bit DLSS 5 Feeder"** — the add-on and the game never share a ReShade instance, so this is
+where the DLSS 5 add-on's *own* full panel lives, for anything not covered by our overlay page.
+Press Home in that window to open it:
 
 <img width="1880" height="1058" alt="image" src="https://github.com/user-attachments/assets/57abd732-94d2-401c-a524-6536006f3c86" />
 
@@ -160,6 +165,30 @@ game already wraps to D3D11 — skip this section, it is just a normal 32-bit in
    filename now and the two would fight.
 6. Turn the watermark off once everything works.
 
+## Install for a Vulkan game
+
+Same pieces as a 64-bit game — with two differences.
+
+1. **ReShade for Vulkan is a layer, not a `dxgi.dll`.** Its installer registers it globally and
+   gates it per-application, so make sure your game's exe is in that list (ReShade's installer adds
+   it when you point it at the exe). The add-ons still go next to the game exe, and the game's
+   `ReShade.ini` needs `AddonPath=.\` under `[ADDON]` so they are found there.
+2. **Everything else is identical** — `dlss5-feed.addon64`, `DLSS5_Feed.fx`, a `texMotionVectors`
+   provider, `renodx-dlss5.addon64` + the `nvngx_*.dll` files, exactly as in the
+   [64-bit instructions](#install-for-a-64-bit-game). The DLSS evaluate runs on a private D3D12
+   device (see [The Vulkan path](#the-vulkan-path)); nothing extra is needed for that.
+
+**If `dlss5-feed.log` says the Vulkan interop entry points are missing**, the game did not enable the
+KHR external-interop extensions at `vkCreateDevice` and nothing in-process can add them afterwards.
+Launch it through the bundled layer instead:
+
+```
+layer\run-with-feed-layer.bat "E:\path\to\game.exe"
+```
+
+That is the whole fix — see [`layer/README.md`](layer/README.md). DOOM (2016) does *not* need it
+(ReShade already enables the extensions there); games like Tekken 3 Recomp do.
+
 ## How it works
 
 * `DLSS5_Feed.fx` (companion effect) converts the provider's motion vectors (delta-UV,
@@ -194,8 +223,9 @@ NGX and the DLSS 5 add-on only exist as x64 code, and a 32-bit process cannot lo
   No frame data ever crosses into system memory; every copy stays GPU-to-GPU.
 * Because the DLSS 5 add-on is itself a ReShade add-on, the host disguises itself as a game to load
   it: a window with a minimal D3D12 swap chain lets its own bundled ReShade (`host64\dxgi.dll`)
-  attach and the add-on arm its hooks, exactly as in a real D3D12 title. That window doubles as the
-  tuning UI.
+  attach and the add-on arm its hooks, exactly as in a real D3D12 title. The 32-bit `dlss5-feed.cfg`
+  add-on writes settings changes made in the *game's* own overlay straight into that window's
+  ReShade.ini and restarts it to apply them.
 * If the host process dies, the pipe breaks, the add-on notices and disables itself — the game keeps
   rendering normally.
 * Verified end to end with a deliberate split-screen test (`mode=1`): the host copies only the left
@@ -210,11 +240,35 @@ DLSS5-Feeder's point of view it is simply a D3D11 game and the 32-bit path appli
 translation is what makes SM5 motion-vector shaders, shared NT-handle textures and fences available
 at all — none of which exist on real D3D9.
 
+### The Vulkan path
+
+The DLSS 5 add-on only hooks **D3D12** NGX entry points, so even though NGX has a Vulkan API, using
+it would be pointless — the add-on would never see the call. The evaluate therefore runs on a
+private D3D12 device exactly as on the D3D11 path, and the frame crosses the API boundary through
+shared memory rather than being copied out to system RAM:
+
+* The D3D12 side creates the shared textures and two shared fences (`D3D12_HEAP_FLAG_SHARED`,
+  `D3D12_FENCE_FLAG_SHARED`) and exports NT handles for them.
+* The add-on imports those handles into the game's own `VkDevice` with raw Vulkan — the D3D12
+  external types (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT`,
+  `VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT`, dedicated allocation). A D3D12 fence and a
+  Vulkan timeline semaphore are the same object, so the frame counter crosses unchanged.
+* The resulting `VkSemaphore`s are handed back to ReShade as `api::fence` handles (in ReShade's
+  Vulkan backend they *are* those objects), so per-frame queue signal/wait stay inside ReShade's own
+  locks. A raw `vkQueueSubmit` would race the game's and ReShade's submits.
+* Per frame: ReShade's `barrier()` moves the game's own images (its layout tracking stays correct),
+  raw `vkCmdCopyImage`/`vkCmdBlitImage` move pixels into and out of our imported images, which sit
+  permanently in `VK_IMAGE_LAYOUT_GENERAL`.
+
+The one thing that cannot be done from inside the process is enabling the interop extensions — those
+are fixed at `vkCreateDevice`. That is what
+[`layer/VkLayer_feed_vk.dll`](layer/README.md) exists for.
+
 ## Requirements
 
 | Piece | Notes |
 | --- | --- |
-| D3D11 or D3D12 game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta). D3D10 and Vulkan are not supported. |
+| D3D11, D3D12 or Vulkan game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan may need [a small bundled layer](#install-for-a-vulkan-game). D3D10 is not supported. |
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
 | DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | from its own author; this project does not include it. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
@@ -223,7 +277,16 @@ at all — none of which exist on real D3D9.
 
 ## Configuration
 
-`dlss5-feed.cfg` is created automatically next to the add-on and re-read while the game runs.
+The easiest way to change any of this is **ReShade's overlay → Add-ons tab → DLSS 5 Feed**: every
+setting below is a live control there (checkboxes, sliders, combos), reading from and saving straight
+to `dlss5-feed.cfg`. On 32-bit games the same page also shows the **DLSS 5 host's** neural-rendering
+settings (neural uplift, NR intensity/style/local structure/local tone/auto mask/UI correction) with
+an **Apply** button — since those live in a separate process, Apply writes them into
+`host64\ReShade.ini` and restarts the helper (~2 s without DLSS; the game keeps rendering, the feed
+reconnects automatically).
+
+`dlss5-feed.cfg` itself is created automatically next to the add-on and re-read while the game runs,
+if you prefer editing the file directly:
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -233,20 +296,19 @@ at all — none of which exist on real D3D9.
 | `depth_inverted` | -1 | -1 follow `RESHADE_DEPTH_INPUT_IS_REVERSED`, 0/1 force. |
 | `flags` | -1 | raw `DLSS.Feature.Create.Flags` override. |
 | `reset_every` | 0 | 1 = NGX Reset every frame (no temporal history; diagnostic). |
-| `warmup_rebuild` | 180 | re-create the feature once after N delivered frames (works around the DLSS 5 add-on latching STANDBY on its first create). |
+| `warmup_rebuild` | 180 | re-create the feature once after N delivered frames (works around the DLSS 5 add-on latching STANDBY on its first create; skipped automatically on newer "v45+" add-on builds). |
 | `rebuild` | 0 | change the number to re-create the feature once, by hand. |
 | `log_frames` | 3 | first N frames logged in detail. |
 | `create_delay` | 60 | frames to hold a feature (re)build after a runtime (re)init — the DLSS 5 add-on arms its NGX hooks asynchronously, and calling in too early can crash. 0 disables. |
+| `preset` | 0 | DLSS render-preset hint: `0` default, `5`/`6` = legacy CNN presets E/F (clamp history harder — try these if motion warps around transparents like dust or flames), `10`/`11` = transformer presets J/K. |
 | `mv_scale_x/y` | 1.0 | extra motion-vector multiplier. |
-| `host_window` | 1 | **32-bit games only.** 1 shows the helper's window (press Home there for the DLSS 5 tuning panel); 0 hides it once you are done tuning. |
+| `host_window` | 1 | **32-bit games only.** 1 shows the helper's window; 0 hides it (its own settings are now on the overlay page above, so you rarely need it). |
 
-In `DLSS5_Feed.fx`'s own UI:
+In `DLSS5_Feed.fx`'s own UI (a handful of settings that only make sense per-shader, not per-session):
 
 * **MV_SIGN** — if the image doubles or smears while moving, flip a component.
 * **DLSS 5 Feed – debug view** technique — shows the vectors/depth being sent (static scene = grey,
   motion = colour).
-* **DLSS 5 host settings** — 32-bit games only: tune the helper's DLSS 5 parameters from the game's
-  own panel and tick APPLY (see the 32-bit install section).
 
 The shader consumes exactly one motion-vector interface: the shared `texMotionVectors` texture.
 Switching providers = enabling a different provider technique above `DLSS 5 Feed`; no recompiles,
@@ -273,6 +335,9 @@ Common cases:
   (a 64-bit `dxgi.dll` cannot load into a 32-bit game, and vice versa).
 * **"ran out of video memory" with dgVoodoo** — raise `VRAM` in `dgVoodoo.conf`; the default 256 MB
   is a virtual limit unrelated to your real GPU.
+* **Vulkan game: "the Vulkan interop entry points are missing"** — that game did not enable the KHR
+  external-interop extensions at `vkCreateDevice`. Launch it via `layer\run-with-feed-layer.bat`
+  (see [`layer/README.md`](layer/README.md)); `feed-vk-layer.log` next to the DLL shows what it added.
 * **DLSS 5 panel stuck in STANDBY** — the add-on missed the first create; the built-in warm-up
   re-creates the feature a few seconds in, which normally clears it.
 
@@ -287,6 +352,7 @@ MSVC (v143/v145) + Windows SDK. Dependencies not vendored: the **NGX SDK** (see
 | `build.bat` | `build\dlss5-feed.addon64` | NGX SDK |
 | `build-addon32.bat` | `build\dlss5-feed.addon32` | ReShade headers only |
 | `host\build-host.bat` | `host\dlss5-feed-host64.exe` | NGX SDK |
+| `layer\build-layer.bat` | `layer\VkLayer_feed_vk.dll` (only needed by Vulkan games that lack the interop extensions) | Vulkan headers |
 | `spike\build-spike.bat` | the standalone 32↔64-bit shared-resource proof used during development | — |
 
 NGX links against the Release CRT, so the builds use `/MD`.

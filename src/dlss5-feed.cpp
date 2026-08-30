@@ -36,6 +36,8 @@
 #include <cstring>
 #include <cstdlib>
 
+#define ImTextureID ImU64   // required by reshade_overlay.hpp before including imgui.h
+#include <imgui.h>
 #include <reshade.hpp>
 
 #include <nvsdk_ngx.h>
@@ -306,6 +308,24 @@ static bool CfgReload()
         g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
         g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     return rebuild;
+}
+
+// Writes every current value to dlss5-feed.cfg, overwriting it -- used by the ReShade
+// overlay page so a change made there survives the next CfgReload() (which otherwise
+// would read the old value straight back off disk 60 frames later).
+static void CfgSave()
+{
+    char path[MAX_PATH];
+    CfgPath(path);
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
+    fprintf(f,
+            "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nwarmup_rebuild=%d\n"
+            "rebuild=%d\nlog_frames=%d\ncreate_delay=%d\npreset=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+            g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
+            g_cfg.warmup_rebuild, g_cfg.rebuild, g_cfg.log_frames, g_cfg.create_delay, g_cfg.preset,
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+    fclose(f);
 }
 
 // ---------------------------------------------------------------------------
@@ -1376,9 +1396,14 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
     // api::fence handle IS a VkSemaphore -- so queue signal/wait stay inside its locks.
     if (!FeedVkLoad(&g.vk, reinterpret_cast<VkDevice>(g.rs_dev->get_native())))
     {
-        Log("[feed] could not resolve the Vulkan external-memory/semaphore entry points");
+        // The game did not enable the KHR external-interop extensions at vkCreateDevice,
+        // so the entry points do not resolve and nothing in-process can fix it. That is
+        // exactly what layer\VkLayer_feed_vk.dll is for.
+        Log("[feed] the Vulkan external-memory/semaphore entry points are missing: this game did not enable");
+        Log("[feed] the KHR external-interop extensions at vkCreateDevice, and they cannot be added afterwards.");
+        Log("[feed] FIX: launch the game through layer\run-with-feed-layer.bat (VK_LAYER_feed_vk appends them).");
         ShutdownSession();
-        FeedDisable("Vulkan interop entry points unavailable (see dlss5-feed.log)");
+        FeedDisable("this game needs VK_LAYER_feed_vk -- see dlss5-feed.log");
         return false;
     }
     g.vk_sem_in  = FeedVkImportFence(&g.vk, g.fence_in_handle);
@@ -2401,6 +2426,90 @@ static void OnDestroyDevice(reshade::api::device *dev)
 }
 
 // ---------------------------------------------------------------------------
+// ReShade overlay page: Add-ons tab -> DLSS 5 Feed. Edits dlss5-feed.cfg live and
+// saves it immediately, so the usual 60-frame CfgReload() picks up the new values
+// (and does not overwrite them with the stale on-disk copy in the meantime).
+// ---------------------------------------------------------------------------
+
+static void HelpMarker(const char *desc)
+{
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+        ImGui::TextUnformatted(desc);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
+static void DrawOverlay(reshade::api::effect_runtime *)
+{
+    bool dirty = false;
+    bool enabled = g_cfg.enabled != 0;
+    if (ImGui::Checkbox("Enabled", &enabled)) { g_cfg.enabled = enabled ? 1 : 0; dirty = true; }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Status");
+    ImGui::Text("Session: %s", g.disabled ? "disabled (see dlss5-feed.log)" : g.session_ready ? "open" : "not started");
+    ImGui::Text("Feature: %s", g.frame_ready ? "ready" : "not built");
+    if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
+    ImGui::Text("DLSS 5 add-on: v%s (%s)", g_renodx_ver, g_renodx_lazy ? "v45+ engine" : "classic engine");
+    if (g.disabled && ImGui::Button("Re-enable"))
+    {
+        g.disabled = false;
+        g.consecutive_fails = 0;
+        Log("[feed] re-enabled from the overlay");
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("DLSS contract");
+    static const char *kModes[] = { "Inert", "Transport test (no NGX)", "Full DLSS path" };
+    if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) dirty = true;
+    static const char *kTri[] = { "Auto", "Force off", "Force on" };
+    int hdr_idx = g_cfg.hdr + 1, di_idx = g_cfg.depth_inverted + 1;
+    if (ImGui::Combo("HDR", &hdr_idx, kTri, 3)) { g_cfg.hdr = hdr_idx - 1; dirty = true; }
+    if (ImGui::Combo("Depth inverted", &di_idx, kTri, 3)) { g_cfg.depth_inverted = di_idx - 1; dirty = true; }
+    bool reset_every = g_cfg.reset_every != 0;
+    if (ImGui::Checkbox("Reset every frame (diagnostic)", &reset_every)) { g_cfg.reset_every = reset_every ? 1 : 0; dirty = true; }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("DLSS render preset");
+    static const char *kPresetNames[] = { "Default", "E (legacy CNN)", "F (legacy CNN)", "J (transformer)", "K (transformer)" };
+    static const int   kPresetValues[] = { 0, 5, 6, 10, 11 };
+    int preset_idx = 0;
+    for (int i = 0; i < 5; ++i) if (kPresetValues[i] == g_cfg.preset) preset_idx = i;
+    if (ImGui::Combo("Preset", &preset_idx, kPresetNames, 5)) { g_cfg.preset = kPresetValues[preset_idx]; dirty = true; }
+    ImGui::TextWrapped("Presets differ in how hard DLSS clamps history against the current frame. "
+                       "If motion warps around transparents (dust, smoke, flames), try E or F.");
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Motion vectors");
+    if (ImGui::SliderFloat("MV scale X", &g_cfg.mv_scale_x, 0.0f, 4.0f)) dirty = true;
+    if (ImGui::SliderFloat("MV scale Y", &g_cfg.mv_scale_y, 0.0f, 4.0f)) dirty = true;
+
+    if (ImGui::CollapsingHeader("Advanced"))
+    {
+        if (ImGui::SliderInt("Create delay (frames)", &g_cfg.create_delay, 0, 300)) dirty = true;
+        ImGui::SameLine(); HelpMarker("Frames to hold a feature (re)build after a runtime (re)init -- "
+                                       "the DLSS 5 add-on arms its NGX hooks asynchronously.");
+        if (!g_renodx_lazy)
+        {
+            if (ImGui::SliderInt("Warm-up rebuild (frames)", &g_cfg.warmup_rebuild, 0, 600)) dirty = true;
+            ImGui::SameLine(); HelpMarker("Re-creates the feature once after N delivered frames -- works around "
+                                          "the classic DLSS 5 add-on latching STANDBY on its first create. "
+                                          "Skipped automatically on v45+ (not shown as adjustable there).");
+        }
+        if (ImGui::InputInt("Raw create flags (-1 = auto)", &g_cfg.flags)) dirty = true;
+        if (ImGui::SliderInt("Log first N frames", &g_cfg.log_frames, 0, 20)) dirty = true;
+        if (ImGui::Button("Force one rebuild")) { ++g_cfg.rebuild; dirty = true; }
+    }
+
+    if (dirty) CfgSave();
+}
+
+// ---------------------------------------------------------------------------
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
@@ -2432,9 +2541,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        reshade::register_overlay(nullptr, DrawOverlay);
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);

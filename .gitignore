@@ -30,3 +30,8 @@ host/ReShade.ini
 host/ReShadePreset.ini
 external/vulkan/vulkan/
 external/vulkan/vk_video/
+layer/*.dll
+layer/*.obj
+layer/*.exp
+layer/*.lib
+layer/*.log

@@ -23,6 +23,8 @@
 #include <cstring>
 #include <cstdlib>
 
+#define ImTextureID ImU64   // required by reshade_overlay.hpp before including imgui.h
+#include <imgui.h>
 #include <reshade.hpp>
 
 #include "feed_ipc.h"
@@ -119,6 +121,22 @@ static void CfgWriteDefault()
     fclose(f);
 }
 
+// Writes every current value, overwriting the file -- used by the overlay page so an
+// edit made there survives the next CfgReload() instead of being read back off the
+// stale on-disk copy 60 frames later.
+static void CfgSave()
+{
+    char path[MAX_PATH];
+    CfgPath(path);
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
+    fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
+               "host_window=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+            g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+    fclose(f);
+}
+
 static bool CfgReload()   // true when a build-affecting value changed
 {
     char path[MAX_PATH];
@@ -178,10 +196,6 @@ struct Feed32
     reshade::api::effect_texture_variable  mv_var;
     reshade::api::effect_texture_variable  depth_var;
 
-    // in-game control of the host's DLSS 5 (renodx) settings, via shader uniforms
-    reshade::api::effect_uniform_variable  u_apply, u_uplift, u_intensity, u_style,
-                                           u_structure, u_tone, u_automask, u_uicorr;
-    bool host_nr_synced;
     bool depth_reversed;
     bool handles_ok;
     bool missing_reported;
@@ -418,48 +432,24 @@ static void WriteHostNR(const HostNR &v)
     sprintf_s(buf, "%.6f", v.tone);        WritePrivateProfileStringA("RenoDX.DLSS5", "NRLocalTone", buf, p);
 }
 
-// Push the host's active values into the shader sliders, so the panel shows the truth.
-static void SyncHostNRToShader(reshade::api::effect_runtime *rt)
-{
-    if (g.host_nr_synced || g.u_apply.handle == 0) return;
-    HostNR v;
-    ReadHostNR(&v);
-    const bool bf = false;
-    rt->set_uniform_value_bool(g.u_apply, &bf, 1);
-    bool b;
-    b = v.uplift   != 0; rt->set_uniform_value_bool(g.u_uplift, &b, 1);
-    b = v.automask != 0; rt->set_uniform_value_bool(g.u_automask, &b, 1);
-    b = v.uicorr   != 0; rt->set_uniform_value_bool(g.u_uicorr, &b, 1);
-    rt->set_uniform_value_int(g.u_intensity, &v.intensity, 1);
-    rt->set_uniform_value_int(g.u_style, &v.style, 1);
-    rt->set_uniform_value_float(g.u_structure, &v.structure_, 1);
-    rt->set_uniform_value_float(g.u_tone, &v.tone, 1);
-    g.host_nr_synced = true;
-    Log("[feed32] host DLSS 5 settings loaded into the panel: uplift=%d intensity=%d style=%d structure=%.2f tone=%.2f automask=%d uicorr=%d",
-        v.uplift, v.intensity, v.style, v.structure_, v.tone, v.automask, v.uicorr);
-}
+// Cache of the host's settings, shown and edited on the ReShade overlay page (Add-ons
+// tab -> DLSS 5 Feed). Loaded from the host's ini on first resolve so the panel always
+// starts from what is actually active, never a stale default.
+static HostNR g_host_nr;
+static bool   g_host_nr_loaded;
 
 static void HostClose();   // below
 
-static void HostApplySettings(reshade::api::effect_runtime *rt)
+static void HostApplySettings()
 {
-    HostNR v = {};
-    bool b = false;
-    rt->get_uniform_value_bool(g.u_uplift, &b, 1);   v.uplift = b ? 1 : 0;
-    rt->get_uniform_value_bool(g.u_automask, &b, 1); v.automask = b ? 1 : 0;
-    rt->get_uniform_value_bool(g.u_uicorr, &b, 1);   v.uicorr = b ? 1 : 0;
-    rt->get_uniform_value_int(g.u_intensity, &v.intensity, 1);
-    rt->get_uniform_value_int(g.u_style, &v.style, 1);
-    rt->get_uniform_value_float(g.u_structure, &v.structure_, 1);
-    rt->get_uniform_value_float(g.u_tone, &v.tone, 1);
-
     Log("[feed32] applying DLSS 5 host settings: uplift=%d intensity=%d style=%d structure=%.2f tone=%.2f automask=%d uicorr=%d",
-        v.uplift, v.intensity, v.style, v.structure_, v.tone, v.automask, v.uicorr);
+        g_host_nr.uplift, g_host_nr.intensity, g_host_nr.style, g_host_nr.structure_, g_host_nr.tone,
+        g_host_nr.automask, g_host_nr.uicorr);
 
     // Order matters: the host's ReShade saves its ini ON EXIT and would clobber our
     // values -- close the host first, write after, respawn on the next frame.
     HostClose();
-    WriteHostNR(v);
+    WriteHostNR(g_host_nr);
 
     SafeRelease(g.fence_in);    // the new host creates new fences; reopen from its BuildAck
     SafeRelease(g.fence_out);
@@ -726,18 +716,6 @@ static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *d
 
 static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
-    // The APPLY tick works even while the feed is disabled -- it is also the recovery path.
-    if (g.u_apply.handle != 0)
-    {
-        bool apply = false;
-        rt->get_uniform_value_bool(g.u_apply, &apply, 1);
-        if (apply)
-        {
-            const bool off = false;
-            rt->set_uniform_value_bool(g.u_apply, &off, 1);
-            HostApplySettings(rt);
-        }
-    }
 
     if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
 
@@ -875,15 +853,14 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
         if (t.handle != 0) { g.launchpad = t; provider = p.tech; break; }
     }
 
-    g.u_apply     = rt->find_uniform_variable(kEffectFile, "HOST_APPLY");
-    g.u_uplift    = rt->find_uniform_variable(kEffectFile, "HOST_NeuralUplift");
-    g.u_intensity = rt->find_uniform_variable(kEffectFile, "HOST_NRIntensity");
-    g.u_style     = rt->find_uniform_variable(kEffectFile, "HOST_NRStyle");
-    g.u_structure = rt->find_uniform_variable(kEffectFile, "HOST_NRLocalStructure");
-    g.u_tone      = rt->find_uniform_variable(kEffectFile, "HOST_NRLocalTone");
-    g.u_automask  = rt->find_uniform_variable(kEffectFile, "HOST_NRAutoMask");
-    g.u_uicorr    = rt->find_uniform_variable(kEffectFile, "HOST_NRUICorrection");
-    SyncHostNRToShader(rt);
+    if (!g_host_nr_loaded)
+    {
+        ReadHostNR(&g_host_nr);
+        g_host_nr_loaded = true;
+        Log("[feed32] host DLSS 5 settings loaded into the overlay page: uplift=%d intensity=%d style=%d structure=%.2f tone=%.2f automask=%d uicorr=%d",
+            g_host_nr.uplift, g_host_nr.intensity, g_host_nr.style, g_host_nr.structure_, g_host_nr.tone,
+            g_host_nr.automask, g_host_nr.uicorr);
+    }
 
     char v[16] = {};
     g.depth_reversed = true;
@@ -951,6 +928,86 @@ static void OnDestroyDevice(reshade::api::device *dev)
 }
 
 // ---------------------------------------------------------------------------
+// ReShade overlay page (Add-ons tab -> DLSS 5 Feed): the local dlss5-feed.cfg, and --
+// unlike the 64-bit add-on -- the DLSS 5 host's own neural-rendering settings, which
+// on this path live in a separate process's ReShade.ini. Replaces the old approach of
+// bridging them through hidden shader uniforms in DLSS5_Feed.fx.
+// ---------------------------------------------------------------------------
+
+static void HelpMarker(const char *desc)
+{
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+        ImGui::TextUnformatted(desc);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
+static void DrawOverlay(reshade::api::effect_runtime *)
+{
+    bool dirty = false;
+    bool enabled = g_cfg.enabled != 0;
+    if (ImGui::Checkbox("Enabled", &enabled)) { g_cfg.enabled = enabled ? 1 : 0; dirty = true; }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Status");
+    ImGui::Text("Feed: %s", g.disabled ? "disabled (see dlss5-feed.log)" : g.built ? "built" : "not built");
+    ImGui::Text("Host process: %s", HostAlive() ? "running" : "not running");
+    if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
+    if (g.disabled && ImGui::Button("Re-enable"))
+    {
+        g.disabled = false;
+        g.consecutive_fails = 0;
+        g_retry_at = 0;
+        Log("[feed32] re-enabled from the overlay");
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("DLSS contract");
+    static const char *kModes[] = { "Inert", "Transport test (no NGX, left half only)", "Full DLSS path" };
+    if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) dirty = true;
+    static const char *kTri[] = { "Auto", "Force off", "Force on" };
+    int hdr_idx = g_cfg.hdr + 1, di_idx = g_cfg.depth_inverted + 1;
+    if (ImGui::Combo("HDR", &hdr_idx, kTri, 3)) { g_cfg.hdr = hdr_idx - 1; dirty = true; }
+    if (ImGui::Combo("Depth inverted", &di_idx, kTri, 3)) { g_cfg.depth_inverted = di_idx - 1; dirty = true; }
+    bool reset_every = g_cfg.reset_every != 0;
+    if (ImGui::Checkbox("Reset every frame (diagnostic)", &reset_every)) { g_cfg.reset_every = reset_every ? 1 : 0; dirty = true; }
+    if (ImGui::SliderFloat("MV scale X", &g_cfg.mv_scale_x, 0.0f, 4.0f)) dirty = true;
+    if (ImGui::SliderFloat("MV scale Y", &g_cfg.mv_scale_y, 0.0f, 4.0f)) dirty = true;
+
+    bool show_host_window = g_cfg.host_window != 0;
+    if (ImGui::Checkbox("Show the DLSS 5 host window", &show_host_window)) { g_cfg.host_window = show_host_window ? 1 : 0; dirty = true; }
+    ImGui::SameLine(); HelpMarker("The helper process's own window. Only needed for settings not listed here.");
+
+    if (ImGui::CollapsingHeader("Advanced"))
+    {
+        if (ImGui::InputInt("Raw create flags (-1 = auto)", &g_cfg.flags)) dirty = true;
+        if (ImGui::SliderInt("Log first N frames", &g_cfg.log_frames, 0, 20)) dirty = true;
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("DLSS 5 neural-rendering settings (on the host)");
+    bool uplift = g_host_nr.uplift != 0, automask = g_host_nr.automask != 0, uicorr = g_host_nr.uicorr != 0;
+    ImGui::Checkbox("Neural uplift", &uplift);           g_host_nr.uplift   = uplift   ? 1 : 0;
+    ImGui::SliderInt("NR intensity", &g_host_nr.intensity, 0, 5);
+    ImGui::SliderInt("NR style", &g_host_nr.style, 0, 3);
+    ImGui::SliderFloat("NR local structure", &g_host_nr.structure_, 0.0f, 1.0f);
+    ImGui::SliderFloat("NR local tone", &g_host_nr.tone, 0.0f, 1.0f);
+    ImGui::Checkbox("NR auto mask", &automask);          g_host_nr.automask = automask ? 1 : 0;
+    ImGui::Checkbox("NR UI correction", &uicorr);        g_host_nr.uicorr   = uicorr   ? 1 : 0;
+    if (ImGui::Button("Apply to the DLSS 5 host"))
+        HostApplySettings();
+    ImGui::SameLine();
+    ImGui::TextDisabled("(restarts the helper process, ~2 s without DLSS)");
+
+    if (dirty) CfgSave();
+}
+
+// ---------------------------------------------------------------------------
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
@@ -979,9 +1036,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        reshade::register_overlay(nullptr, DrawOverlay);
     }
     else if (reason == DLL_PROCESS_DETACH)
     {
+        reshade::unregister_overlay(nullptr, DrawOverlay);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);

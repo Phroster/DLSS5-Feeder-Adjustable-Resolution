@@ -16,6 +16,7 @@ $rootFiles = @(
     'LICENSE',
     'THIRD_PARTY_NOTICES.md',
     'CHANGELOG.md',
+    'VISUAL_TUNING.md',
     'Install-NR50.ps1',
     'Verify-NR50.ps1'
 )
@@ -25,7 +26,7 @@ foreach ($relative in $rootFiles) {
     Copy-Item -LiteralPath $source -Destination (Join-Path $packageRoot $relative)
 }
 
-foreach ($directory in @('bin', 'shaders')) {
+foreach ($directory in @('bin', 'shaders', 'presets')) {
     $source = Join-Path $repo $directory
     if (-not (Test-Path -LiteralPath $source -PathType Container)) { throw "Missing release directory: $source" }
     Copy-Item -LiteralPath $source -Destination (Join-Path $packageRoot $directory) -Recurse

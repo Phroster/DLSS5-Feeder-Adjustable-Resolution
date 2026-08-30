@@ -7,6 +7,8 @@
   changes no longer reload the ReShade effect or reset its UI.
 - Removed unsupported split input/output controls and RenoDX WIP-upscaling guidance.
 - Kept the 400 ms debounce, exact motion-vector scaling, persistence, and rollback.
+- Added an optional MGS4 visual preset using post-NR Colourfulness, Levels, low-strength
+  Clarity, and RCAS without redistributing third-party shaders.
 
 ## 0.3.0 - 2026-08-30 (withdrawn experiment)
 

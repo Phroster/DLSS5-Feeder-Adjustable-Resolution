@@ -85,6 +85,14 @@ A healthy result reports the selected percentage and work resolution, a matching
 Feeder/RenoDX native contract, a successful inline Feature 18 evaluation, and no
 fallback marker.
 
+## Optional visual preset
+
+An optional MGS4 presentation preset is provided at
+[`presets/MGS4-VisualTune.ini`](presets/MGS4-VisualTune.ini). It adds restrained
+post-NR color/levels, low-strength Clarity, and RCAS sharpening without bundling the
+third-party shader files. See [VISUAL_TUNING.md](VISUAL_TUNING.md) for dependencies,
+ordering, values, and rollback guidance.
+
 ## Roll back
 
 Each install creates `_NR50-Backup-yyyyMMdd-HHmmss` inside the game directory. Run

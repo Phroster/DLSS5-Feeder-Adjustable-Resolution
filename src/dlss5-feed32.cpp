@@ -27,14 +27,14 @@
 
 #include "feed_ipc.h"
 
-#define FEED_VERSION "0.3.0"
+#define FEED_VERSION "0.4.0"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Feeds DLSS 5 neural rendering in 32-bit D3D11 games without DLSS: ships the frame, depth and "
-    "LaunchPad motion vectors to a 64-bit helper process (host64\\dlss5-feed-host64.exe) over "
-    "cross-process shared GPU textures, and blits the neural result back. Needs DLSS5_Feed.fx + "
-    "MartysMods LaunchPad. Settings in dlss5-feed.cfg.";
+    "motion vectors to a 64-bit helper process (host64\\dlss5-feed-host64.exe) over cross-process "
+    "shared GPU textures, and blits the neural result back. Needs DLSS5_Feed.fx and a motion-vector "
+    "provider (iMMERSE LaunchPad or any texMotionVectors shader). Settings in dlss5-feed.cfg.";
 
 // ---------------------------------------------------------------------------
 // Logging (same shape as the 64-bit add-on)

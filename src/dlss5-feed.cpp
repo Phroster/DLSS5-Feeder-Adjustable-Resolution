@@ -41,14 +41,15 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
-#define FEED_VERSION "0.2.0"
+#define FEED_VERSION "0.4.0"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Feeds DLSS 5 neural rendering with ReShade's depth and LaunchPad motion vectors in D3D11 and "
+    "Feeds DLSS 5 neural rendering with ReShade's depth and estimated motion vectors in D3D11 and "
     "D3D12 games without DLSS: runs a real DLSS DLAA pass where the DLSS 5 add-on hooks in (a private "
     "D3D12 device for D3D11 games, the game's own device for D3D12) and writes the result back into "
-    "the frame. Needs DLSS5_Feed.fx + MartysMods LaunchPad. Settings in dlss5-feed.cfg.";
+    "the frame. Needs DLSS5_Feed.fx and a motion-vector provider (iMMERSE LaunchPad or any "
+    "texMotionVectors shader). Settings in dlss5-feed.cfg.";
 
 // ---------------------------------------------------------------------------
 // Logging

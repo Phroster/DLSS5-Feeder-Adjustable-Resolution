@@ -256,10 +256,18 @@ static void FeedDisable(const char *why)
     Warn("stopped: %s. The game renders normally. See dlss5-feed.log for the detail.", why);
 }
 
+// A build can fail transiently -- the game is mid-resolution-change, or the host's NGX
+// needs a reinit first. Retrying every frame just hammers a broken NGX (and spams the
+// log), so back off exponentially instead of disabling the feed for the whole session:
+// the user should not have to restart the game because one mode switch went wrong.
+static UINT64 g_retry_at;   // GetTickCount64 deadline
+
 static void FeedFail(const char *what)
 {
-    Log("[feed32] failure: %s", what);
-    if (++g.consecutive_fails >= 3) FeedDisable("repeated failures");
+    const int n = ++g.consecutive_fails;
+    const DWORD wait_ms = n <= 3 ? 1000u : (n <= 6 ? 5000u : 30000u);
+    g_retry_at = GetTickCount64() + wait_ms;
+    Log("[feed32] failure: %s (attempt %d; retrying in %lu ms)", what, n, wait_ms);
 }
 
 // ---------------------------------------------------------------------------
@@ -675,10 +683,16 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
 
     if (ok && (!g.built || cd.Width != g.width || cd.Height != g.height || cd.Format != g.bb_fmt))
     {
-        Log("[feed32] building: %ux%u backbuffer fmt=%u (depth reversed=%d, mode=%d)",
-            cd.Width, cd.Height, cd.Format, g.depth_reversed ? 1 : 0, g_cfg.mode);
-        ok = BuildShared(cd.Width, cd.Height, cd.Format);
-        if (!ok && !g.disabled) FeedFail("shared build");
+        if (GetTickCount64() < g_retry_at)
+            ok = false;                       // backing off after a failed build
+        else
+        {
+            Log("[feed32] building: %ux%u backbuffer fmt=%u (depth reversed=%d, mode=%d)",
+                cd.Width, cd.Height, cd.Format, g.depth_reversed ? 1 : 0, g_cfg.mode);
+            ok = BuildShared(cd.Width, cd.Height, cd.Format);
+            if (ok) g.consecutive_fails = 0;
+            else if (!g.disabled) FeedFail("shared build");
+        }
     }
 
     if (ok && g.built)

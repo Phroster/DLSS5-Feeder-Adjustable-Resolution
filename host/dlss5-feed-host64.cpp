@@ -498,6 +498,8 @@ static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r)
     if (ccode != 0)
     {
         AbortCommands();
+        // NGX may have partially written *OutHandle before the fault; never trust it.
+        h.feature = nullptr;
         Log("[host] CreateFeature raised 0x%08X (caught; nothing submitted)", ccode);
         return false;
     }
@@ -507,6 +509,20 @@ static bool CreateFeature(UINT w, UINT h_, int flags, NVSDK_NGX_Result *out_r)
     { Log("[host] CreateFeature failed 0x%08X (%s)", rf, NgxResultName(rf)); h.feature = nullptr; return false; }
     Log("[host] feature ready: %ux%u DLAA flags=%d", w, h_, flags);
     return true;
+}
+
+// A crashed CreateFeature can leave NGX's own internal state broken (seen in BioShock
+// Remastered: the add-on faulted once during a resolution/HDR change, and every following
+// create failed too, with the SEH catching a different exception each time -- NGX was
+// never going to recover on its own). Reset NGX itself as a last resort so the feed can
+// come back without the user having to restart the game.
+static bool ReinitNgx()
+{
+    Log("[host] NGX looks corrupted after repeated failures; reinitializing");
+    if (h.params != nullptr) { NVSDK_NGX_D3D12_DestroyParameters(h.params); h.params = nullptr; }
+    if (h.ngx_inited) { NVSDK_NGX_D3D12_Shutdown1(h.dev); h.ngx_inited = false; }
+    h.feature = nullptr;
+    return InitNgx();
 }
 
 static bool Evaluate(ID3D12Resource *color, ID3D12Resource *output, ID3D12Resource *depth, ID3D12Resource *mv,
@@ -651,6 +667,7 @@ static int Serve(DWORD game_pid)
     UINT64 hold_until = GetTickCount64() + 800;
     UINT64 evaluated  = 0;
     bool   warm_done  = false;
+    int    build_fails = 0;
 
     for (;;)
     {
@@ -658,8 +675,22 @@ static int Serve(DWORD game_pid)
         // The pipe is byte-mode from a single writer, so read the smaller header
         // first and decide -- FeedFrameMsg and FeedBuild share no prefix, so the
         // client precedes every message with a 1-byte tag instead.
+        //
+        // A plain blocking ReadFile here starves the message pump (and Present)
+        // whenever the game stops feeding frames -- paused, loading, a menu -- and
+        // Windows shows the host window as "Not Responding". Poll instead, so the
+        // window (and its ReShade overlay) stays alive and clickable at all times.
         BYTE tag = 0;
-        if (!ReadFull(pipe, &tag, 1)) { Log("[host] pipe closed by the game"); break; }
+        bool tag_read = false;
+        for (;;)
+        {
+            DWORD avail = 0;
+            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr)) break;   // pipe broken
+            if (avail > 0) { tag_read = ReadFull(pipe, &tag, 1); break; }
+            PumpPresent();
+            Sleep(8);
+        }
+        if (!tag_read) { Log("[host] pipe closed by the game"); break; }
 
         if (tag == 'B')
         {
@@ -712,6 +743,14 @@ static int Serve(DWORD game_pid)
                     if (now < hold_until) Sleep(static_cast<DWORD>(hold_until - now));  // hook-arming grace
                     ok = CreateFeature(b.width, b.height, flags_active, &rf);
                     hold_until = GetTickCount64() + 1000;   // next create not before +1 s
+
+                    if (ok) build_fails = 0;
+                    else if (++build_fails >= 2 && ReinitNgx())
+                    {
+                        Log("[host] retrying the create after an NGX reinit");
+                        ok = CreateFeature(b.width, b.height, flags_active, &rf);
+                        if (ok) build_fails = 0;
+                    }
                 }
             }
 

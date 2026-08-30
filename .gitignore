@@ -14,3 +14,7 @@ external/ngx/libs/
 # Upstream bridge sources are not re-hosted; see README credits
 external/bridge-1.0.19/
 release/
+spike/*.exe
+spike/*.obj
+spike/*.log
+spike/*.err

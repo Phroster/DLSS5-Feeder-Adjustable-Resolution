@@ -43,15 +43,15 @@
 
 #include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
 
-#define FEED_VERSION "0.4.0"
+#define FEED_VERSION "0.5.0"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Feeds DLSS 5 neural rendering with ReShade's depth and estimated motion vectors in D3D11 and "
     "D3D12 games without DLSS: runs a real DLSS DLAA pass where the DLSS 5 add-on hooks in (a private "
     "D3D12 device for D3D11 games, the game's own device for D3D12) and writes the result back into "
-    "the frame. Needs DLSS5_Feed.fx and a motion-vector provider (iMMERSE LaunchPad or any "
-    "texMotionVectors shader). Settings in dlss5-feed.cfg.";
+    "the frame. Needs DLSS5_Feed.fx and a texMotionVectors provider (e.g. ReshadeMotionEstimation). "
+    "Settings in dlss5-feed.cfg.";
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -1724,7 +1724,7 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 cl->barrier(2, res, from, to);
             }
 
-            // Everything recorded so far (LaunchPad, the feed passes, these copies) goes to
+            // Everything recorded so far (the motion-vector provider, the feed passes, these copies) goes to
             // the game's queue now; our evaluate follows it on the same queue.
             Breadcrumb("flushing ReShade's command list");
             g.rs_queue->flush_immediate_command_list();

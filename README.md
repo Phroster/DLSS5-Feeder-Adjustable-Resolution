@@ -1,13 +1,14 @@
 # DLSS5-Feeder
 
-**DLSS 5 neural rendering in D3D11 games that ship without any DLSS.**
+**DLSS 5 neural rendering in D3D11 and D3D12 games that ship without any DLSS.**
 
 DLSS 5's neural-rendering add-on only works by hooking a game's own DLSS calls. A game that has no
 DLSS never makes those calls, so the add-on sits idle. **DLSS5-Feeder makes the calls itself.** It
 builds a complete DLSS DLAA "contract" out of what ReShade already has — the frame being processed,
 the depth buffer, and iMMERSE **LaunchPad**'s optical-flow motion vectors — runs a genuine DLSS
-evaluate on a private D3D12 device, lets the DLSS 5 neural-rendering add-on hook into that evaluate,
-and copies the neural result back into the frame. All inside ReShade's effect chain.
+evaluate (on a private D3D12 device for D3D11 games, directly on the game's own device for D3D12
+games), lets the DLSS 5 neural-rendering add-on hook into that evaluate, and copies the neural
+result back into the frame. All inside ReShade's effect chain.
 
 ```
 game frame → ReShade effects → [MartysMods_Launchpad] → [DLSS5_Feed] → DLSS5-Feeder:
@@ -18,18 +19,19 @@ game frame → ReShade effects → [MartysMods_Launchpad] → [DLSS5_Feed] → D
 
 ### Status
 
-Proven working in **Metro 2033 Redux** (64-bit, D3D11, no native DLSS): the DLSS 5 neural-rendering
+Proven working in **Metro 2033 Redux** (64-bit, D3D11) and **The Lord of the Rings: War in the
+North - Legacy Edition** (64-bit, D3D12), both without native DLSS: the DLSS 5 neural-rendering
 add-on reports `feature 18 created … inline feature 18 evaluation succeeded` at native 4K/1440p,
 driven entirely by ReShade depth + LaunchPad motion vectors. This is a first, rough version — expect
 the temporal quality of estimated motion vectors (some ghosting in fast motion, softness on thin
 moving geometry), and the HUD is processed along with the scene.
 
-It is not Metro-specific: any 64-bit D3D11 game with a working ReShade depth buffer and LaunchPad
-motion vectors should work.
+It is not game-specific: any 64-bit D3D11 or D3D12 game with a working ReShade depth buffer and
+LaunchPad motion vectors should work.
 
 ## Install (5 steps)
 
-You need a 64-bit **DirectX 11** game (DX12/DX9/32-bit won't work).
+You need a 64-bit **DirectX 11 or DirectX 12** game (DX9/DX10/32-bit won't work).
 
 1. **ReShade with add-on support** — get it from **https://reshade.me** , run the installer, pick your
    game's `.exe`, choose **Direct3D 10/11/12**, and tick **"Enable loading of add-ons"** (the full /
@@ -75,6 +77,9 @@ That's it. Check `dlss5-feed.log` (next to the game `.exe`) for `feature ready �
   mode (render size = output size, no jitter), and blits the D3D12 output back onto the backbuffer.
   The DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) detours that D3D12 evaluate and inserts
   its neural pass — it cannot tell the contract is synthetic.
+* On a **D3D12 game** there is no transport at all: NGX runs on the game's own device and queue,
+  motion vectors and depth are consumed zero-copy straight from the effect textures, and the
+  feature survives alt-tabs and effect reloads untouched (only a real resolution change rebuilds).
 * NGX calls are wrapped in SEH: if the (closed-source) DLSS 5 add-on faults — e.g. across a
   resolution change — the feed disables itself and the game keeps running, rather than crashing.
 
@@ -82,7 +87,7 @@ That's it. Check `dlss5-feed.log` (next to the game `.exe`) for `feature ready �
 
 | Piece | Notes |
 | --- | --- |
-| 64-bit D3D11 game | NGX is 64-bit only. DX12 / DX9 / 32-bit not supported. |
+| 64-bit D3D11 or D3D12 game | NGX is 64-bit only. DX9 / DX10 / Vulkan / 32-bit not supported. |
 | ReShade 6.8+ **with add-on support** (`dxgi.dll`) | Generic Depth add-on enabled and picking the scene depth. |
 | DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | from its own author; this project does not include it. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
@@ -102,6 +107,7 @@ That's it. Check `dlss5-feed.log` (next to the game `.exe`) for `feature ready �
 | `warmup_rebuild` | 180 | re-create the feature once after N delivered frames (works around the DLSS 5 add-on latching STANDBY/FAILED on its first create). |
 | `rebuild` | 0 | change the number to re-create the feature once, by hand. |
 | `log_frames` | 3 | first N frames logged in detail. |
+| `create_delay` | 60 | frames to hold a feature (re)build after a runtime (re)init -- the DLSS 5 add-on arms its NGX hooks asynchronously, and calling in too early can crash. 0 disables. |
 | `mv_scale_x/y` | 1.0 | extra motion-vector multiplier. |
 
 Motion-vector **sign** and scale are also exposed in `DLSS5_Feed.fx`'s UI; if the image doubles/smears
@@ -140,6 +146,8 @@ uses `/MD`.
 * **Motion vectors:** Pascal Gilcher's iMMERSE LaunchPad (consumed at runtime, not bundled).
 * **DLSS 5 neural rendering:** the RenoDX community's `renodx-dlss5` add-on.
 * **ReShade** add-on API by Patrick Mours.
+* **D3D12 stability findings** independently confirmed by the
+  [Pizzawookiee fork](https://github.com/Pizzawookiee/DLSS5-Feeder)'s diagnostics.
 
 ## License
 

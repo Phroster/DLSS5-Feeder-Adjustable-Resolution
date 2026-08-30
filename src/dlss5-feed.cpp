@@ -41,6 +41,8 @@
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
+#include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
+
 #define FEED_VERSION "0.4.0"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
@@ -279,11 +281,17 @@ struct Feed
     // performs the Vulkan external-memory import, tracks the images for barrier()/copy,
     // and keeps every queue operation inside its own locks. No raw Vk* in this add-on.
     reshade::api::device  *rs_dev;               // not owned
-    reshade::api::resource rs_tex[SLOT_COUNT];   // imported views of tex12[]
-    reshade::api::fence    rs_fence_in, rs_fence_out;
+    reshade::api::fence    rs_fence_in, rs_fence_out;  // wrap vk_sem_* for ReShade queue signal/wait
     ID3D12Fence           *fence12_in, *fence12_out;  // the same fences, D3D12 side
     HANDLE                 fence_in_handle, fence_out_handle;
     HANDLE                 tex_shared_vk[SLOT_COUNT];
+    // raw-Vulkan imports of the D3D12 shared objects (ReShade's create_* import them
+    // as the wrong external type). Wrapped back into rs_fence_* for ReShade queue ops.
+    FeedVk                 vk;
+    VkImage                vk_img[SLOT_COUNT];
+    VkDeviceMemory         vk_mem[SLOT_COUNT];
+    VkSemaphore            vk_sem_in, vk_sem_out;
+    bool                   vk_layout_init;   // our images transitioned UNDEFINED->GENERAL once
     UINT64                 vk_frame;
 
     // NGX
@@ -539,13 +547,17 @@ static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOU
 static void ReleaseFrameResources()
 {
     DrainGpu();
-    // Vulkan transport: drop the game-side imports first (through ReShade, while the
-    // game's device is still alive), then the D3D12 halves below.
-    if (g.rs_dev != nullptr)
+    // Vulkan transport: drop our raw VkImage imports (the memory is the D3D12 resource's;
+    // freeing the import does not free the D3D12 resource, which SafeRelease(tex12) does).
+    if (g.vk.ok)
         for (int i = 0; i < SLOT_COUNT; ++i)
-            if (g.rs_tex[i].handle != 0) { g.rs_dev->destroy_resource(g.rs_tex[i]); g.rs_tex[i] = {}; }
+        {
+            if (g.vk_img[i] != VK_NULL_HANDLE) { g.vk.DestroyImage(g.vk.dev, g.vk_img[i], nullptr); g.vk_img[i] = VK_NULL_HANDLE; }
+            if (g.vk_mem[i] != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_mem[i], nullptr);   g.vk_mem[i] = VK_NULL_HANDLE; }
+        }
     for (int i = 0; i < SLOT_COUNT; ++i)
         if (g.tex_shared_vk[i] != nullptr) { CloseHandle(g.tex_shared_vk[i]); g.tex_shared_vk[i] = nullptr; }
+    g.vk_layout_init = false;
     SafeRelease(g.output_srv);
     for (int i = 0; i < SLOT_COUNT; ++i)
     {
@@ -947,11 +959,12 @@ static void ShutdownSession()
     g.session_ready = false;
     g.dev11 = nullptr;
     g.rs_queue = nullptr;
-    if (g.rs_dev != nullptr)
+    if (g.vk.ok)
     {
-        if (g.rs_fence_in.handle  != 0) { g.rs_dev->destroy_fence(g.rs_fence_in);  g.rs_fence_in  = {}; }
-        if (g.rs_fence_out.handle != 0) { g.rs_dev->destroy_fence(g.rs_fence_out); g.rs_fence_out = {}; }
+        if (g.vk_sem_in  != VK_NULL_HANDLE) { g.vk.DestroySemaphore(g.vk.dev, g.vk_sem_in,  nullptr); g.vk_sem_in  = VK_NULL_HANDLE; }
+        if (g.vk_sem_out != VK_NULL_HANDLE) { g.vk.DestroySemaphore(g.vk.dev, g.vk_sem_out, nullptr); g.vk_sem_out = VK_NULL_HANDLE; }
     }
+    g.rs_fence_in = {}; g.rs_fence_out = {};
     SafeRelease(g.fence12_in);
     SafeRelease(g.fence12_out);
     if (g.fence_in_handle  != nullptr) { CloseHandle(g.fence_in_handle);  g.fence_in_handle  = nullptr; }
@@ -1256,44 +1269,29 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
         return false;
     }
 
-    void *hin  = g.fence_in_handle;
-    void *hout = g.fence_out_handle;
-    const bool fin  = g.rs_dev->create_fence(0, reshade::api::fence_flags::shared, &g.rs_fence_in, &hin);
-    const bool fout = g.rs_dev->create_fence(0, reshade::api::fence_flags::shared, &g.rs_fence_out, &hout);
-    Log("[feed] PROBE: D3D12 fence import into the game's API: in=%s out=%s",
-        fin ? "OK" : "FAILED", fout ? "OK" : "FAILED");
-    if (!fin || !fout)
+    // Import both D3D12 fences into the game's Vulkan device as timeline semaphores,
+    // ourselves (ReShade's create_fence imports as the wrong external type). Then wrap
+    // the VkSemaphores back into api::fence handles -- in ReShade's Vulkan backend an
+    // api::fence handle IS a VkSemaphore -- so queue signal/wait stay inside its locks.
+    if (!FeedVkLoad(&g.vk, reinterpret_cast<VkDevice>(g.rs_dev->get_native())))
     {
-        // Diagnose A vs B (see PLAN-VULKAN phase-0 fallback): ask the game's VkDevice
-        // itself whether the external-semaphore/memory import entry points resolve.
-        // vkGetDeviceProcAddr returns null for a DEVICE extension that was not enabled
-        // at vkCreateDevice, so this cleanly separates the two failure modes.
-        typedef void *(__stdcall *PFN_gdpa)(void *device, const char *name);
-        void *vkdev = reinterpret_cast<void *>(g.rs_dev->get_native());
-        HMODULE vk = LoadLibraryW(L"vulkan-1.dll");
-        auto gdpa = vk ? reinterpret_cast<PFN_gdpa>(GetProcAddress(vk, "vkGetDeviceProcAddr")) : nullptr;
-        if (gdpa != nullptr && vkdev != nullptr)
-        {
-            const bool sem = gdpa(vkdev, "vkImportSemaphoreWin32HandleKHR") != nullptr;
-            const bool mem = gdpa(vkdev, "vkGetMemoryWin32HandlePropertiesKHR") != nullptr;
-            Log("[feed] PROBE A/B: on the game's VkDevice  external_semaphore_win32=%s  external_memory_win32=%s",
-                sem ? "PRESENT" : "absent", mem ? "PRESENT" : "absent");
-            if (sem || mem)
-                Log("[feed] -> case B: the extensions ARE enabled; ReShade's create_fence will not import a "
-                    "D3D12 handle type. Fix = raw Vulkan import in the add-on (no layer needed).");
-            else
-                Log("[feed] -> case A: the extensions are NOT enabled at vkCreateDevice. Fix = a small Vulkan "
-                    "layer that appends them + the timelineSemaphore feature (PLAN-VULKAN fallback).");
-        }
-        else
-            Log("[feed] PROBE A/B: could not query the VkDevice (vulkan-1.dll=%p gdpa=%p vkdev=%p)",
-                (void *)vk, (void *)gdpa, vkdev);
-
-        Log("[feed] cross-API fence import failed; see the PROBE A/B line above for which fix applies");
+        Log("[feed] could not resolve the Vulkan external-memory/semaphore entry points");
+        ShutdownSession();
+        FeedDisable("Vulkan interop entry points unavailable (see dlss5-feed.log)");
+        return false;
+    }
+    g.vk_sem_in  = FeedVkImportFence(&g.vk, g.fence_in_handle);
+    g.vk_sem_out = FeedVkImportFence(&g.vk, g.fence_out_handle);
+    Log("[feed] D3D12 fence -> Vulkan timeline semaphore import: in=%s out=%s",
+        g.vk_sem_in ? "OK" : "FAILED", g.vk_sem_out ? "OK" : "FAILED");
+    if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
+    {
         ShutdownSession();
         FeedDisable("cross-API fence import failed (see dlss5-feed.log)");
         return false;
     }
+    g.rs_fence_in  = { reinterpret_cast<uint64_t>(g.vk_sem_in) };
+    g.rs_fence_out = { reinterpret_cast<uint64_t>(g.vk_sem_out) };
 
     Log("[feed] session ready (Vulkan transport): dev12=%p queue=%p", (void *)g.dev12, (void *)g.queue);
     Log("############# feed: session open (Vulkan transport) #############");
@@ -1329,19 +1327,21 @@ static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
         return false;
     }
 
-    // Game half: imported through ReShade, which performs the external-memory import
-    // and registers the image in its tracking (required for barrier()/copies on it).
-    reshade::api::resource_desc desc(w, h, 1, 1, static_cast<reshade::api::format>(fmt), 1,
-                                     reshade::api::memory_heap::default_, vk_usage,
-                                     reshade::api::resource_flags::shared | reshade::api::resource_flags::shared_nt_handle);
-    void *handle = g.tex_shared_vk[slot];
-    if (!g.rs_dev->create_resource(desc, nullptr, vk_initial, &g.rs_tex[slot], &handle))
+    // Game half: import the D3D12 memory into a VkImage ourselves (raw Vulkan; ReShade
+    // would import it as the wrong external type). Kept permanently in GENERAL layout.
+    (void)vk_usage; (void)vk_initial;
+    const VkFormat vkf = FeedVkFormat(fmt);
+    if (vkf == VK_FORMAT_UNDEFINED)
     {
-        Log("[feed] PROBE: texture import FAILED: %s %ux%u %s (VK_KHR_external_memory_win32 missing?)",
-            kSlotName[slot], w, h, FormatName(fmt));
+        Log("[feed] %s: no VkFormat mapping for %s", kSlotName[slot], FormatName(fmt));
         return false;
     }
-    Log("[feed] %-6s %ux%u %s shared D3D12 -> imported into the game's API", kSlotName[slot], w, h, FormatName(fmt));
+    if (!FeedVkImportImage(&g.vk, g.tex_shared_vk[slot], w, h, vkf, uav, &g.vk_img[slot], &g.vk_mem[slot]))
+    {
+        Log("[feed] texture import FAILED: %s %ux%u %s (raw Vulkan external-memory import)", kSlotName[slot], w, h, FormatName(fmt));
+        return false;
+    }
+    Log("[feed] %-6s %ux%u %s shared D3D12 -> imported as VkImage", kSlotName[slot], w, h, FormatName(fmt));
     return true;
 }
 
@@ -1807,44 +1807,54 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
     if (ok && g.frame_ready)
     {
-        // The shared images rest permanently copy-ready (inputs copy_dest, output
-        // copy_source), so only the game-owned sources need transitions here.
+        VkCommandBuffer cb = reinterpret_cast<VkCommandBuffer>(cl->get_native());
+        VkImage bb_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(bb_res.handle));
+        VkImage mv_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(mv_res.handle));
+        VkImage dp_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(depth_res.handle));
+
+        // Our imported images -> GENERAL (first frame after a build, from UNDEFINED).
+        // ReShade never touches them; only these raw barriers do.
         Breadcrumb("copying inputs (Vulkan)");
+        {
+            const VkImageLayout f = g.vk_layout_init ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+            for (int i = 0; i < SLOT_COUNT; ++i)
+                FeedVkBarrier(&g.vk, cb, g.vk_img[i], f, VK_IMAGE_LAYOUT_GENERAL);
+            g.vk_layout_init = true;
+        }
+        // Game images -> copy_source via ReShade (its layout tracking stays correct),
+        // then raw-copy each into our GENERAL image.
         {
             const resource       res[3]  = { bb_res, mv_res, depth_res };
             const resource_usage from[3] = { resource_usage::render_target, resource_usage::shader_resource, resource_usage::shader_resource };
             const resource_usage to[3]   = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source };
             cl->barrier(3, res, from, to);
         }
-        cl->copy_texture_region(bb_res, 0, nullptr, g.rs_tex[SLOT_COLOR], 0, nullptr);
-        cl->copy_texture_region(mv_res, 0, nullptr, g.rs_tex[SLOT_MV], 0, nullptr);
-        cl->copy_texture_region(depth_res, 0, nullptr, g.rs_tex[SLOT_DEPTH], 0, nullptr);
+        FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
+        FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_MV],    VK_IMAGE_LAYOUT_GENERAL, w, h);
+        FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[SLOT_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
 
         if (g_cfg.mode == 1)
         {
-            // Transport test: only the LEFT half comes back -- a split screen is
-            // unambiguous visual proof of the round trip, as on the 32-bit path.
+            // Transport test: raw-copy the LEFT half of our COLOR back over the game's
+            // backbuffer -- a split screen is unambiguous proof of the round trip.
             {
-                const resource       res[4]  = { bb_res, mv_res, depth_res, g.rs_tex[SLOT_COLOR] };
-                const resource_usage from[4] = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_dest };
-                const resource_usage to[4]   = { resource_usage::copy_dest, resource_usage::shader_resource, resource_usage::shader_resource, resource_usage::copy_source };
-                cl->barrier(4, res, from, to);
+                const resource       res[3]  = { bb_res, mv_res, depth_res };
+                const resource_usage from[3] = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source };
+                const resource_usage to[3]   = { resource_usage::copy_dest, resource_usage::shader_resource, resource_usage::shader_resource };
+                cl->barrier(3, res, from, to);
             }
-            subresource_box box = {};
-            box.right  = w / 2;
-            box.bottom = h;
-            box.back   = 1;
-            cl->copy_texture_region(g.rs_tex[SLOT_COLOR], 0, &box, bb_res, 0, &box);
+            FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_COLOR], VK_IMAGE_LAYOUT_GENERAL, bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w / 2, h);
             {
-                const resource       res[2]  = { bb_res, g.rs_tex[SLOT_COLOR] };
-                const resource_usage from[2] = { resource_usage::copy_dest, resource_usage::copy_source };
-                const resource_usage to[2]   = { resource_usage::render_target, resource_usage::copy_dest };
-                cl->barrier(2, res, from, to);
+                const resource       res[1]  = { bb_res };
+                const resource_usage from[1] = { resource_usage::copy_dest };
+                const resource_usage to[1]   = { resource_usage::render_target };
+                cl->barrier(1, res, from, to);
             }
             ++g.frames_done;
         }
         else
         {
+            // Park the backbuffer as copy_dest to receive the output; restore mv/depth.
             {
                 const resource       res[3]  = { bb_res, mv_res, depth_res };
                 const resource_usage from[3] = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source };
@@ -1923,8 +1933,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             // game's queue after the wait below -- GPU-ordered, no CPU stall.
             Breadcrumb("waiting for the result (Vulkan)");
             g.rs_queue->wait(g.rs_fence_out, n);
-            if (done)
-                cl->copy_texture_region(g.rs_tex[SLOT_OUTPUT], 0, nullptr, bb_res, 0, nullptr);
+            cb = reinterpret_cast<VkCommandBuffer>(cl->get_native());  // fresh buffer after the flush
+            if (done)  // blit (not copy): handles an output/backbuffer channel-order or format diff
+                FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
             {
                 const resource       res[1]  = { bb_res };
                 const resource_usage from[1] = { resource_usage::copy_dest };

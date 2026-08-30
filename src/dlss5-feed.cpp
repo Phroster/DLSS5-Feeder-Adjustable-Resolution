@@ -271,8 +271,20 @@ struct Feed
     ID3D11DeviceContext4      *ctx4;
     UINT64                     fence_value;
     ID3D11Device              *dev11;      // not owned
-    bool                       dev12_owned; // true on the D3D11 path (we created the private device)
-    reshade::api::command_queue *rs_queue;  // D3D12 path: ReShade's wrapper of the game's queue (not owned)
+    bool                       dev12_owned; // true on the D3D11/Vulkan paths (we created the private device)
+    reshade::api::command_queue *rs_queue;  // D3D12/Vulkan paths: ReShade's wrapper of the game's queue (not owned)
+
+    // Vulkan transport: the game-side halves of the shared resources, imported THROUGH
+    // ReShade's API (create_resource/create_fence with an existing NT handle), so ReShade
+    // performs the Vulkan external-memory import, tracks the images for barrier()/copy,
+    // and keeps every queue operation inside its own locks. No raw Vk* in this add-on.
+    reshade::api::device  *rs_dev;               // not owned
+    reshade::api::resource rs_tex[SLOT_COUNT];   // imported views of tex12[]
+    reshade::api::fence    rs_fence_in, rs_fence_out;
+    ID3D12Fence           *fence12_in, *fence12_out;  // the same fences, D3D12 side
+    HANDLE                 fence_in_handle, fence_out_handle;
+    HANDLE                 tex_shared_vk[SLOT_COUNT];
+    UINT64                 vk_frame;
 
     // NGX
     bool                 ngx_inited;
@@ -527,6 +539,13 @@ static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOU
 static void ReleaseFrameResources()
 {
     DrainGpu();
+    // Vulkan transport: drop the game-side imports first (through ReShade, while the
+    // game's device is still alive), then the D3D12 halves below.
+    if (g.rs_dev != nullptr)
+        for (int i = 0; i < SLOT_COUNT; ++i)
+            if (g.rs_tex[i].handle != 0) { g.rs_dev->destroy_resource(g.rs_tex[i]); g.rs_tex[i] = {}; }
+    for (int i = 0; i < SLOT_COUNT; ++i)
+        if (g.tex_shared_vk[i] != nullptr) { CloseHandle(g.tex_shared_vk[i]); g.tex_shared_vk[i] = nullptr; }
     SafeRelease(g.output_srv);
     for (int i = 0; i < SLOT_COUNT; ++i)
     {
@@ -928,6 +947,17 @@ static void ShutdownSession()
     g.session_ready = false;
     g.dev11 = nullptr;
     g.rs_queue = nullptr;
+    if (g.rs_dev != nullptr)
+    {
+        if (g.rs_fence_in.handle  != 0) { g.rs_dev->destroy_fence(g.rs_fence_in);  g.rs_fence_in  = {}; }
+        if (g.rs_fence_out.handle != 0) { g.rs_dev->destroy_fence(g.rs_fence_out); g.rs_fence_out = {}; }
+    }
+    SafeRelease(g.fence12_in);
+    SafeRelease(g.fence12_out);
+    if (g.fence_in_handle  != nullptr) { CloseHandle(g.fence_in_handle);  g.fence_in_handle  = nullptr; }
+    if (g.fence_out_handle != nullptr) { CloseHandle(g.fence_out_handle); g.fence_out_handle = nullptr; }
+    g.rs_dev   = nullptr;
+    g.vk_frame = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,6 +1117,243 @@ static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     if (!MakeTex12(SLOT_COLOR, w, h, g.color_fmt, false,
                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) ||
         !MakeTex12(SLOT_OUTPUT, w, h, g.output_fmt, true, D3D12_RESOURCE_STATE_UNORDERED_ACCESS))
+    {
+        ReleaseFrameResources();
+        return false;
+    }
+
+    if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
+
+    bool crashed = false;
+    if (!CreateDlssFeature(w, h, inverted, &crashed))
+    {
+        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Session, Vulkan transport: the game renders on Vulkan, but the DLSS 5 add-on
+// only hooks D3D12 -- so the evaluate runs on our private D3D12 device exactly as
+// on the D3D11 path, and the frame crosses the API boundary through shared NT
+// handles. The game-side halves are imported THROUGH ReShade's documented
+// shared-handle API; the create_fence/create_resource results below double as the
+// PLAN-VULKAN phase-0 probe (they fail cleanly if the device lacks the
+// external-memory/semaphore extensions, and the log says exactly which).
+// ---------------------------------------------------------------------------
+
+static bool InitSessionVk(reshade::api::effect_runtime *rt)
+{
+    Breadcrumb("opening the D3D12 session (Vulkan transport)");
+    Log("################ feed: opening D3D12 session (Vulkan transport) ################");
+
+    g.rs_dev   = rt->get_device();
+    g.rs_queue = rt->get_command_queue();
+    if (g.rs_dev == nullptr || g.rs_queue == nullptr)
+    {
+        FeedDisable("the ReShade device/queue is not reachable");
+        return false;
+    }
+
+    // Private D3D12 device, loaded so ReShade hooks it -- that hook is what lets the
+    // DLSS 5 add-on see the device (proven on the D3D11 path since Metro; whether it
+    // also holds when ReShade is loaded as a Vulkan layer is part of this probe:
+    // look for the add-on's "hooks installed" line in ReShade.log).
+    HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
+    auto create_device = d3d12 ? reinterpret_cast<PFN_D3D12CreateDevice_>(GetProcAddress(d3d12, "D3D12CreateDevice")) : nullptr;
+    if (create_device == nullptr)
+    {
+        Log("[feed] no D3D12CreateDevice");
+        FeedDisable("d3d12.dll unavailable");
+        return false;
+    }
+    HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&g.dev12));
+    if (FAILED(hr) || g.dev12 == nullptr)
+    {
+        Log("[feed] D3D12CreateDevice failed 0x%08X", hr);
+        FeedDisable("the private D3D12 device failed");
+        return false;
+    }
+    g.dev12_owned = true;
+
+    wchar_t data_path[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, data_path, MAX_PATH);
+    if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
+
+    Breadcrumb("initialising NGX (Vulkan transport)");
+    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
+    Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
+    if (NVSDK_NGX_FAILED(r))
+    {
+        r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+                                                "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
+        Log("[feed] NVSDK_NGX_D3D12_Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
+    }
+    if (NVSDK_NGX_FAILED(r))
+    {
+        ShutdownSession();
+        FeedDisable("NGX would not initialise");
+        return false;
+    }
+    g.ngx_inited = true;
+
+    NVSDK_NGX_Parameter *caps = nullptr;
+    r = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
+    if (NVSDK_NGX_SUCCEED(r) && caps != nullptr)
+    {
+        int avail = 0;
+        caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
+        Log("[feed] NGX capabilities: SuperSampling.Available=%d", avail);
+        if (!avail)
+        {
+            ShutdownSession();
+            FeedDisable("DLSS is not available on this GPU/driver");
+            return false;
+        }
+    }
+    r = NVSDK_NGX_D3D12_AllocateParameters(&g.params);
+    if (NVSDK_NGX_FAILED(r) || g.params == nullptr)
+    {
+        Log("[feed] AllocateParameters failed 0x%08X", r);
+        ShutdownSession();
+        FeedDisable("NGX parameter allocation failed");
+        return false;
+    }
+
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    g.dev12->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&g.queue));
+    for (int i = 0; i < Feed::kFrames; ++i)
+        g.dev12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                        reinterpret_cast<void **>(&g.alloc[i]));
+    if (g.alloc[0] != nullptr)
+        g.dev12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.alloc[0], nullptr,
+                                   __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g.list));
+    if (g.list != nullptr) g.list->Close();
+    g.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g.dev12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12));
+    if (g.queue == nullptr || g.list == nullptr || g.fence12 == nullptr || g.fence_event == nullptr)
+    {
+        Log("[feed] D3D12 queue/list/fence creation failed");
+        ShutdownSession();
+        FeedDisable("could not create the D3D12 objects");
+        return false;
+    }
+
+    // The two cross-API fences: created shared on D3D12, imported into the game's
+    // device through ReShade. A D3D12 fence and a Vulkan timeline semaphore are the
+    // same kernel object by design, so the frame counter crosses unchanged.
+    hr = g.dev12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12_in));
+    if (SUCCEEDED(hr)) hr = g.dev12->CreateSharedHandle(g.fence12_in, nullptr, GENERIC_ALL, nullptr, &g.fence_in_handle);
+    if (SUCCEEDED(hr)) hr = g.dev12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12_out));
+    if (SUCCEEDED(hr)) hr = g.dev12->CreateSharedHandle(g.fence12_out, nullptr, GENERIC_ALL, nullptr, &g.fence_out_handle);
+    if (FAILED(hr))
+    {
+        Log("[feed] shared fence creation failed 0x%08X", hr);
+        ShutdownSession();
+        FeedDisable("shared fence creation failed");
+        return false;
+    }
+
+    void *hin  = g.fence_in_handle;
+    void *hout = g.fence_out_handle;
+    const bool fin  = g.rs_dev->create_fence(0, reshade::api::fence_flags::shared, &g.rs_fence_in, &hin);
+    const bool fout = g.rs_dev->create_fence(0, reshade::api::fence_flags::shared, &g.rs_fence_out, &hout);
+    Log("[feed] PROBE: D3D12 fence import into the game's API: in=%s out=%s",
+        fin ? "OK" : "FAILED", fout ? "OK" : "FAILED");
+    if (!fin || !fout)
+    {
+        Log("[feed] the runtime/driver would not import a D3D12 fence; the device probably lacks");
+        Log("[feed] VK_KHR_external_semaphore_win32 / timelineSemaphore (see PLAN-VULKAN.md, phase-0 fallback)");
+        ShutdownSession();
+        FeedDisable("cross-API fence import failed (see dlss5-feed.log)");
+        return false;
+    }
+
+    Log("[feed] session ready (Vulkan transport): dev12=%p queue=%p", (void *)g.dev12, (void *)g.queue);
+    Log("############# feed: session open (Vulkan transport) #############");
+    g.session_ready = true;
+    return true;
+}
+
+static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
+                            reshade::api::resource_usage vk_usage, reshade::api::resource_usage vk_initial)
+{
+    // D3D12 half: shared committed resource, same shape MakeSharedPair creates.
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width            = w;
+    rd.Height           = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = fmt;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+                          (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
+    HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                  nullptr, __uuidof(ID3D12Resource),
+                                                  reinterpret_cast<void **>(&g.tex12[slot]));
+    if (SUCCEEDED(hr))
+        hr = g.dev12->CreateSharedHandle(g.tex12[slot], nullptr, GENERIC_ALL, nullptr, &g.tex_shared_vk[slot]);
+    if (FAILED(hr))
+    {
+        Log("[feed] %s: shared D3D12 texture failed 0x%08X", kSlotName[slot], hr);
+        return false;
+    }
+
+    // Game half: imported through ReShade, which performs the external-memory import
+    // and registers the image in its tracking (required for barrier()/copies on it).
+    reshade::api::resource_desc desc(w, h, 1, 1, static_cast<reshade::api::format>(fmt), 1,
+                                     reshade::api::memory_heap::default_, vk_usage,
+                                     reshade::api::resource_flags::shared | reshade::api::resource_flags::shared_nt_handle);
+    void *handle = g.tex_shared_vk[slot];
+    if (!g.rs_dev->create_resource(desc, nullptr, vk_initial, &g.rs_tex[slot], &handle))
+    {
+        Log("[feed] PROBE: texture import FAILED: %s %ux%u %s (VK_KHR_external_memory_win32 missing?)",
+            kSlotName[slot], w, h, FormatName(fmt));
+        return false;
+    }
+    Log("[feed] %-6s %ux%u %s shared D3D12 -> imported into the game's API", kSlotName[slot], w, h, FormatName(fmt));
+    return true;
+}
+
+static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
+{
+    if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        return RecreateFeatureOnly(w, h);
+
+    Breadcrumb("building the Vulkan-shared textures");
+    ReleaseFrameResources();
+
+    g.width      = w;
+    g.height     = h;
+    g.bb_fmt     = bb_fmt;
+    g.color_fmt  = TypedColorFormat(bb_fmt);
+    g.output_fmt = OutputFormatFor(g.color_fmt);
+    g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+    const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+
+    if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
+    {
+        Log("[feed] backbuffer format %u (%s) is not supported", bb_fmt, FormatName(bb_fmt));
+        FeedDisable("unsupported backbuffer format");
+        return false;
+    }
+
+    // Rest states keep the shared images permanently copy-ready on the game side:
+    // inputs sit in copy_dest, the output in copy_source -- so the per-frame path
+    // never has to barrier them there at all.
+    const reshade::api::resource_usage copy_rw =
+        reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::copy_source;
+    if (!MakeSharedTexVk(SLOT_COLOR,  w, h, g.color_fmt,             false, copy_rw, reshade::api::resource_usage::copy_dest) ||
+        !MakeSharedTexVk(SLOT_OUTPUT, w, h, g.output_fmt,            true,  copy_rw, reshade::api::resource_usage::copy_source) ||
+        !MakeSharedTexVk(SLOT_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,   false, copy_rw, reshade::api::resource_usage::copy_dest) ||
+        !MakeSharedTexVk(SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false, copy_rw, reshade::api::resource_usage::copy_dest))
     {
         ReleaseFrameResources();
         return false;
@@ -1433,6 +1700,236 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
 }
 
 // ---------------------------------------------------------------------------
+// Per frame, Vulkan transport: ReShade's command list carries the copies between
+// the game's images and the shared ones, ReShade's queue signal/wait carries the
+// cross-API fences, and our private D3D12 list carries only the NGX evaluate.
+// ---------------------------------------------------------------------------
+
+static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+{
+    using namespace reshade::api;
+
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.frame_ready = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+
+    device *dev_api = rt->get_device();
+
+    resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
+    if (g.mv_var.handle != 0)    rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
+    if (g.depth_var.handle != 0) rt->get_texture_binding(g.depth_var, &d_srv, &d_srgb);
+    if (mv_srv.handle == 0 || d_srv.handle == 0)
+    {
+        if (!g.missing_reported)
+        {
+            g.missing_reported = true;
+            Warn("DLSS5_Feed.fx textures not found (technique %s). Install DLSS5_Feed.fx + a motion vector provider and enable both.",
+                 g.technique.handle ? "found" : "MISSING");
+        }
+        return;
+    }
+
+    const resource bb_res    = dev_api->get_resource_from_view(rtv);
+    const resource mv_res    = dev_api->get_resource_from_view(mv_srv);
+    const resource depth_res = dev_api->get_resource_from_view(d_srv);
+    if (bb_res.handle == 0 || mv_res.handle == 0 || depth_res.handle == 0) return;
+
+    const resource_desc cd = dev_api->get_resource_desc(bb_res);
+    const resource_desc md = dev_api->get_resource_desc(mv_res);
+    const resource_desc dd = dev_api->get_resource_desc(depth_res);
+    const UINT w = cd.texture.width, h = cd.texture.height;
+    if (w != md.texture.width || h != md.texture.height || w != dd.texture.width || h != dd.texture.height ||
+        cd.texture.samples != 1 ||
+        md.texture.format != format::r16g16_float || dd.texture.format != format::r32_float)
+    {
+        static bool said_vk = false;
+        if (!said_vk)
+        {
+            said_vk = true;
+            Log("[feed] input mismatch: color %ux%u fmt=%u samp=%u | mv %ux%u fmt=%u | depth %ux%u fmt=%u -- skipping",
+                w, h, (unsigned)cd.texture.format, cd.texture.samples, md.texture.width, md.texture.height,
+                (unsigned)md.texture.format, dd.texture.width, dd.texture.height, (unsigned)dd.texture.format);
+        }
+        return;
+    }
+
+    bool ok = true;
+    if (g.session_ready && g.rs_dev != nullptr && g.rs_dev != dev_api)
+    {
+        Log("[feed] the game recreated its device; rebuilding the session");
+        ShutdownSession();
+    }
+    if (!g.session_ready) ok = InitSessionVk(rt);
+
+    const DXGI_FORMAT bbf = static_cast<DXGI_FORMAT>(cd.texture.format);
+    const bool needs_build_vk = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt;
+    if (ok && needs_build_vk && g.create_grace < g_cfg.create_delay)
+    {
+        if (++g.create_grace == 1)
+            Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously)",
+                g_cfg.create_delay);
+        ok = false;
+    }
+    if (ok && needs_build_vk)
+    {
+        Log("[feed] building: %ux%u backbuffer %s (Vulkan transport, depth reversed=%d)", w, h,
+            FormatName(bbf), g.depth_reversed ? 1 : 0);
+        ok = BuildResourcesVk(w, h, bbf);
+        if (!ok) FeedFail("resource build");
+        else g.consecutive_fails = 0;
+    }
+
+    if (ok && g.frame_ready)
+    {
+        // The shared images rest permanently copy-ready (inputs copy_dest, output
+        // copy_source), so only the game-owned sources need transitions here.
+        Breadcrumb("copying inputs (Vulkan)");
+        {
+            const resource       res[3]  = { bb_res, mv_res, depth_res };
+            const resource_usage from[3] = { resource_usage::render_target, resource_usage::shader_resource, resource_usage::shader_resource };
+            const resource_usage to[3]   = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source };
+            cl->barrier(3, res, from, to);
+        }
+        cl->copy_texture_region(bb_res, 0, nullptr, g.rs_tex[SLOT_COLOR], 0, nullptr);
+        cl->copy_texture_region(mv_res, 0, nullptr, g.rs_tex[SLOT_MV], 0, nullptr);
+        cl->copy_texture_region(depth_res, 0, nullptr, g.rs_tex[SLOT_DEPTH], 0, nullptr);
+
+        if (g_cfg.mode == 1)
+        {
+            // Transport test: only the LEFT half comes back -- a split screen is
+            // unambiguous visual proof of the round trip, as on the 32-bit path.
+            {
+                const resource       res[4]  = { bb_res, mv_res, depth_res, g.rs_tex[SLOT_COLOR] };
+                const resource_usage from[4] = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_dest };
+                const resource_usage to[4]   = { resource_usage::copy_dest, resource_usage::shader_resource, resource_usage::shader_resource, resource_usage::copy_source };
+                cl->barrier(4, res, from, to);
+            }
+            subresource_box box = {};
+            box.right  = w / 2;
+            box.bottom = h;
+            box.back   = 1;
+            cl->copy_texture_region(g.rs_tex[SLOT_COLOR], 0, &box, bb_res, 0, &box);
+            {
+                const resource       res[2]  = { bb_res, g.rs_tex[SLOT_COLOR] };
+                const resource_usage from[2] = { resource_usage::copy_dest, resource_usage::copy_source };
+                const resource_usage to[2]   = { resource_usage::render_target, resource_usage::copy_dest };
+                cl->barrier(2, res, from, to);
+            }
+            ++g.frames_done;
+        }
+        else
+        {
+            {
+                const resource       res[3]  = { bb_res, mv_res, depth_res };
+                const resource_usage from[3] = { resource_usage::copy_source, resource_usage::copy_source, resource_usage::copy_source };
+                const resource_usage to[3]   = { resource_usage::copy_dest, resource_usage::shader_resource, resource_usage::shader_resource };
+                cl->barrier(3, res, from, to);
+            }
+
+            const UINT64 n = ++g.vk_frame;
+            const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+            g.need_reset = false;
+
+            Breadcrumb("signalling the game-side fence (Vulkan)");
+            g.rs_queue->flush_immediate_command_list();
+            g.rs_queue->signal(g.rs_fence_in, n);
+
+            // D3D12: wait for the copies, evaluate, signal back. Unchanged machinery.
+            g.queue->Wait(g.fence12_in, n);
+            bool done = false;
+            if (!BeginCommands()) FeedFail("command list");
+            else
+            {
+                Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
+                ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
+                ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
+                ep.Feature.InSharpness = 0.0f;
+                ep.pInDepth          = g.tex12[SLOT_DEPTH];
+                ep.pInMotionVectors  = g.tex12[SLOT_MV];
+                ep.InJitterOffsetX   = 0.0f;
+                ep.InJitterOffsetY   = 0.0f;
+                ep.InRenderSubrectDimensions.Width  = g.width;
+                ep.InRenderSubrectDimensions.Height = g.height;
+                ep.InReset           = reset;
+                ep.InMVScaleX        = g_cfg.mv_scale_x;
+                ep.InMVScaleY        = g_cfg.mv_scale_y;
+                ep.InPreExposure     = 1.0f;
+                ep.InExposureScale   = 1.0f;
+
+                Breadcrumb("running the D3D12 evaluate (Vulkan transport)");
+                DWORD ecode = 0;
+                NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+                if (ecode != 0)
+                {
+                    AbortCommands();  // never execute a list NGX crashed while recording
+                    Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
+                    FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
+                    g.frame_ready = false;
+                }
+                else
+                {
+                    Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+                    EndCommands();
+                    if (NVSDK_NGX_FAILED(re))
+                    {
+                        Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
+                        FeedFail("evaluate");
+                        g.frame_ready = false;
+                    }
+                    else
+                        done = true;
+                }
+            }
+            if (done)
+                g.queue->Signal(g.fence12_out, n);   // after the evaluate, GPU-ordered
+            else
+                g.fence12_out->Signal(n);            // CPU-signal so the game never hangs on us
+
+            // The copy home lands on the fresh immediate list, which executes on the
+            // game's queue after the wait below -- GPU-ordered, no CPU stall.
+            Breadcrumb("waiting for the result (Vulkan)");
+            g.rs_queue->wait(g.rs_fence_out, n);
+            if (done)
+                cl->copy_texture_region(g.rs_tex[SLOT_OUTPUT], 0, nullptr, bb_res, 0, nullptr);
+            {
+                const resource       res[1]  = { bb_res };
+                const resource_usage from[1] = { resource_usage::copy_dest };
+                const resource_usage to[1]   = { resource_usage::render_target };
+                cl->barrier(1, res, from, to);
+            }
+
+            if (done)
+            {
+                const UINT64 fn = ++g.frames_done;
+                g.consecutive_fails = 0;
+                if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
+                    Log("[feed] frame %llu delivered (%ux%u, reset=%d, Vulkan transport)", fn, g.width, g.height, reset);
+
+                if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                {
+                    g.warmup_done = true;
+                    g.frame_ready = false;
+                    Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu, Vulkan transport)", fn);
+                }
+            }
+        }
+    }
+
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
+// ---------------------------------------------------------------------------
 // Per frame, D3D11: the original private-device transport
 // ---------------------------------------------------------------------------
 
@@ -1647,7 +2144,8 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
     {
     case reshade::api::device_api::d3d11: FeedFrame11(rt, cl, rtv); break;
     case reshade::api::device_api::d3d12: FeedFrame12(rt, cl, rtv); break;
-    default: FeedDisable("only Direct3D 11 and 12 games are supported"); break;
+    case reshade::api::device_api::vulkan: FeedFrameVk(rt, cl, rtv); break;
+    default: FeedDisable("only Direct3D 11/12 and Vulkan games are supported"); break;
     }
 }
 
@@ -1746,6 +2244,11 @@ static void OnDestroyDevice(reshade::api::device *dev)
              reinterpret_cast<ID3D12Device *>(dev->get_native()) == g.dev12)
     {
         Log("[feed] the game's D3D12 device is being destroyed; shutting the session down");
+        ShutdownSession();
+    }
+    else if (g.session_ready && dev->get_api() == reshade::api::device_api::vulkan && dev == g.rs_dev)
+    {
+        Log("[feed] the game's Vulkan device is being destroyed; shutting the session down");
         ShutdownSession();
     }
 }

@@ -92,10 +92,11 @@ struct Cfg
     int   flags;           // -1 auto, else raw DLSS.Feature.Create.Flags (host applies)
     int   reset_every;
     int   log_frames;
+    int   host_window;     // 1 = show the host's window (it carries the DLSS 5 tuning panel: press Home there)
     float mv_scale_x, mv_scale_y;
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 1, 1.0f, 1.0f };
 
 static void CfgPath(char *out)
 {
@@ -112,9 +113,9 @@ static void CfgWriteDefault()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "mv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+               "host_window=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.log_frames, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
 }
 
@@ -139,6 +140,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "flags")          == 0) next.flags          = iv;
         else if (_stricmp(key, "reset_every")    == 0) next.reset_every    = iv;
         else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
+        else if (_stricmp(key, "host_window")    == 0) next.host_window    = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
@@ -318,7 +320,7 @@ static bool EnsureHost()
         FeedDisable("the 64-bit host is not installed");
         return false;
     }
-    sprintf_s(cmd, "\"%s\" %lu", exe, GetCurrentProcessId());
+    sprintf_s(cmd, "\"%s\" %lu%s", exe, GetCurrentProcessId(), g_cfg.host_window ? "" : " --hide");
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};

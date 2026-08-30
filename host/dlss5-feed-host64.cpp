@@ -35,6 +35,7 @@
 // ---------------------------------------------------------------------------
 
 static char g_log_path[MAX_PATH];
+static bool g_show_window = false;   // visible host window = the user's door to the DLSS 5 panel
 
 static void Log(const char *fmt, ...)
 {
@@ -216,9 +217,12 @@ static bool InitDisguise()
     wc.hInstance     = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"dlss5feedhost";
     RegisterClassW(&wc);
-    h.hwnd = CreateWindowExW(0, wc.lpszClassName, L"dlss5-feed host", WS_OVERLAPPED, 0, 0, 64, 64,
+    h.hwnd = CreateWindowExW(0, wc.lpszClassName,
+                             L"DLSS 5 Feed host - press Home HERE to tune DLSS 5 neural rendering",
+                             WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 960, 540,
                              nullptr, nullptr, wc.hInstance, nullptr);
     if (h.hwnd == nullptr) { Log("[host] window creation failed"); return false; }
+    if (g_show_window) ShowWindow(h.hwnd, SW_SHOWNOACTIVATE);   // never steal the game's focus
 
     HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device),
                                reinterpret_cast<void **>(&h.dev));
@@ -234,8 +238,8 @@ static bool InitDisguise()
     if (FAILED(hr)) { Log("[host] CreateDXGIFactory1 failed 0x%08X", hr); return false; }
 
     DXGI_SWAP_CHAIN_DESC1 sd = {};
-    sd.Width            = 64;
-    sd.Height           = 64;
+    sd.Width            = 960;
+    sd.Height           = 540;
     sd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
     sd.SampleDesc.Count = 1;
     sd.BufferUsage      = DXGI_USAGE_RENDER_TARGET_OUTPUT;
@@ -459,7 +463,11 @@ static int Serve(DWORD game_pid)
     int flags_active = 0;
     bool transport_only = false;
     float mvsx = 1.0f, mvsy = 1.0f;
-    UINT64 hold_until = 0;   // hook-arming grace, in GetTickCount64 ms
+    // The DLSS 5 add-on arms its NGX hooks ~150 ms after NGX init; the first create must
+    // not race that (a 15 ms miss latched STANDBY in Blacklist), so hold it briefly.
+    UINT64 hold_until = GetTickCount64() + 800;
+    UINT64 evaluated  = 0;
+    bool   warm_done  = false;
 
     for (;;)
     {
@@ -524,6 +532,9 @@ static int Serve(DWORD game_pid)
                 }
             }
 
+            evaluated = 0;
+            warm_done = transport_only;   // no warm-up needed without NGX
+
             FeedBuildAck back = {};
             back.ok         = ok ? 1 : 0;
             back.ngx_result = static_cast<uint32_t>(rf);
@@ -556,7 +567,22 @@ static int Serve(DWORD game_pid)
                                 h.width, h.height, fm.reset ? 1 : 0, mvsx, mvsy);
 
             if (done)
+            {
                 h.queue->Signal(h.fence_out, fm.n);
+                // One warm-up re-create per build: the DLSS 5 add-on misses the very first
+                // create (STANDBY latch) when its hooks armed a moment too late.
+                if (!warm_done && ++evaluated >= 180)
+                {
+                    warm_done = true;
+                    Log("[host] warm-up: re-creating the feature once");
+                    WaitFenceValue(h.fence, h.fence_value, 2000);
+                    NVSDK_NGX_Handle *old = h.feature;
+                    h.feature = nullptr;
+                    NVSDK_NGX_Result rr = NVSDK_NGX_Result_Fail;
+                    if (CreateFeature(h.width, h.height, flags_active, &rr)) SafeReleaseFeature(old);
+                    else { h.feature = old; Log("[host] keeping the previous feature"); }
+                }
+            }
             else
                 h.fence_out->Signal(fm.n);     // CPU-signal so the game never hangs on us
 
@@ -584,14 +610,23 @@ int main(int argc, char **argv)
 
     Log("dlss5-feed-host64 (built %s %s)", __DATE__, __TIME__);
 
+    bool  test = false, hide = false;
+    DWORD pid = 0;
+    for (int i = 1; i < argc; ++i)
+    {
+        if      (strcmp(argv[i], "--test") == 0) test = true;
+        else if (strcmp(argv[i], "--hide") == 0) hide = true;
+        else pid = static_cast<DWORD>(strtoul(argv[i], nullptr, 10));
+    }
+    if (!test && pid == 0)
+    {
+        Log("usage: dlss5-feed-host64 --test | dlss5-feed-host64 <game pid> [--hide]");
+        return 1;
+    }
+    g_show_window = !test && !hide;   // the visible window carries the DLSS 5 add-on's tuning panel
+
     if (!InitDisguise()) return 1;
     if (!InitNgx()) { Log("[host] NGX unavailable"); return 1; }
 
-    if (argc > 1 && strcmp(argv[1], "--test") == 0)
-        return RunTest();
-    if (argc > 1)
-        return Serve(static_cast<DWORD>(strtoul(argv[1], nullptr, 10)));
-
-    Log("usage: dlss5-feed-host64 --test | dlss5-feed-host64 <game pid>");
-    return 1;
+    return test ? RunTest() : Serve(pid);
 }

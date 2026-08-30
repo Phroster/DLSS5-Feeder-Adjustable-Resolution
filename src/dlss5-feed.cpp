@@ -142,6 +142,13 @@ static LONG WINAPI CrashFilter(EXCEPTION_POINTERS *ep)
 static char g_renodx_ver[48] = "not found";
 static bool g_renodx_lazy    = false;
 
+// Set when the game's device (or the process) is being destroyed: from that moment,
+// never call back into NGX. The DLSS 5 add-on tears its hooks down during device
+// destruction, and releasing a feature created through those hooks afterwards throws
+// on a foreign thread and wedges the quitting game (seen in DOOM: 0xE06D7363 in
+// KERNELBASE 18 ms after the add-on's vtable::Unhook). The OS reclaims it all anyway.
+static bool g_ngx_dying = false;
+
 static void DetectRenodxAddon()
 {
     char path[MAX_PATH];
@@ -648,7 +655,7 @@ static void ReleaseFrameResources()
     if (g.feature != nullptr)
     {
         Breadcrumb("releasing the DLSS feature");
-        SafeReleaseFeature(g.feature);
+        if (!g_ngx_dying) SafeReleaseFeature(g.feature);
         g.feature = nullptr;
     }
     g.frame_ready = false;
@@ -926,6 +933,7 @@ static bool InitSession(ID3D11Device *dev11, ID3D11DeviceContext *ctx)
 {
     Breadcrumb("opening the D3D12 session");
     Log("################ feed: opening D3D12 session ################");
+    g_ngx_dying = false;
     g.dev11 = dev11;
 
     IDXGIDevice  *dxgi_dev = nullptr;
@@ -1034,8 +1042,8 @@ fail:
 static void ShutdownSession()
 {
     ReleaseFrameResources();
-    if (g.params != nullptr) { NVSDK_NGX_D3D12_DestroyParameters(g.params); g.params = nullptr; }
-    if (g.ngx_inited && g.dev12 != nullptr) { NVSDK_NGX_D3D12_Shutdown1(g.dev12); g.ngx_inited = false; }
+    if (g.params != nullptr) { if (!g_ngx_dying) NVSDK_NGX_D3D12_DestroyParameters(g.params); g.params = nullptr; }
+    if (g.ngx_inited && g.dev12 != nullptr) { if (!g_ngx_dying) NVSDK_NGX_D3D12_Shutdown1(g.dev12); g.ngx_inited = false; }
     SafeRelease(g.blit_vs);
     SafeRelease(g.blit_ps);
     SafeRelease(g.blit_sampler);
@@ -1076,6 +1084,7 @@ static bool InitSession12(reshade::api::effect_runtime *rt)
 {
     Breadcrumb("opening the same-device D3D12 session");
     Log("################ feed: opening same-device D3D12 session ################");
+    g_ngx_dying = false;
 
     reshade::api::device *dev_api = rt->get_device();
     auto *dev = reinterpret_cast<ID3D12Device *>(dev_api->get_native());
@@ -1251,6 +1260,7 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
 {
     Breadcrumb("opening the D3D12 session (Vulkan transport)");
     Log("################ feed: opening D3D12 session (Vulkan transport) ################");
+    g_ngx_dying = false;
 
     g.rs_dev   = rt->get_device();
     g.rs_queue = rt->get_command_queue();
@@ -2372,17 +2382,20 @@ static void OnDestroyDevice(reshade::api::device *dev)
     if (g.dev11 != nullptr && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev11)
     {
         Log("[feed] D3D11 device destroyed; shutting the session down");
+        g_ngx_dying = true;   // cleared again if a fresh session opens
         ShutdownSession();
     }
     else if (g.session_ready && !g.dev12_owned && g.dev12 != nullptr &&
              reinterpret_cast<ID3D12Device *>(dev->get_native()) == g.dev12)
     {
         Log("[feed] the game's D3D12 device is being destroyed; shutting the session down");
+        g_ngx_dying = true;
         ShutdownSession();
     }
     else if (g.session_ready && dev->get_api() == reshade::api::device_api::vulkan && dev == g.rs_dev)
     {
         Log("[feed] the game's Vulkan device is being destroyed; shutting the session down");
+        g_ngx_dying = true;
         ShutdownSession();
     }
 }
@@ -2427,6 +2440,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        g_ngx_dying = true;   // process is exiting: never call back into NGX
         ShutdownSession();
         reshade::unregister_addon(module);
         Log("shut down cleanly.");

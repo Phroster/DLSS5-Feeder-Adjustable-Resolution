@@ -97,10 +97,23 @@ struct Cfg
     int   reset_every;
     int   log_frames;
     int   host_window;     // 1 = show the host's window (it carries the DLSS 5 tuning panel: press Home there)
+    int   work_resolution; // 50..100 percent of each backbuffer axis; the game stays native-sized
     float mv_scale_x, mv_scale_y;
 };
 
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 1, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 1, 100, 1.0f, 1.0f };
+static int       g_work_resolution_ui = 100;
+static int       g_pending_work_resolution = 0;
+static ULONGLONG g_work_resolution_apply_after = 0;
+
+// NGX work textures use even dimensions; 100% must return the native extent untouched.
+static UINT ScaledExtent(UINT native_extent, int percent)
+{
+    if (percent >= 100) return native_extent;
+    UINT extent = (native_extent * static_cast<UINT>(percent)) / 100u;
+    extent &= ~1u;
+    return extent >= 2u ? extent : 2u;
+}
 
 static void CfgPath(char *out)
 {
@@ -117,9 +130,9 @@ static void CfgWriteDefault()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+               "host_window=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.log_frames, g_cfg.host_window, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
 }
 
@@ -133,10 +146,25 @@ static void CfgSave()
     FILE *f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
-               "host_window=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+               "host_window=%d\nwork_resolution=%d\nmv_scale_x=%.3f\nmv_scale_y=%.3f\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
-            g_cfg.log_frames, g_cfg.host_window, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.work_resolution, g_cfg.mv_scale_x, g_cfg.mv_scale_y);
     fclose(f);
+}
+
+// The slider drives a full shared-texture rebuild and a host round trip, so apply it
+// once the user stops dragging rather than once per intermediate value.
+static bool ApplyPendingWorkResolution()
+{
+    if (g_pending_work_resolution == 0 || GetTickCount64() < g_work_resolution_apply_after) return false;
+    const int next = g_pending_work_resolution;
+    g_pending_work_resolution = 0;
+    g_work_resolution_apply_after = 0;
+    if (next == g_cfg.work_resolution) return false;
+    g_cfg.work_resolution = next;
+    CfgSave();
+    Log("[feed32] settled work resolution=%d%%; rebuilding the shared set", g_cfg.work_resolution);
+    return true;
 }
 
 static bool CfgReload()   // true when a build-affecting value changed
@@ -161,10 +189,12 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "reset_every")    == 0) next.reset_every    = iv;
         else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
         else if (_stricmp(key, "host_window")    == 0) next.host_window    = iv;
+        else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
     fclose(f);
+    if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
     const bool rebuild = next.mode != g_cfg.mode || next.hdr != g_cfg.hdr ||
                          next.depth_inverted != g_cfg.depth_inverted || next.flags != g_cfg.flags ||
                          next.mv_scale_x != g_cfg.mv_scale_x || next.mv_scale_y != g_cfg.mv_scale_y;
@@ -279,13 +309,17 @@ struct Feed32
     ID3D11Texture2D *tex[FEED_SLOTS];
     HANDLE           tex_handle[FEED_SLOTS];
     ID3D11ShaderResourceView *output_srv;
+    ID3D11RenderTargetView   *input_rtv[FEED_SLOTS];  // work-resolution resample targets
+    ID3D11Texture2D          *color_stage;            // native-size copy of the frame (the only SRV-able source)
+    ID3D11ShaderResourceView *color_stage_srv;
     ID3D11Fence     *fence_in;    // we signal
     ID3D11Fence     *fence_out;   // host signals
     ID3D11DeviceContext4 *ctx4;
     ID3D11Device    *dev;         // not owned
 
     bool        built;
-    UINT        width, height;
+    UINT        width, height;                  // the work resolution DLSS runs at
+    UINT        backbuffer_width, backbuffer_height;
     DXGI_FORMAT bb_fmt, color_fmt, output_fmt;
     UINT64      frame_n;
     bool        need_reset;
@@ -293,7 +327,10 @@ struct Feed32
     // blit
     ID3D11VertexShader *blit_vs;
     ID3D11PixelShader  *blit_ps;
+    ID3D11PixelShader  *resample_ps;
     ID3D11SamplerState *blit_sampler;
+    ID3D11SamplerState *point_sampler;
+    ID3D11Buffer       *resample_cb;
 
     UINT64   frames_done;
     LONGLONG qpf, cpu_ticks, span_start;
@@ -535,15 +572,18 @@ static void HostApplySettings()
 static void ReleaseShared()
 {
     SafeRelease(g.output_srv);
+    SafeRelease(g.color_stage_srv);
+    SafeRelease(g.color_stage);
     for (int i = 0; i < FEED_SLOTS; ++i)
     {
+        SafeRelease(g.input_rtv[i]);
         SafeRelease(g.tex[i]);
         if (g.tex_handle[i] != nullptr) { CloseHandle(g.tex_handle[i]); g.tex_handle[i] = nullptr; }
     }
     g.built = false;
 }
 
-static bool MakeShared(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
+static bool MakeShared(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, bool render_target)
 {
     D3D11_TEXTURE2D_DESC td = {};
     td.Width            = w;
@@ -553,7 +593,9 @@ static bool MakeShared(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
     td.Format           = fmt;
     td.SampleDesc.Count = 1;
     td.Usage            = D3D11_USAGE_DEFAULT;
-    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE | (uav ? D3D11_BIND_UNORDERED_ACCESS : 0);
+    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE |
+                          (uav ? D3D11_BIND_UNORDERED_ACCESS : 0) |
+                          (render_target ? D3D11_BIND_RENDER_TARGET : 0);
     td.MiscFlags        = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
     HRESULT hr = g.dev->CreateTexture2D(&td, nullptr, &g.tex[slot]);
     if (FAILED(hr)) { Log("[feed32] tex %d CreateTexture2D failed 0x%08X", slot, hr); return false; }
@@ -574,12 +616,23 @@ static bool MakeBlitShaders()
 {
     if (g.blit_vs != nullptr && g.blit_ps != nullptr) return true;
     static const char kSrc[] =
-        "Texture2D<float4> src : register(t0);\n"
+        "Texture2D<float4> src_color : register(t0);\n"
+        "Texture2D<float2> src_mv : register(t1);\n"
+        "Texture2D<float> src_depth : register(t2);\n"
         "SamplerState smp : register(s0);\n"
+        "SamplerState point_smp : register(s1);\n"
+        "cbuffer ResampleConstants : register(b0) { float2 mv_scale; float2 _pad; };\n"
         "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
         "VSOut vs(uint id : SV_VertexID) { VSOut o; float2 uv = float2((id << 1) & 2, id & 2);\n"
         "  o.uv = uv; o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
-        "float4 ps(VSOut i) : SV_Target { return float4(src.Sample(smp, i.uv).rgb, 1.0); }\n";
+        "float4 ps(VSOut i) : SV_Target { return float4(src_color.Sample(smp, i.uv).rgb, 1.0); }\n"
+        // Motion vectors are in pixels, so they scale with the resolution ratio; depth is a
+        // point sample (interpolating across a silhouette would invent geometry).
+        "struct ResampleOut { float4 color : SV_Target0; float2 mv : SV_Target1; float depth : SV_Target2; };\n"
+        "ResampleOut ps_resample(VSOut i) { ResampleOut o;\n"
+        "  o.color = src_color.SampleLevel(smp, i.uv, 0);\n"
+        "  o.mv = src_mv.SampleLevel(point_smp, i.uv, 0) * mv_scale;\n"
+        "  o.depth = src_depth.SampleLevel(point_smp, i.uv, 0); return o; }\n";
     HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
     auto compile = m != nullptr ? reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
     if (compile == nullptr) { Log("[feed32] d3dcompiler_47.dll unavailable"); return false; }
@@ -590,25 +643,51 @@ static bool MakeBlitShaders()
     hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "ps", "ps_4_0", 0, 0, &ps, &err);
     if (FAILED(hr)) { Log("[feed32] blit PS compile failed 0x%08X", hr); SafeRelease(err); SafeRelease(vs); return false; }
     SafeRelease(err);
+    ID3DBlob *resample = nullptr;
+    hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "ps_resample", "ps_4_0", 0, 0, &resample, &err);
+    if (FAILED(hr))
+    {
+        Log("[feed32] resample PS compile failed 0x%08X: %s", hr, err ? (const char *)err->GetBufferPointer() : "");
+        SafeRelease(err); SafeRelease(vs); SafeRelease(ps); return false;
+    }
+    SafeRelease(err);
+
     hr = g.dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &g.blit_vs);
     if (SUCCEEDED(hr)) hr = g.dev->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &g.blit_ps);
+    if (SUCCEEDED(hr)) hr = g.dev->CreatePixelShader(resample->GetBufferPointer(), resample->GetBufferSize(), nullptr, &g.resample_ps);
     vs->Release();
     ps->Release();
+    resample->Release();
     if (FAILED(hr)) { Log("[feed32] blit shader creation failed 0x%08X", hr); return false; }
+
     D3D11_SAMPLER_DESC sd = {};
-    sd.Filter   = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    // Linear: below 100% this sampler both downsamples the colour and upscales the result.
+    // At 100% every tap lands on a texel centre, so it stays bit-identical to the old point filter.
+    sd.Filter   = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
     sd.MaxLOD   = D3D11_FLOAT32_MAX;
-    return SUCCEEDED(g.dev->CreateSamplerState(&sd, &g.blit_sampler));
+    if (FAILED(g.dev->CreateSamplerState(&sd, &g.blit_sampler))) { Log("[feed32] blit sampler failed"); return false; }
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    if (FAILED(g.dev->CreateSamplerState(&sd, &g.point_sampler))) { Log("[feed32] point sampler failed"); return false; }
+
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.ByteWidth      = 16;
+    cbd.Usage          = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(g.dev->CreateBuffer(&cbd, nullptr, &g.resample_cb))) { Log("[feed32] resample constant buffer failed"); return false; }
+    return true;
 }
 
-static bool BuildShared(UINT w, UINT h, DXGI_FORMAT bb_fmt)
+static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DXGI_FORMAT bb_fmt)
 {
     Breadcrumb("building the shared textures");
     ReleaseShared();
 
     g.width      = w;
     g.height     = h;
+    g.backbuffer_width  = backbuffer_w;
+    g.backbuffer_height = backbuffer_h;
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = TypedColorFormat(bb_fmt);
     // Transport test copies Color->Output host-side with CopyResource: same format then.
@@ -618,10 +697,10 @@ static bool BuildShared(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     const bool hdr      = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
 
-    if (!MakeShared(FEED_COLOR, w, h, g.color_fmt, false) ||
-        !MakeShared(FEED_OUTPUT, w, h, g.output_fmt, true) ||
-        !MakeShared(FEED_DEPTH, w, h, DXGI_FORMAT_R32_FLOAT, false) ||
-        !MakeShared(FEED_MV, w, h, DXGI_FORMAT_R16G16_FLOAT, false))
+    if (!MakeShared(FEED_COLOR, w, h, g.color_fmt, false, true) ||
+        !MakeShared(FEED_OUTPUT, w, h, g.output_fmt, true, false) ||
+        !MakeShared(FEED_DEPTH, w, h, DXGI_FORMAT_R32_FLOAT, false, true) ||
+        !MakeShared(FEED_MV, w, h, DXGI_FORMAT_R16G16_FLOAT, false, true))
     { ReleaseShared(); return false; }
 
     D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
@@ -631,6 +710,45 @@ static bool BuildShared(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     if (FAILED(g.dev->CreateShaderResourceView(g.tex[FEED_OUTPUT], &sv, &g.output_srv)))
     { Log("[feed32] output SRV failed"); ReleaseShared(); return false; }
     if (!MakeBlitShaders()) { ReleaseShared(); return false; }
+
+    // Below 100% the guides are resampled into the shared set rather than copied, which
+    // needs an RTV per input and an SRV-able source. ReShade's backbuffer has neither
+    // D3D11_BIND_SHADER_RESOURCE nor a resource behind `DLSS5_ColorInput : COLOR`, so
+    // stage a native-size copy we own and downsample from that.
+    if (backbuffer_w != w || backbuffer_h != h)
+    {
+        const int input_slots[] = { FEED_COLOR, FEED_MV, FEED_DEPTH };
+        for (const int slot : input_slots)
+        {
+            D3D11_RENDER_TARGET_VIEW_DESC rv = {};
+            rv.Format = slot == FEED_COLOR ? g.color_fmt
+                      : (slot == FEED_MV ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R32_FLOAT);
+            rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            if (FAILED(g.dev->CreateRenderTargetView(g.tex[slot], &rv, &g.input_rtv[slot])))
+            { Log("[feed32] input RTV %d failed", slot); ReleaseShared(); return false; }
+        }
+
+        D3D11_TEXTURE2D_DESC sd = {};
+        sd.Width            = backbuffer_w;
+        sd.Height           = backbuffer_h;
+        sd.MipLevels        = 1;
+        sd.ArraySize        = 1;
+        sd.Format           = bb_fmt;          // exact backbuffer format, so CopyResource accepts it
+        sd.SampleDesc.Count = 1;
+        sd.Usage            = D3D11_USAGE_DEFAULT;
+        sd.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(g.dev->CreateTexture2D(&sd, nullptr, &g.color_stage)))
+        { Log("[feed32] work-resolution staging texture failed (%ux%u fmt=%u)", backbuffer_w, backbuffer_h, bb_fmt); ReleaseShared(); return false; }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC ss = {};
+        ss.Format              = g.color_fmt;  // typed view, in case the backbuffer is TYPELESS
+        ss.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+        ss.Texture2D.MipLevels = 1;
+        if (FAILED(g.dev->CreateShaderResourceView(g.color_stage, &ss, &g.color_stage_srv)))
+        { Log("[feed32] work-resolution staging SRV failed"); ReleaseShared(); return false; }
+
+        Log("[feed32] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
+    }
 
     if (!EnsureHost()) return false;
 
@@ -672,11 +790,118 @@ static bool BuildShared(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         if (FAILED(h1) || FAILED(h2)) { Log("[feed32] OpenSharedFence failed 0x%08X/0x%08X", h1, h2); return false; }
     }
 
-    Log("[feed32] shared set ready: %ux%u color fmt=%u output fmt=%u (host ngx 0x%08X, %s)",
-        w, h, g.color_fmt, g.output_fmt, ack.ngx_result, g_cfg.mode == 1 ? "transport" : "DLSS");
+    Log("[feed32] shared set ready: %ux%u (%d%% of %ux%u) color fmt=%u output fmt=%u (host ngx 0x%08X, %s)",
+        w, h, g_cfg.work_resolution, backbuffer_w, backbuffer_h,
+        g.color_fmt, g.output_fmt, ack.ngx_result, g_cfg.mode == 1 ? "transport" : "DLSS");
     g.built      = true;
     g.need_reset = true;
     g.consecutive_fails = 0;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Guide preparation: a straight copy at 100%, one resample pass below it
+// ---------------------------------------------------------------------------
+
+static bool CopyOrResampleInputs(ID3D11DeviceContext *ctx,
+                                 ID3D11Texture2D *color, ID3D11Texture2D *mv, ID3D11Texture2D *depth,
+                                 ID3D11ShaderResourceView *mv_srv, ID3D11ShaderResourceView *depth_srv,
+                                 UINT source_w, UINT source_h)
+{
+    if (source_w == g.width && source_h == g.height)
+    {
+        ctx->CopyResource(g.tex[FEED_COLOR], color);
+        ctx->CopyResource(g.tex[FEED_DEPTH], depth);
+        ctx->CopyResource(g.tex[FEED_MV], mv);
+        return true;
+    }
+
+    if (g.color_stage == nullptr || g.color_stage_srv == nullptr || g.resample_ps == nullptr) return false;
+    if (mv_srv == nullptr || depth_srv == nullptr) return false;
+    ctx->CopyResource(g.color_stage, color);
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(ctx->Map(g.resample_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+    { Log("[feed32] resample constant-buffer map failed"); return false; }
+    const float constants[4] = {
+        static_cast<float>(g.width)  / static_cast<float>(source_w),
+        static_cast<float>(g.height) / static_cast<float>(source_h), 0.0f, 0.0f
+    };
+    memcpy(mapped.pData, constants, sizeof(constants));
+    ctx->Unmap(g.resample_cb, 0);
+
+    ID3D11RenderTargetView   *old_rtvs[3] = {};
+    ID3D11DepthStencilView   *old_dsv = nullptr;
+    ID3D11VertexShader       *old_vs = nullptr;
+    ID3D11PixelShader        *old_ps = nullptr;
+    ID3D11ShaderResourceView *old_srvs[3] = {};
+    ID3D11SamplerState       *old_samplers[2] = {};
+    ID3D11Buffer             *old_cb = nullptr;
+    ID3D11InputLayout        *old_il = nullptr;
+    ID3D11BlendState         *old_bs = nullptr; FLOAT old_bf[4] = {}; UINT old_mask = 0;
+    ID3D11DepthStencilState  *old_ds = nullptr; UINT old_sref = 0;
+    ID3D11RasterizerState    *old_rs = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY  old_topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    UINT nvp = 1; D3D11_VIEWPORT old_vp = {};
+
+    ctx->OMGetRenderTargets(3, old_rtvs, &old_dsv);
+    ctx->VSGetShader(&old_vs, nullptr, nullptr);
+    ctx->PSGetShader(&old_ps, nullptr, nullptr);
+    ctx->PSGetShaderResources(0, 3, old_srvs);
+    ctx->PSGetSamplers(0, 2, old_samplers);
+    ctx->PSGetConstantBuffers(0, 1, &old_cb);
+    ctx->IAGetInputLayout(&old_il);
+    ctx->IAGetPrimitiveTopology(&old_topo);
+    ctx->OMGetBlendState(&old_bs, old_bf, &old_mask);
+    ctx->OMGetDepthStencilState(&old_ds, &old_sref);
+    ctx->RSGetState(&old_rs);
+    ctx->RSGetViewports(&nvp, &old_vp);
+
+    D3D11_VIEWPORT vp = {};
+    vp.Width    = static_cast<float>(g.width);
+    vp.Height   = static_cast<float>(g.height);
+    vp.MaxDepth = 1.0f;
+    ID3D11RenderTargetView   *rtvs[3] = { g.input_rtv[FEED_COLOR], g.input_rtv[FEED_MV], g.input_rtv[FEED_DEPTH] };
+    ID3D11ShaderResourceView *srvs[3] = { g.color_stage_srv, mv_srv, depth_srv };
+    ID3D11SamplerState       *samplers[2] = { g.blit_sampler, g.point_sampler };
+
+    ctx->RSSetViewports(1, &vp);
+    ctx->OMSetRenderTargets(3, rtvs, nullptr);
+    ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(nullptr, 0);
+    ctx->RSSetState(nullptr);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(g.blit_vs, nullptr, 0);
+    ctx->PSSetShader(g.resample_ps, nullptr, 0);
+    ctx->PSSetShaderResources(0, 3, srvs);
+    ctx->PSSetSamplers(0, 2, samplers);
+    ctx->PSSetConstantBuffers(0, 1, &g.resample_cb);
+    ctx->Draw(3, 0);
+
+    ID3D11ShaderResourceView *null_srvs[3] = {};
+    ID3D11RenderTargetView   *null_rtvs[3] = {};
+    ctx->PSSetShaderResources(0, 3, null_srvs);
+    ctx->OMSetRenderTargets(3, null_rtvs, nullptr);
+
+    ctx->OMSetRenderTargets(3, old_rtvs, old_dsv);
+    ctx->VSSetShader(old_vs, nullptr, 0);
+    ctx->PSSetShader(old_ps, nullptr, 0);
+    ctx->PSSetShaderResources(0, 3, old_srvs);
+    ctx->PSSetSamplers(0, 2, old_samplers);
+    ctx->PSSetConstantBuffers(0, 1, &old_cb);
+    ctx->IASetInputLayout(old_il);
+    ctx->IASetPrimitiveTopology(old_topo);
+    ctx->OMSetBlendState(old_bs, old_bf, old_mask);
+    ctx->OMSetDepthStencilState(old_ds, old_sref);
+    ctx->RSSetState(old_rs);
+    if (nvp != 0) ctx->RSSetViewports(1, &old_vp);
+
+    for (auto *r : old_rtvs) SafeRelease(r);
+    SafeRelease(old_dsv); SafeRelease(old_vs); SafeRelease(old_ps);
+    for (auto *r : old_srvs) SafeRelease(r);
+    for (auto *r : old_samplers) SafeRelease(r);
+    SafeRelease(old_cb); SafeRelease(old_il); SafeRelease(old_bs); SafeRelease(old_ds); SafeRelease(old_rs);
     return true;
 }
 
@@ -711,8 +936,8 @@ static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetV
     ctx->RSGetViewports(&nvp, &old_vp);
 
     D3D11_VIEWPORT vp = {};
-    vp.Width    = static_cast<float>(g.width);
-    vp.Height   = static_cast<float>(g.height);
+    vp.Width    = static_cast<float>(g.backbuffer_width);
+    vp.Height   = static_cast<float>(g.backbuffer_height);
     vp.MaxDepth = 1.0f;
     ID3D11RenderTargetView *rtvs[] = { rtv };
     ID3D11ShaderResourceView *srvs[] = { g.output_srv };
@@ -797,6 +1022,7 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
     auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cl->get_native());
     if (ctx == nullptr || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
 
+    if (ApplyPendingWorkResolution()) g.built = false;
     if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
 
@@ -848,15 +1074,18 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
         { FeedDisable("ID3D11DeviceContext4 unavailable (Windows 10 1703+ required)"); ok = false; }
     }
 
-    if (ok && (!g.built || cd.Width != g.width || cd.Height != g.height || cd.Format != g.bb_fmt))
+    const UINT work_w = ScaledExtent(cd.Width, g_cfg.work_resolution);
+    const UINT work_h = ScaledExtent(cd.Height, g_cfg.work_resolution);
+    if (ok && (!g.built || work_w != g.width || work_h != g.height ||
+               cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height || cd.Format != g.bb_fmt))
     {
         if (GetTickCount64() < g_retry_at)
             ok = false;                       // backing off after a failed build
         else
         {
-            Log("[feed32] building: %ux%u backbuffer fmt=%u (depth reversed=%d, mode=%d)",
-                cd.Width, cd.Height, cd.Format, g.depth_reversed ? 1 : 0, g_cfg.mode);
-            ok = BuildShared(cd.Width, cd.Height, cd.Format);
+            Log("[feed32] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer fmt=%u (depth reversed=%d, mode=%d)",
+                work_w, work_h, g_cfg.work_resolution, cd.Width, cd.Height, cd.Format, g.depth_reversed ? 1 : 0, g_cfg.mode);
+            ok = BuildShared(work_w, work_h, cd.Width, cd.Height, cd.Format);
             if (ok) g.consecutive_fails = 0;
             else if (!g.disabled) FeedFail("shared build");
         }
@@ -867,10 +1096,20 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
         if (!HostAlive()) { HostLost("process died"); }
         else
         {
-            Breadcrumb("copying inputs");
-            ctx->CopyResource(g.tex[FEED_COLOR], color);
-            ctx->CopyResource(g.tex[FEED_DEPTH], depth);
-            ctx->CopyResource(g.tex[FEED_MV], mv);
+            Breadcrumb("preparing work-resolution inputs");
+            if (!CopyOrResampleInputs(ctx, color, mv, depth,
+                                      reinterpret_cast<ID3D11ShaderResourceView *>(mv_srv.handle),
+                                      reinterpret_cast<ID3D11ShaderResourceView *>(d_srv.handle),
+                                      cd.Width, cd.Height))
+            {
+                // Cannot prepare the guides (only reachable below 100%): count it as a
+                // failure so the usual backoff applies, and leave the frame untouched.
+                FeedFail("work-resolution resample");
+                SafeRelease(color); SafeRelease(mv); SafeRelease(depth);
+                QueryPerformanceCounter(&t1);
+                TimingTick(t0.QuadPart, t1.QuadPart);
+                return;
+            }
 
             const UINT64 n = ++g.frame_n;
             const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
@@ -1081,6 +1320,24 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::TextUnformatted("DLSS contract");
     static const char *kModes[] = { "Inert", "Transport test (no NGX, left half only)", "Full DLSS path" };
     if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) dirty = true;
+
+    // Always available here: the 32-bit path is D3D11 by definition.
+    if (g_pending_work_resolution == 0 && g_work_resolution_ui != g_cfg.work_resolution)
+        g_work_resolution_ui = g_cfg.work_resolution;
+    if (ImGui::SliderInt("Work resolution (%)", &g_work_resolution_ui, 50, 100))
+    {
+        g_pending_work_resolution = g_work_resolution_ui;
+        g_work_resolution_apply_after = GetTickCount64() + 400;
+    }
+    ImGui::SameLine(); HelpMarker("Scales both axes of the shared DLAA + Neural Rendering work textures the host "
+                                  "runs on. The game and its backbuffer stay native-sized. Applied once 400 ms "
+                                  "after dragging stops, since each change rebuilds the shared set.");
+    if (g_pending_work_resolution != 0)
+        ImGui::TextDisabled("Pending: %d%%", g_pending_work_resolution);
+    else if (g.backbuffer_width != 0)
+        ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
+                            g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
+
     static const char *kTri[] = { "Auto", "Force off", "Force on" };
     int hdr_idx = g_cfg.hdr + 1, di_idx = g_cfg.depth_inverted + 1;
     if (ImGui::Combo("HDR", &hdr_idx, kTri, 3)) { g_cfg.hdr = hdr_idx - 1; dirty = true; }

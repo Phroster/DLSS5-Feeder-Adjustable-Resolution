@@ -1,3 +1,23 @@
+> # 🔄 This project is being partially superseded
+>
+> ShortFuse's **renodx-dlss** add-on now handles **D3D9, D3D11, and D3D12 presentation natively**
+> — in-process, through a same-adapter D3D12 endpoint, with real motion-vector and depth sharing
+> on D3D11. **For any 64-bit D3D9 / D3D11 / D3D12 game, use that add-on directly — you do not
+> need DLSS5-Feeder.**
+>
+> **Where to get it:** this build is *not* published on the
+> [renodx GitHub](https://github.com/clshortfuse/renodx). It is distributed through the **RenoDX
+> Discord, `#DLSS5` channel** — check the pinned messages there for the current binary:
+> <https://discord.com/channels/1408098019194310818/1542647972695904317>
+>
+> DLSS5-Feeder remains the only option for what renodx-dlss does not cover:
+>
+> - **32-bit games** — renodx-dlss is 64-bit only, and NVIDIA ships no 32-bit NGX runtime, so an
+>   in-process approach is impossible there. The feeder's cross-process host is the only way.
+> - **Vulkan games** — via the bundled layer.
+> - **Real motion vectors on D3D9** — renodx-dlss evaluates only the finished backbuffer there
+>   (no temporal inputs); the feeder drives a full temporal evaluate from ReShade motion vectors.
+
 ## ⚠️ Not compatible with Nvidia Smooth Motion / Optiscaler. Disable them to avoid issues.
 
 # DLSS5-Feeder

@@ -16,6 +16,7 @@ external/ngx/libs/nvsdk_ngx_d.lib      (Release, /MD)
 ```
 
 Get it from the NVIDIA DLSS Super Resolution SDK: https://github.com/NVIDIA/DLSS
-(headers under `include/`, the import library under `lib/Windows_x86_64/x86_64/`).
+(headers under `include/`, the import library under `lib/Windows_x86_64/x64/` -- that one
+targets VS2015+/UCRT; the `vs2010`/`vs2012`/`vs2013` siblings fail to link with LNK2038).
 The runtime DLL (`nvngx_dlss.dll`) and the DLSS 5 neural-rendering model (`nvngx_dlssnr.dll`)
 are supplied at runtime by the game / the DLSS 5 add-on, not by this build.

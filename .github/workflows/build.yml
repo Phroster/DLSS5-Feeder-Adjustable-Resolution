@@ -54,7 +54,7 @@ jobs:
           path: |
             external/ngx
             external/vulkan
-          key: external-${{ runner.os }}-ngx-${{ steps.deps.outputs.ngx }}-vk-${{ steps.deps.outputs.vk }}
+          key: external-v2-${{ runner.os }}-ngx-${{ steps.deps.outputs.ngx }}-vk-${{ steps.deps.outputs.vk }}
 
       - name: Fetch the NGX SDK
         if: steps.cache-external.outputs.cache-hit != 'true'
@@ -69,13 +69,16 @@ jobs:
           git -C "$RUNNER_TEMP/dlss" sparse-checkout set --no-cone '/include/**' '/lib/**'
           git -C "$RUNNER_TEMP/dlss" checkout
 
-          # Located rather than hardcoded: NVIDIA has moved these between releases,
-          # and a named failure here beats a confusing C1083 three steps later.
           mkdir -p external/ngx/libs
           find "$RUNNER_TEMP/dlss" -name 'nvsdk_ngx*.h' -exec cp {} external/ngx/ ';'
-          lib=$(find "$RUNNER_TEMP/dlss" -name 'nvsdk_ngx_d.lib' -path '*x86_64*' | head -n1)
-          if [ -z "$lib" ]; then
-            echo "::error::nvsdk_ngx_d.lib not found in the NVIDIA/DLSS checkout"
+
+          # The repository ships one import library per toolchain era; only the
+          # lib/Windows_x86_64/x64 one targets VS2015+ (_MSC_VER 1900, UCRT).
+          # The vs2010/vs2012/vs2013 siblings link against the old msvcrt and
+          # fail with LNK2038 _MSC_VER mismatches, so take exactly this path.
+          lib="$RUNNER_TEMP/dlss/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib"
+          if [ ! -f "$lib" ]; then
+            echo "::error::$lib not found -- NVIDIA moved it; pick the VS2015+ one from:"
             find "$RUNNER_TEMP/dlss" -name '*.lib'
             exit 1
           fi

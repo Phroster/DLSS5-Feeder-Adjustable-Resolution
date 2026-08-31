@@ -604,6 +604,12 @@ static DXGI_FORMAT TypedColorFormat(DXGI_FORMAT f)
 
 // DLSS writes its Output through a UAV; BGRA/X8 variants are not reliably UAV-typed, so
 // they get an RGBA8 output and the copy-back blit takes care of the channel order.
+// The output must keep the backbuffer's channel order. When it does not, the copy
+// home has to convert, and on Vulkan that conversion is vkCmdBlitImage -- which is
+// sRGB-aware, so writing our (linear-typed) output into a VK_FORMAT_*_SRGB swapchain
+// applies a linear->sRGB encode and the whole image comes back washed out and bright.
+// On D3D12 the mismatch is worse: copy_resource() across format families is invalid.
+// The frames arrive already encoded, so the copy home must move bytes, not convert.
 static DXGI_FORMAT OutputFormatFor(DXGI_FORMAT color_typed)
 {
     switch (color_typed)
@@ -611,8 +617,57 @@ static DXGI_FORMAT OutputFormatFor(DXGI_FORMAT color_typed)
     case DXGI_FORMAT_R16G16B16A16_FLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
     case DXGI_FORMAT_R11G11B10_FLOAT:    return DXGI_FORMAT_R16G16B16A16_FLOAT;
     case DXGI_FORMAT_R10G10B10A2_UNORM:  return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_UNORM:     return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_UNORM:     return DXGI_FORMAT_B8G8R8A8_UNORM;   // X8 has no alpha to preserve
     default:                             return DXGI_FORMAT_R8G8B8A8_UNORM;
     }
+}
+
+// Channel order and bit layout only, ignoring the transfer function: an _SRGB
+// backbuffer and our UNORM output ARE interchangeable for a raw copy, and copying
+// them raw is exactly the point -- the bytes must land unconverted.
+static int TexelLayoutFamily(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return 1;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return 2;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return 3;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return 4;
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+        return 5;
+    default:
+        return 0;   // unknown: never claim a raw copy is safe
+    }
+}
+
+static bool SameTexelLayout(DXGI_FORMAT a, DXGI_FORMAT b)
+{
+    const int fa = TexelLayoutFamily(a);
+    return fa != 0 && fa == TexelLayoutFamily(b);
+}
+
+// NGX writes the output through a UAV, and typed UAV *stores* to B8G8R8A8_UNORM are an
+// optional D3D12 feature. Where the device lacks it, fall back to RGBA and the
+// converting copy home -- wrong colours beat a feature that cannot be created at all.
+static DXGI_FORMAT ResolveOutputFormat(DXGI_FORMAT color_typed, ID3D12Device *dev12)
+{
+    const DXGI_FORMAT want = OutputFormatFor(color_typed);
+    if (want != DXGI_FORMAT_B8G8R8A8_UNORM || dev12 == nullptr) return want;
+
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {};
+    fs.Format = want;
+    const bool ok = SUCCEEDED(dev12->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
+                    (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0;
+    if (ok) return want;
+    Log("[feed] B8G8R8A8_UNORM has no typed UAV store on this device; output stays R8G8B8A8_UNORM "
+        "(the copy home converts, so expect the washed-out image of issue #11)");
+    return DXGI_FORMAT_R8G8B8A8_UNORM;
 }
 
 static bool IsHdrFormat(DXGI_FORMAT typed)
@@ -1102,7 +1157,7 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
     g.backbuffer_height = backbuffer_h;
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = TypedColorFormat(bb_fmt);
-    g.output_fmt = OutputFormatFor(g.color_fmt);
+    g.output_fmt = ResolveOutputFormat(g.color_fmt, g.dev12);
     g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
 
@@ -1804,7 +1859,10 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     g.height     = h;
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = TypedColorFormat(bb_fmt);
-    g.output_fmt = OutputFormatFor(g.color_fmt);
+    g.output_fmt = ResolveOutputFormat(g.color_fmt, g.dev12);
+    Log("[feed] copy home: %s (output %s -> backbuffer %s)",
+        SameTexelLayout(g.output_fmt, bb_fmt) ? "raw vkCmdCopyImage" : "vkCmdBlitImage (CONVERTS: expect issue #11 washout)",
+        FormatName(g.output_fmt), FormatName(bb_fmt));
     g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
     const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
 
@@ -2559,9 +2617,21 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             Breadcrumb("waiting for the result (Vulkan)");
             g.rs_queue->wait(g.rs_fence_out, n);
             cb = reinterpret_cast<VkCommandBuffer>(cl->get_native());  // fresh buffer after the flush
-            if (done)  // blit (not copy): handles an output/backbuffer channel-order or format diff
-                FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
-                                bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+            if (done)
+            {
+                // Prefer the raw copy. vkCmdBlitImage converts, and that conversion is
+                // sRGB-aware: blitting our linear-typed output into a VK_FORMAT_*_SRGB
+                // swapchain applies a linear->sRGB encode and the frame comes back much
+                // brighter with lifted blacks (issue #11). The frame we were handed is
+                // already encoded, so the bytes must go home untouched. The blit stays
+                // only for the layouts a raw copy genuinely cannot express.
+                if (SameTexelLayout(g.output_fmt, g.bb_fmt))
+                    FeedVkCopyImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                else
+                    FeedVkBlitImage(&g.vk, cb, g.vk_img[SLOT_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+            }
             {
                 const resource       res[1]  = { bb_res };
                 const resource_usage from[1] = { resource_usage::copy_dest };

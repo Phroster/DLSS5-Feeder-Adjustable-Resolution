@@ -516,6 +516,8 @@ struct Feed
     ID3D11Texture2D *tex11[SLOT_COUNT];
     HANDLE           shared[SLOT_COUNT];
     ID3D11ShaderResourceView *output_srv;   // on tex11[SLOT_OUTPUT], for the copy-back blit
+    ID3D11Texture2D          *color_stage;     // native-size copy of the frame, the only SRV-able source we get
+    ID3D11ShaderResourceView *color_stage_srv; // its SRV, sampled by the work-resolution downsample
     ID3D11RenderTargetView   *input_rtv[SLOT_COUNT]; // D3D11 work-resolution resample targets
     UINT        width, height;
     UINT        backbuffer_width, backbuffer_height;
@@ -898,6 +900,8 @@ static void ReleaseFrameResources()
         if (g.tex_shared_vk[i] != nullptr) { CloseHandle(g.tex_shared_vk[i]); g.tex_shared_vk[i] = nullptr; }
     g.vk_layout_init = false;
     SafeRelease(g.output_srv);
+    SafeRelease(g.color_stage_srv);
+    SafeRelease(g.color_stage);
     for (int i = 0; i < SLOT_COUNT; ++i)
     {
         SafeRelease(g.input_rtv[i]);
@@ -1124,6 +1128,31 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
     sv.Texture2D.MipLevels = 1;
     if (FAILED(g.dev11->CreateShaderResourceView(g.tex11[SLOT_OUTPUT], &sv, &g.output_srv)))
     { Log("[feed] output SRV creation failed"); ReleaseFrameResources(); return false; }
+
+    // Work resolution below 100%: a native-size, SRV-able copy of the frame to downsample from.
+    if (backbuffer_w != w || backbuffer_h != h)
+    {
+        D3D11_TEXTURE2D_DESC sd = {};
+        sd.Width      = backbuffer_w;
+        sd.Height     = backbuffer_h;
+        sd.MipLevels  = 1;
+        sd.ArraySize  = 1;
+        sd.Format     = bb_fmt;              // exact backbuffer format, so CopyResource accepts it
+        sd.SampleDesc.Count = 1;
+        sd.Usage      = D3D11_USAGE_DEFAULT;
+        sd.BindFlags  = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(g.dev11->CreateTexture2D(&sd, nullptr, &g.color_stage)))
+        { Log("[feed] work-resolution staging texture failed (%ux%u %s)", backbuffer_w, backbuffer_h, FormatName(bb_fmt)); ReleaseFrameResources(); return false; }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC ss = {};
+        ss.Format              = g.color_fmt;   // typed view, in case the backbuffer is TYPELESS
+        ss.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+        ss.Texture2D.MipLevels = 1;
+        if (FAILED(g.dev11->CreateShaderResourceView(g.color_stage, &ss, &g.color_stage_srv)))
+        { Log("[feed] work-resolution staging SRV failed"); ReleaseFrameResources(); return false; }
+
+        Log("[feed] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
+    }
 
     const int input_slots[] = { SLOT_COLOR, SLOT_MV, SLOT_DEPTH, SLOT_MASK };
     for (const int slot : input_slots)
@@ -1822,6 +1851,18 @@ static bool CopyOrResampleInputs(ID3D11DeviceContext *ctx,
                                  ID3D11ShaderResourceView *mv_srv, ID3D11ShaderResourceView *depth_srv,
                                  ID3D11ShaderResourceView *mask_srv, UINT source_w, UINT source_h)
 {
+    // Below 100% the frame has to be sampled, and neither candidate source can be:
+    // ReShade's backbuffer has no D3D11_BIND_SHADER_RESOURCE (CreateShaderResourceView
+    // on it fails), and `DLSS5_ColorInput : COLOR` is a semantic texture with no resource
+    // of its own, so get_texture_binding() returns a null view for it. So copy the frame
+    // into a texture we own and sample that. One native-resolution copy, only below 100%.
+    if (source_w != g.width || source_h != g.height)
+    {
+        if (g.color_stage == nullptr || g.color_stage_srv == nullptr) return false;
+        ctx->CopyResource(g.color_stage, color);
+        color_srv = g.color_stage_srv;
+    }
+
     if (source_w == g.width && source_h == g.height)
     {
         ctx->CopyResource(g.tex11[SLOT_COLOR], color);
@@ -2572,7 +2613,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     if (g.color_var.handle != 0) rt->get_texture_binding(g.color_var, &color_srv, &color_srgb);
     if (g.mv_var.handle != 0)    rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
     if (g.depth_var.handle != 0) rt->get_texture_binding(g.depth_var, &d_srv, &d_srgb);
-    if ((g_cfg.work_resolution < 100 && color_srv.handle == 0) || mv_srv.handle == 0 || d_srv.handle == 0)
+    if (mv_srv.handle == 0 || d_srv.handle == 0)
     {
         if (!g.missing_reported)
         {
@@ -2583,8 +2624,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
         return;
     }
 
-    auto *color_res = reinterpret_cast<ID3D11Resource *>(
-        dev_api->get_resource_from_view(g_cfg.work_resolution < 100 ? color_srv : rtv).handle);
+    auto *color_res = reinterpret_cast<ID3D11Resource *>(dev_api->get_resource_from_view(rtv).handle);
     auto *mv_res    = reinterpret_cast<ID3D11Resource *>(dev_api->get_resource_from_view(mv_srv).handle);
     auto *depth_res = reinterpret_cast<ID3D11Resource *>(dev_api->get_resource_from_view(d_srv).handle);
     auto *rtv11     = reinterpret_cast<ID3D11RenderTargetView *>(rtv.handle);
@@ -2673,7 +2713,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     {
         Breadcrumb("preparing work-resolution inputs");
         ok = CopyOrResampleInputs(ctx, color, mv, depth, mask,
-                                  reinterpret_cast<ID3D11ShaderResourceView *>(color_srv.handle),
+                                  nullptr,
                                   reinterpret_cast<ID3D11ShaderResourceView *>(mv_srv.handle),
                                   reinterpret_cast<ID3D11ShaderResourceView *>(d_srv.handle),
                                   reinterpret_cast<ID3D11ShaderResourceView *>(mask_srv.handle),

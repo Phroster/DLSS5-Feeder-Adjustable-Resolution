@@ -11,12 +11,50 @@
 // Our own images are kept permanently in VK_IMAGE_LAYOUT_GENERAL and transitioned
 // only by the raw barriers here; ReShade only ever touches the game's own resources.
 // The actual copies are raw vkCmd* recorded into ReShade's command buffer.
+//
+// This header is compiled for BOTH architectures (the 32-bit add-on uses it for the
+// DXVK path, issue #15), so it never punes a handle with a bare cast -- see
+// FeedVkHandle/FeedVkValue below for why that matters on x86.
 
 #pragma once
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
 #include <vulkan/vulkan_core.h>    // needs /Iexternal\vulkan (so vk_video/* resolves)
 #include <vulkan/vulkan_win32.h>
+#include <dxgiformat.h>            // FeedVkFormat's argument; the add-ons get it via
+                                   // d3d11/d3d12.h, the spike does not
+#include <cstdint>
+#include <type_traits>
+
+// ---------------------------------------------------------------------------
+// Handle punning that is well-formed on both architectures.
+//
+// A NON-DISPATCHABLE Vulkan handle (VkImage, VkSemaphore, ...) is a pointer on x64
+// and a plain uint64_t on x86; a DISPATCHABLE one (VkDevice, VkCommandBuffer) is a
+// pointer everywhere. ReShade hands us both as uint64_t. `reinterpret_cast<VkImage>(
+// uint64_t)` therefore compiles on x64 and is ill-formed on x86 (integer-to-wider-
+// integer reinterpret_cast), so every conversion goes through these instead.
+// ---------------------------------------------------------------------------
+
+template <typename H> static inline H FeedVkHandle(uint64_t v)
+{
+    if constexpr (std::is_pointer_v<H>) return reinterpret_cast<H>(static_cast<uintptr_t>(v));
+    else                                return static_cast<H>(v);
+}
+
+template <typename H> static inline uint64_t FeedVkValue(H h)
+{
+    if constexpr (std::is_pointer_v<H>) return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h));
+    else                                return static_cast<uint64_t>(h);
+}
+
+// Dispatchable handles are pointers on every target; spelled separately so the call
+// sites say which kind of handle they are converting.
+template <typename H> static inline H FeedVkDispatch(uint64_t v)
+{
+    static_assert(std::is_pointer_v<H>, "FeedVkDispatch is for dispatchable (pointer) handles only");
+    return reinterpret_cast<H>(static_cast<uintptr_t>(v));
+}
 
 struct FeedVk
 {
@@ -36,6 +74,12 @@ struct FeedVk
     PFN_vkCmdPipelineBarrier          CmdPipelineBarrier;
     PFN_vkCmdCopyImage                CmdCopyImage;
     PFN_vkCmdBlitImage                CmdBlitImage;
+    // Only the cross-process (32-bit) path needs to ask a timeline semaphore where it
+    // is, or to block on it: when the host dies mid-frame the game is left holding a
+    // queued wait that nothing will ever satisfy. Core in Vulkan 1.2, so try the core
+    // name first and fall back to the KHR alias.
+    PFN_vkWaitSemaphores              WaitSemaphores;
+    PFN_vkGetSemaphoreCounterValue    GetSemaphoreCounterValue;
 
     bool ok;
 };
@@ -69,8 +113,50 @@ static bool FeedVkLoad(FeedVk *vk, VkDevice device)
     FEED_VK_GET(CmdBlitImage,                "vkCmdBlitImage")
     #undef FEED_VK_GET
 
+    // The timeline queries: core in 1.2, KHR before that, same entry point either way.
+    // OPTIONAL, deliberately -- only the cross-process path calls them, and making them
+    // a hard requirement would be a new way for the proven in-process 64-bit path to
+    // disable itself over something it never uses. The caller checks before relying on
+    // them (see FeedVkWaitTimeline / FeedVkTimelineValue, which return false / 0 here).
+    vk->WaitSemaphores = reinterpret_cast<PFN_vkWaitSemaphores>(vk->GetDeviceProcAddr(device, "vkWaitSemaphores"));
+    if (vk->WaitSemaphores == nullptr)
+        vk->WaitSemaphores = reinterpret_cast<PFN_vkWaitSemaphores>(vk->GetDeviceProcAddr(device, "vkWaitSemaphoresKHR"));
+    vk->GetSemaphoreCounterValue = reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(
+        vk->GetDeviceProcAddr(device, "vkGetSemaphoreCounterValue"));
+    if (vk->GetSemaphoreCounterValue == nullptr)
+        vk->GetSemaphoreCounterValue = reinterpret_cast<PFN_vkGetSemaphoreCounterValue>(
+            vk->GetDeviceProcAddr(device, "vkGetSemaphoreCounterValueKHR"));
+
     vk->ok = true;
     return true;
+}
+
+// Does this device let us ask a timeline semaphore where it is? Realistically always,
+// on any device that could import a D3D12 fence in the first place.
+static bool FeedVkHasTimelineQueries(const FeedVk *vk)
+{
+    return vk->ok && vk->WaitSemaphores != nullptr && vk->GetSemaphoreCounterValue != nullptr;
+}
+
+// Block until the imported timeline semaphore reaches `value`, or the deadline passes.
+// The 32-bit path's freeze protection: a queued wait on a dead host is only safe to
+// walk away from once we know it can no longer be the thing that wedges the queue.
+static bool FeedVkWaitTimeline(FeedVk *vk, VkSemaphore sem, uint64_t value, uint32_t timeout_ms)
+{
+    if (!FeedVkHasTimelineQueries(vk) || sem == VK_NULL_HANDLE) return false;
+    VkSemaphoreWaitInfo wi = { VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO };
+    wi.semaphoreCount = 1;
+    wi.pSemaphores    = &sem;
+    wi.pValues        = &value;
+    return vk->WaitSemaphores(vk->dev, &wi, static_cast<uint64_t>(timeout_ms) * 1000000ull) == VK_SUCCESS;
+}
+
+static uint64_t FeedVkTimelineValue(FeedVk *vk, VkSemaphore sem)
+{
+    uint64_t v = 0;
+    if (!FeedVkHasTimelineQueries(vk) || sem == VK_NULL_HANDLE) return 0;
+    if (vk->GetSemaphoreCounterValue(vk->dev, sem, &v) != VK_SUCCESS) return 0;
+    return v;
 }
 
 // Import a D3D12 shared fence (from CreateSharedHandle) as a Vulkan TIMELINE

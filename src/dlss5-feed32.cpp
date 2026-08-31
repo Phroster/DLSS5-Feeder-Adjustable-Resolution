@@ -1,5 +1,5 @@
-// dlss5-feed32 - the 32-bit in-game half of DLSS5-Feeder for 32-bit D3D11 and
-// OpenGL games.
+// dlss5-feed32 - the 32-bit in-game half of DLSS5-Feeder for 32-bit D3D11, OpenGL
+// and Vulkan (DXVK) games.
 //
 // A 32-bit game cannot load NGX or the DLSS 5 add-on (x64-only), so this add-on
 // does none of that. Four GPU textures are shared ACROSS PROCESSES, the frame plus
@@ -16,6 +16,12 @@
 //    import-only (there is no export in GL_EXT_external_objects_win32). The GL half
 //    is raw, through the very same src/feed_gl.h the 64-bit add-on uses, compiled
 //    x86; both directions are proven by spike/spike-gl32.exe. See PLAN-OPENGL §5.
+//  * Vulkan: created by the HOST too, because D3D12 cannot open what Vulkan exports.
+//    The transport is src/feed_vk.h -- again the 64-bit add-on's own header, compiled
+//    x86 -- with the queue signal/wait going through ReShade (an api::fence handle IS
+//    a VkSemaphore in its Vulkan backend), never a raw vkQueueSubmit. Proven by
+//    spike/spike-vkclient32.exe. See PLAN-VULKAN32; the audience is DXVK, which is
+//    how most surviving 32-bit games reach Vulkan at all (issue #15).
 //
 // If the host dies, the pipe breaks and the game just renders normally.
 
@@ -37,13 +43,16 @@
 #include <reshade.hpp>
 
 #include "feed_ipc.h"
+#include "feed_fmt.h"  // the DXGI format decisions shared with the host
 #include "feed_gl.h"   // raw-OpenGL interop, the same header the 64-bit add-on uses
+#include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
+#include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 
-#define FEED_VERSION "0.7.0"
+#define FEED_VERSION "0.8.0-beta.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Feeds DLSS 5 neural rendering in 32-bit D3D11 and OpenGL games without DLSS: ships the frame, depth and "
+    "Feeds DLSS 5 neural rendering in 32-bit D3D11, OpenGL and Vulkan (DXVK) games without DLSS: ships the frame, depth and "
     "motion vectors to a 64-bit helper process (host64\\dlss5-feed-host64.exe) over cross-process "
     "shared GPU textures, and blits the neural result back. Needs DLSS5_Feed.fx and a motion-vector "
     "provider (DRME, qUINT, Launchpad, VORT or LumeniteFX; pick it with the DLSS5_MV_PROVIDER definition). "
@@ -338,6 +347,21 @@ struct Feed32
     GLuint gl_sem_in, gl_sem_out;
     GLuint gl_fbo_read, gl_fbo_draw;
 
+    // Vulkan client: the host creates the shared textures here too (D3D12 cannot open
+    // Vulkan-exported memory), and we import them as VkImages. The per-frame COPIES are
+    // raw vkCmd* recorded into ReShade's own command buffer, but every QUEUE operation
+    // goes through ReShade -- an api::fence handle IS a VkSemaphore in its Vulkan
+    // backend -- so signal/wait stay inside its locks and never race the game's submits.
+    bool                       is_vulkan;
+    FeedVk                     vk;
+    reshade::api::device       *rs_dev;     // not owned
+    reshade::api::command_queue *rs_queue;  // not owned
+    reshade::api::fence         rs_fence_in, rs_fence_out;   // our vk_sem_* punned back
+    VkImage                    vk_img[FEED_SLOTS];
+    VkDeviceMemory             vk_mem[FEED_SLOTS];
+    VkSemaphore                vk_sem_in, vk_sem_out;
+    bool                       vk_layout_init;   // our images transitioned UNDEFINED->GENERAL once
+
     bool        built;
     UINT        width, height;                  // the work resolution DLSS runs at
     UINT        backbuffer_width, backbuffer_height;
@@ -442,6 +466,33 @@ static void HostDrain()
     // has been signalled. The host also catch-up-signals fence_out on its way out,
     // so with both sides healthy this resolves in milliseconds.
     if (!g.fence_wait_queued) return;
+    if (g.is_vulkan)
+    {
+        // The imported timeline semaphore IS the host's D3D12 fence, so it can be both
+        // read and waited on with a deadline -- the same shape as the D3D11 arm below.
+        g.fence_wait_queued = false;
+        if (!g.vk.ok || g.vk_sem_out == VK_NULL_HANDLE) return;
+        if (!FeedVkHasTimelineQueries(&g.vk))
+        {
+            // No way to ask or wait on the value (a device that imported a D3D12 fence
+            // without vkWaitSemaphores should not exist, but do not guess). Driving the
+            // queue to completion answers the same question the long way round.
+            Log("[feed32] drain: no timeline query on this device; draining the queue instead");
+            if (g.rs_queue != nullptr) g.rs_queue->wait_idle();
+            return;
+        }
+        if (FeedVkTimelineValue(&g.vk, g.vk_sem_out) >= g.frame_n) return;
+        if (g.hproc == nullptr || WaitForSingleObject(g.hproc, 0) != WAIT_TIMEOUT)
+        {
+            Log("[feed32] drain: host died before signalling frame %llu",
+                static_cast<unsigned long long>(g.frame_n));
+            return;
+        }
+        if (!FeedVkWaitTimeline(&g.vk, g.vk_sem_out, g.frame_n, 2000))
+            Log("[feed32] drain: frame %llu never signalled by the host",
+                static_cast<unsigned long long>(g.frame_n));
+        return;
+    }
     if (g.is_gl)
     {
         // On OpenGL the outstanding wait is a glWaitSemaphoreEXT, which has no timeout
@@ -498,8 +549,28 @@ static void HostClose()
         if (g.gl_sem_out != 0) { g.gl.DeleteSemaphoresEXT(1, &g.gl_sem_out); g.gl_sem_out = 0; }
     }
     g.gl_sem_in = g.gl_sem_out = 0;
+    if (g.vk.ok)
+    {
+        // HostDrain above waits on the semaphore's VALUE, which the HOST's D3D12 queue
+        // advances -- it says nothing about the GAME's queue having retired the batches
+        // that signal fence_in and wait on fence_out, and vkDestroySemaphore requires
+        // exactly that. The gap is not theoretical: if the frame message fails to write,
+        // FeedFrameVk has already enqueued signal(rs_fence_in, n) but never set
+        // fence_wait_queued, so the drain returns instantly and we would destroy a
+        // semaphore with a signal still in flight on it.
+        if (g.rs_queue != nullptr) g.rs_queue->wait_idle();
+        if (g.vk_sem_in  != VK_NULL_HANDLE) { g.vk.DestroySemaphore(g.vk.dev, g.vk_sem_in,  nullptr); }
+        if (g.vk_sem_out != VK_NULL_HANDLE) { g.vk.DestroySemaphore(g.vk.dev, g.vk_sem_out, nullptr); }
+    }
+    g.vk_sem_in = g.vk_sem_out = VK_NULL_HANDLE;
+    g.rs_fence_in = g.rs_fence_out = {};
     if (g.fence_in_handle  != nullptr) { CloseHandle(g.fence_in_handle);  g.fence_in_handle  = nullptr; }
     if (g.fence_out_handle != nullptr) { CloseHandle(g.fence_out_handle); g.fence_out_handle = nullptr; }
+    // A respawned host creates NEW fences and, on the paths where it owns them, new
+    // textures as well. Force the next frame through a full rebuild so both are
+    // re-imported instead of aliasing objects that died with the old host. The D3D11
+    // path creates its own textures and is deliberately left as it was.
+    if (g.is_gl || g.is_vulkan) g.built = false;
 }
 
 // Set when a restart is initiated from the overlay, so the game's own window can be put
@@ -594,21 +665,23 @@ static bool EnsureHost()
     }
     if (g.pipe == nullptr) { HostLost("pipe never appeared"); return false; }
 
-    FeedHello hello = { FEED_IPC_MAGIC, FEED_IPC_VERSION, GetCurrentProcessId(),
-                        static_cast<uint32_t>(g.is_gl ? FEED_CLIENT_GL : FEED_CLIENT_D3D11) };
+    const uint32_t kind = g.is_vulkan ? FEED_CLIENT_VULKAN : g.is_gl ? FEED_CLIENT_GL : FEED_CLIENT_D3D11;
+    const char *kind_name = g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : "D3D11";
+    FeedHello hello = { FEED_IPC_MAGIC, FEED_IPC_VERSION, GetCurrentProcessId(), kind };
     FeedHelloAck ack = {};
     if (!PipeWrite(&hello, sizeof(hello)) || !PipeRead(&ack, sizeof(ack)) || ack.magic != FEED_IPC_MAGIC)
     { HostLost("handshake failed"); return false; }
     if (ack.version != FEED_IPC_VERSION)
     {
-        // An older host reads only a v1 hello and would leave our extra bytes in the
-        // pipe, misparsing everything after. Refuse the pair instead of misbehaving.
+        // The message structs after the hello changed size between versions, so a
+        // mismatched pair would not just misbehave, it would desync the pipe. Both
+        // sides refuse rather than guess.
         Log("[feed32] the host in host64\\ speaks protocol v%u, this add-on v%u", ack.version, FEED_IPC_VERSION);
         HostClose();
         FeedDisable("the host64\\ folder is from a different release -- reinstall both halves together");
         return false;
     }
-    Log("[feed32] host connected (protocol v%u, %s client)", ack.version, g.is_gl ? "OpenGL" : "D3D11");
+    Log("[feed32] host connected (protocol v%u, %s client)", ack.version, kind_name);
     RestoreGameFocus();   // the replacement host is up; take the foreground back if we lost it
     return true;
 }
@@ -778,6 +851,20 @@ static void HostApplySettings()
 
 static void ReleaseShared()
 {
+    // Vulkan: drop our VkImage aliases of the host's D3D12 textures. The memory belongs
+    // to the host's resource; freeing the import does not free it. Nothing may still be
+    // reading them, and the frame in flight is only one of the things that could be --
+    // so drain the whole queue, not just our own fence.
+    if (g.vk.ok)
+    {
+        if (g.rs_queue != nullptr) g.rs_queue->wait_idle();
+        for (int i = 0; i < FEED_SLOTS; ++i)
+        {
+            if (g.vk_img[i] != VK_NULL_HANDLE) { g.vk.DestroyImage(g.vk.dev, g.vk_img[i], nullptr); g.vk_img[i] = VK_NULL_HANDLE; }
+            if (g.vk_mem[i] != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_mem[i], nullptr);   g.vk_mem[i] = VK_NULL_HANDLE; }
+        }
+        g.vk_layout_init = false;   // the next set starts from UNDEFINED again
+    }
     // OpenGL: drop our aliases of the host's textures. Deleting them frees the import,
     // not the host's D3D12 resource. GL objects can only be deleted from the context
     // they live in; from anywhere else the driver reclaims them with the context.
@@ -1070,10 +1157,27 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
     FeedBuildAck ack = {};
     if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
     { HostLost("build exchange failed"); return false; }
+
+    // Own the duplicated handles before any early return can drop them -- see the same
+    // step in BuildSharedVk for why the failing build is exactly when this bites.
+    for (int i = 0; i < FEED_SLOTS; ++i)
+        g.tex_handle[i] = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.tex[i]));
+
     if (!ack.ok)
     {
         Log("[feed32] host build failed (ngx 0x%08X)", ack.ngx_result);
         return false;
+    }
+
+    // The host owns the Output format on every path where it owns the texture. Today
+    // this always agrees with what we asked for -- GlSafeColorFormat has already ruled
+    // out the one format (BGRA8) the host's typed-UAV-store fallback can change -- but
+    // trusting its answer rather than our assumption is what keeps the two in step.
+    if (ack.output_fmt != 0 && static_cast<DXGI_FORMAT>(ack.output_fmt) != g.output_fmt)
+    {
+        Log("[feed32] the host created the Output as %s, not the requested %s",
+            FeedFmtName(static_cast<DXGI_FORMAT>(ack.output_fmt)), FeedFmtName(g.output_fmt));
+        g.output_fmt = static_cast<DXGI_FORMAT>(ack.output_fmt);
     }
 
     // The fences are per session, not per build: import them once.
@@ -1095,7 +1199,6 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
     {
         const DXGI_FORMAT f = i == FEED_COLOR ? g.color_fmt : i == FEED_OUTPUT ? g.output_fmt : kFmt[i];
         const GLenum glf = FeedGlFormat(f);
-        g.tex_handle[i] = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.tex[i]));
         if (glf == 0 || g.tex_handle[i] == nullptr || ack.tex_size[i] == 0 ||
             !FeedGlImportImage(&g.gl, g.tex_handle[i], ack.tex_size[i],
                                static_cast<GLsizei>(w), static_cast<GLsizei>(h), glf,
@@ -1126,6 +1229,177 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
 
     Log("[feed32] shared set ready (OpenGL): %ux%u color fmt=%u output fmt=%u (host ngx 0x%08X, %s)",
         w, h, g.color_fmt, g.output_fmt, ack.ngx_result, g_cfg.mode == 1 ? "transport" : "DLSS");
+    g.built      = true;
+    g.need_reset = true;
+    g.consecutive_fails = 0;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Vulkan client (issue #15: 32-bit games on DXVK). The host creates the shared set
+// here too -- D3D12 cannot open memory Vulkan exported -- and we import it as
+// VkImages, exactly as the 64-bit add-on's Vulkan transport does in-process.
+//
+// The division of labour is the 64-bit path's, unchanged: raw vkCmd* for the copies
+// (recorded into ReShade's own command buffer, so they are simply more commands in
+// the buffer it is already building), and ReShade for every QUEUE operation. That
+// second half matters -- a raw vkQueueSubmit would race ReShade's and the game's
+// submits -- and it is possible because in ReShade's Vulkan backend an api::fence
+// handle IS a VkSemaphore, so our imported timeline semaphores can be handed straight
+// back to it.
+// ---------------------------------------------------------------------------
+
+// Resolve the raw entry points from the game's own VkDevice. Once per device; the
+// failure path is where a missing interop extension is diagnosed.
+static bool EnsureVulkanLoaded(reshade::api::effect_runtime *rt)
+{
+    if (g.vk.ok) return true;
+
+    g.rs_dev   = rt->get_device();
+    g.rs_queue = rt->get_command_queue();
+    if (g.rs_dev == nullptr || g.rs_queue == nullptr)
+    { FeedDisable("the ReShade device/queue is not reachable"); return false; }
+
+    if (FeedVkLoad(&g.vk, FeedVkDispatch<VkDevice>(g.rs_dev->get_native())))
+    {
+        Log("[feed32] Vulkan: interop entry points resolved on device %p (thread %lu)",
+            (void *)g.vk.dev, GetCurrentThreadId());
+        return true;
+    }
+
+    // The KHR external-interop extensions were not enabled at vkCreateDevice. The
+    // add-on's own hook (feed_vk_hook.h) normally appends them; if it never saw this
+    // device -- DXVK resolved vkCreateDevice some way the hook does not cover, or the
+    // hook could not be installed at all -- the out-of-process layer is the fallback.
+    Log("[feed32] the Vulkan external-memory/semaphore entry points are missing: the KHR external-interop");
+    Log("[feed32] extensions were not enabled on this device at vkCreateDevice.");
+    if (g_vk_create_device_target == nullptr)
+        Log("[feed32] The add-on's vkCreateDevice hook was NOT installed (see the hook lines above).");
+    else if (g_vk_hook_devices == 0)
+        Log("[feed32] The add-on's vkCreateDevice hook was installed but never called: this game creates its device some way it does not intercept.");
+    else
+        Log("[feed32] The hook did run (%d vkCreateDevice call(s)); check its per-extension lines above for what the driver refused.", g_vk_hook_devices);
+    Log("[feed32] FALLBACK: launch the game through layer\\x86\\run-with-feed-layer32.bat (the 32-bit VK_LAYER_feed_vk appends them from outside).");
+    FeedDisable("the Vulkan interop extensions are missing on this device -- see dlss5-feed.log");
+    return false;
+}
+
+static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
+{
+    Breadcrumb("building the shared textures (Vulkan)");
+    ReleaseShared();
+
+    g.width  = w;
+    g.height = h;
+    g.backbuffer_width  = w;   // v1 Vulkan is DLAA at 100%: no work-resolution scaling
+    g.backbuffer_height = h;
+    g.bb_fmt     = bb_fmt;
+    g.color_fmt  = FeedFmtTypedColor(bb_fmt);
+    if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
+    {
+        Log("[feed32] backbuffer format %u (%s) is not supported", bb_fmt, FeedFmtName(bb_fmt));
+        FeedDisable("unsupported backbuffer format");
+        return false;
+    }
+    // Transport test copies Color->Output host-side with CopyTextureRegion: same format
+    // then. Otherwise ask for the channel order the backbuffer has, so the way home is a
+    // raw vkCmdCopyImage -- the host gets the final say (see ack.output_fmt below).
+    const DXGI_FORMAT want_output = g_cfg.mode == 1 ? g.color_fmt : FeedFmtOutputFor(g.color_fmt);
+    const bool hdr      = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : FeedFmtIsHdr(g.color_fmt);
+    const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+
+    if (!EnsureHost()) return false;
+
+    FeedBuild b = {};
+    b.width          = w;
+    b.height         = h;
+    b.color_fmt      = g.color_fmt;
+    b.output_fmt     = want_output;
+    b.hdr            = hdr ? 1 : 0;
+    b.depth_inverted = inverted ? 1 : 0;
+    b.flags_override = g_cfg.flags;
+    b.transport      = g_cfg.mode == 1 ? 1 : 0;
+    b.mv_scale_x     = g_cfg.mv_scale_x;
+    b.mv_scale_y     = g_cfg.mv_scale_y;
+    // b.tex stays zero: on this path the host creates, and answers with its handles.
+
+    Breadcrumb("asking the host to build (Vulkan)");
+    BYTE tag = 'B';
+    FeedBuildAck ack = {};
+    if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
+    { HostLost("build exchange failed"); return false; }
+
+    // Take ownership of the duplicated handles NOW, before any early return can drop
+    // them on the floor. The host duplicates all four into this process and fills
+    // ack.tex[] whether or not the build as a whole succeeded -- the common failure is
+    // the textures being made fine and then CreateFeature failing -- and g.tex_handle[]
+    // is the only thing ReleaseShared closes. Every path out of here runs ReleaseShared
+    // first on the next attempt, so this is what keeps a retry loop from leaking four
+    // handles a go. Zeros from a host that did not create anything are harmless.
+    for (int i = 0; i < FEED_SLOTS; ++i)
+        g.tex_handle[i] = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.tex[i]));
+
+    if (!ack.ok)
+    {
+        Log("[feed32] host build failed (ngx 0x%08X)", ack.ngx_result);
+        return false;
+    }
+
+    // The host owns the Output format: only its device can be asked whether a typed UAV
+    // store to BGRA8 exists on this GPU, and it falls back to RGBA8 where it does not.
+    g.output_fmt = ack.output_fmt != 0 ? static_cast<DXGI_FORMAT>(ack.output_fmt) : want_output;
+    if (g.output_fmt != want_output)
+        Log("[feed32] the host created the Output as %s, not the requested %s",
+            FeedFmtName(g.output_fmt), FeedFmtName(want_output));
+
+    // The fences are per session, not per build: import them once.
+    if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
+    {
+        g.fence_in_handle  = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_in));
+        g.fence_out_handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_out));
+        g.vk_sem_in  = FeedVkImportFence(&g.vk, g.fence_in_handle);
+        g.vk_sem_out = FeedVkImportFence(&g.vk, g.fence_out_handle);
+        Log("[feed32] D3D12 fence -> Vulkan timeline semaphore import: in=%s out=%s",
+            g.vk_sem_in  != VK_NULL_HANDLE ? "OK" : "FAILED",
+            g.vk_sem_out != VK_NULL_HANDLE ? "OK" : "FAILED");
+        if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
+        { FeedDisable("cross-process fence import failed (see dlss5-feed.log)"); return false; }
+        // Hand them back to ReShade as api::fence handles, which is what they already are.
+        g.rs_fence_in  = { FeedVkValue(g.vk_sem_in) };
+        g.rs_fence_out = { FeedVkValue(g.vk_sem_out) };
+    }
+
+    static const DXGI_FORMAT kFmt[FEED_SLOTS] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
+                                                  DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT };
+    for (int i = 0; i < FEED_SLOTS; ++i)
+    {
+        const DXGI_FORMAT f = i == FEED_COLOR ? g.color_fmt : i == FEED_OUTPUT ? g.output_fmt : kFmt[i];
+        const VkFormat vkf = FeedVkFormat(f);
+        // Only the Output is written through a UAV, so only it asks for storage usage --
+        // the same split the 64-bit add-on makes, matching the D3D12 resource's flags.
+        const bool storage = i == FEED_OUTPUT;
+        if (vkf == VK_FORMAT_UNDEFINED || g.tex_handle[i] == nullptr ||
+            !FeedVkImportImage(&g.vk, g.tex_handle[i], w, h, vkf, storage,
+                               &g.vk_img[i], &g.vk_mem[i]))
+        {
+            Log("[feed32] texture import FAILED: slot %d %ux%u %s (raw Vulkan external-memory import)",
+                i, w, h, FeedFmtName(f));
+            if (storage && f == DXGI_FORMAT_B8G8R8A8_UNORM)
+                Log("[feed32] the Output is the one slot imported with VK_IMAGE_USAGE_STORAGE_BIT, and this is "
+                    "a BGRA8 one -- if the driver does not support storage images in that format, that is why. "
+                    "Forcing an RGBA8 backbuffer, or a game/DXVK setting that yields one, works around it.");
+            ReleaseShared();
+            return false;
+        }
+    }
+
+    Log("[feed32] copy home: %s (output %s -> backbuffer %s)",
+        FeedFmtSameTexelLayout(g.output_fmt, bb_fmt) ? "raw vkCmdCopyImage"
+                                                     : "vkCmdBlitImage (CONVERTS: expect issue #11 washout)",
+        FeedFmtName(g.output_fmt), FeedFmtName(bb_fmt));
+    Log("[feed32] shared set ready (Vulkan): %ux%u color %s output %s (host ngx 0x%08X, %s)",
+        w, h, FeedFmtName(g.color_fmt), FeedFmtName(g.output_fmt), ack.ngx_result,
+        g_cfg.mode == 1 ? "transport" : "DLSS");
     g.built      = true;
     g.need_reset = true;
     g.consecutive_fails = 0;
@@ -1505,6 +1779,195 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
     TimingTick(t0.QuadPart, t1.QuadPart);
 }
 
+// The Vulkan sibling of FeedFrame below: the same protocol and the same host, with
+// raw vkCmd* copies recorded into ReShade's command buffer and every queue operation
+// handed back to ReShade. Structurally this is the 64-bit add-on's FeedFrameVk with
+// the D3D12 middle replaced by the pipe -- and with no MASK slot, which the 32-bit
+// protocol has never carried.
+static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_list *cl,
+                        reshade::api::resource_view rtv)
+{
+    using namespace reshade::api;
+
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+
+    device *dev_api = rt->get_device();
+
+    resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
+    if (g.mv_var.handle != 0)    rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
+    if (g.depth_var.handle != 0) rt->get_texture_binding(g.depth_var, &d_srv, &d_srgb);
+    if (mv_srv.handle == 0 || d_srv.handle == 0)
+    {
+        if (!g.missing_reported)
+        {
+            g.missing_reported = true;
+            Warn("DLSS5_Feed.fx textures not found. Install DLSS5_Feed.fx + a texMotionVectors provider and enable both.");
+        }
+        return;
+    }
+
+    const resource bb_res    = dev_api->get_resource_from_view(rtv);
+    const resource mv_res    = dev_api->get_resource_from_view(mv_srv);
+    const resource depth_res = dev_api->get_resource_from_view(d_srv);
+    if (bb_res.handle == 0 || mv_res.handle == 0 || depth_res.handle == 0) return;
+
+    const resource_desc cd = dev_api->get_resource_desc(bb_res);
+    const resource_desc md = dev_api->get_resource_desc(mv_res);
+    const resource_desc dd = dev_api->get_resource_desc(depth_res);
+    const UINT w = cd.texture.width, h = cd.texture.height;
+    if (w != md.texture.width || h != md.texture.height || w != dd.texture.width || h != dd.texture.height ||
+        cd.texture.samples != 1 ||
+        md.texture.format != format::r16g16_float || dd.texture.format != format::r32_float)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[feed32] input mismatch: color %ux%u fmt=%u samp=%u | mv %ux%u fmt=%u | depth %ux%u fmt=%u",
+                w, h, (unsigned)cd.texture.format, cd.texture.samples, md.texture.width, md.texture.height,
+                (unsigned)md.texture.format, dd.texture.width, dd.texture.height, (unsigned)dd.texture.format);
+        }
+        return;
+    }
+
+    // A recreated device strands every import: the images, the semaphores and the
+    // entry points all belong to the old one. Drop them WITHOUT calling into it --
+    // they died with it -- and start over on the new device.
+    if (g.vk.ok && g.rs_dev != nullptr && g.rs_dev != dev_api)
+    {
+        Log("[feed32] the game recreated its Vulkan device; rebuilding on the new one");
+        g.fence_wait_queued = false;
+        for (int i = 0; i < FEED_SLOTS; ++i) { g.vk_img[i] = VK_NULL_HANDLE; g.vk_mem[i] = VK_NULL_HANDLE; }
+        g.vk = {};
+        g.vk_sem_in = g.vk_sem_out = VK_NULL_HANDLE;
+        g.rs_fence_in = g.rs_fence_out = {};
+        g.vk_layout_init = false;
+        g.rs_queue = nullptr;
+        HostClose();
+        ReleaseShared();
+    }
+    if (!EnsureVulkanLoaded(rt)) return;
+
+    const DXGI_FORMAT bbf = static_cast<DXGI_FORMAT>(cd.texture.format);
+    bool ok = true;
+    if (!g.built || w != g.width || h != g.height || bbf != g.bb_fmt)
+    {
+        if (GetTickCount64() < g_retry_at)
+            ok = false;                       // backing off after a failed build
+        else
+        {
+            Log("[feed32] building: %ux%u backbuffer %s (Vulkan, depth reversed=%d, mode=%d)",
+                w, h, FeedFmtName(bbf), g.depth_reversed ? 1 : 0, g_cfg.mode);
+            ok = BuildSharedVk(w, h, bbf);
+            if (ok) g.consecutive_fails = 0;
+            else if (!g.disabled) FeedFail("shared build");
+        }
+    }
+
+    if (ok && g.built)
+    {
+        if (!HostAlive()) { HostLost("process died"); }
+        else
+        {
+            VkCommandBuffer cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());
+            const VkImage bb_img = FeedVkHandle<VkImage>(bb_res.handle);
+            const VkImage mv_img = FeedVkHandle<VkImage>(mv_res.handle);
+            const VkImage dp_img = FeedVkHandle<VkImage>(depth_res.handle);
+
+            // Our imported images live permanently in GENERAL; only these raw barriers
+            // ever move them, and only the first frame after a build starts UNDEFINED.
+            Breadcrumb("copying inputs (Vulkan)");
+            {
+                const VkImageLayout from = g.vk_layout_init ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+                for (int i = 0; i < FEED_SLOTS; ++i)
+                    FeedVkBarrier(&g.vk, cb, g.vk_img[i], from, VK_IMAGE_LAYOUT_GENERAL);
+                g.vk_layout_init = true;
+            }
+            // The game's own images go through ReShade's barrier API so its layout
+            // tracking stays correct; the copies themselves are raw.
+            {
+                const resource       res[3]  = { bb_res, mv_res, depth_res };
+                const resource_usage from[3] = { resource_usage::render_target, resource_usage::shader_resource,
+                                                 resource_usage::shader_resource };
+                const resource_usage to[3]   = { resource_usage::copy_source, resource_usage::copy_source,
+                                                 resource_usage::copy_source };
+                cl->barrier(3, res, from, to);
+            }
+            FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[FEED_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
+            FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[FEED_MV],    VK_IMAGE_LAYOUT_GENERAL, w, h);
+            FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[FEED_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
+
+            // Park the backbuffer as copy_dest to receive the result; hand mv/depth back.
+            {
+                const resource       res[3]  = { bb_res, mv_res, depth_res };
+                const resource_usage from[3] = { resource_usage::copy_source, resource_usage::copy_source,
+                                                 resource_usage::copy_source };
+                const resource_usage to[3]   = { resource_usage::copy_dest, resource_usage::shader_resource,
+                                                 resource_usage::shader_resource };
+                cl->barrier(3, res, from, to);
+            }
+
+            const UINT64 n = ++g.frame_n;
+            const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+            g.need_reset = false;
+
+            Breadcrumb("signalling the host (Vulkan)");
+            g.rs_queue->flush_immediate_command_list();
+            g.rs_queue->signal(g.rs_fence_in, n);
+
+            BYTE tag = 'F';
+            FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
+            bool delivered = false;
+            if (!PipeWrite(&tag, 1) || !PipeWrite(&fm, sizeof(fm)))
+                HostLost("frame message failed");
+            else
+            {
+                Breadcrumb("waiting for the host's result (Vulkan)");
+                g.rs_queue->wait(g.rs_fence_out, n);   // GPU-side; the host CPU-signals on failure
+                g.fence_wait_queued = true;            // HostDrain must resolve this before any close
+                cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());   // fresh buffer after the flush
+                // Prefer the raw copy: vkCmdBlitImage CONVERTS, and that conversion is
+                // sRGB-aware, so blitting our linear-typed output into a VK_FORMAT_*_SRGB
+                // swapchain re-encodes it and the frame comes back washed out (issue #11).
+                // The frame we were handed is already encoded; the bytes must go home
+                // untouched. The blit stays only for layouts a raw copy cannot express.
+                if (FeedFmtSameTexelLayout(g.output_fmt, g.bb_fmt))
+                    FeedVkCopyImage(&g.vk, cb, g.vk_img[FEED_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                else
+                    FeedVkBlitImage(&g.vk, cb, g.vk_img[FEED_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                delivered = true;
+            }
+
+            // The backbuffer goes back to render_target whether or not the round trip
+            // happened: leaving ReShade's tracking believing it is still copy_dest would
+            // break every pass after ours, including its own UI.
+            {
+                const resource       res[1]  = { bb_res };
+                const resource_usage from[1] = { resource_usage::copy_dest };
+                const resource_usage to[1]   = { resource_usage::render_target };
+                cl->barrier(1, res, from, to);
+            }
+
+            if (delivered)
+            {
+                const UINT64 done = ++g.frames_done;
+                g.consecutive_fails = 0;
+                if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                    Log("[feed32] frame %llu delivered (%ux%u, reset=%d, Vulkan)", done, g.width, g.height, reset);
+            }
+        }
+    }
+
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
 static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
 
@@ -1516,8 +1979,10 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
     reshade::api::device *dev_api = rt->get_device();
     if (dev_api->get_api() == reshade::api::device_api::opengl)
     { g.is_gl = true; FeedFrameGl(rt, rtv); return; }
+    if (dev_api->get_api() == reshade::api::device_api::vulkan)
+    { g.is_vulkan = true; FeedFrameVk(rt, cl, rtv); return; }
     if (dev_api->get_api() != reshade::api::device_api::d3d11)
-    { FeedDisable("only Direct3D 11 and OpenGL games are supported by the 32-bit add-on"); return; }
+    { FeedDisable("only Direct3D 11, OpenGL and Vulkan games are supported by the 32-bit add-on"); return; }
 
     auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cl->get_native());
     if (ctx == nullptr || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
@@ -1759,12 +2224,17 @@ static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::ef
 static void OnDestroyDevice(reshade::api::device *dev)
 {
     const bool ours = (g.dev != nullptr && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev) ||
-                      (g.is_gl && dev->get_api() == reshade::api::device_api::opengl);
+                      (g.is_gl && dev->get_api() == reshade::api::device_api::opengl) ||
+                      (g.is_vulkan && dev == g.rs_dev);
     if (!ours) return;
 
     Log("[feed32] game device destroyed; shutting down");
     HostClose();     // drain + end the host while the fences are still alive
     ReleaseShared();
+    g.vk = {};
+    g.rs_dev = nullptr;
+    g.rs_queue = nullptr;
+    g.vk_layout_init = false;
     if (g.gl.ok && g.gl.wglGetCurrentContext() == g.gl_ctx && g.gl_ctx != nullptr)
     {
         if (g.gl_fbo_read != 0) { g.gl.DeleteFramebuffers(1, &g.gl_fbo_read); g.gl_fbo_read = 0; }
@@ -1809,6 +2279,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     ImGui::Separator();
     ImGui::TextUnformatted("Status");
     ImGui::Text("Feed: %s", g.disabled ? "disabled (see dlss5-feed.log)" : g.built ? "built" : "not built");
+    ImGui::Text("Render API: %s", g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : "Direct3D 11");
     ImGui::Text("Host process: %s", HostAlive() ? "running" : "not running");
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
     ImGui::TextWrapped("Motion vectors: %s", g_mv_status);
@@ -1827,22 +2298,36 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     static const char *kModes[] = { "Inert", "Transport test (no NGX, left half only)", "Full DLSS path" };
     if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) dirty = true;
 
-    // Always available here: the 32-bit path is D3D11 by definition.
-    if (g_pending_work_resolution == 0 && g_work_resolution_ui != g_cfg.work_resolution)
-        g_work_resolution_ui = g_cfg.work_resolution;
-    if (ImGui::SliderInt("Work resolution (%)", &g_work_resolution_ui, 50, 100))
+    // Below 100% the guides have to be resampled into the shared set, which is a
+    // D3D11 pixel-shader pass this add-on only has on the D3D11 path. The OpenGL and
+    // Vulkan transports run DLAA at the native size, so the slider would lie.
+    if (g.is_gl || g.is_vulkan)
     {
-        g_pending_work_resolution = g_work_resolution_ui;
-        g_work_resolution_apply_after = GetTickCount64() + 400;
+        ImGui::BeginDisabled();
+        int fixed = 100;
+        ImGui::SliderInt("Work resolution (%)", &fixed, 50, 100);
+        ImGui::EndDisabled();
+        ImGui::SameLine(); HelpMarker("Fixed at 100% on the OpenGL and Vulkan transports: DLSS runs at the "
+                                      "game's native resolution there.");
     }
-    ImGui::SameLine(); HelpMarker("Scales both axes of the shared DLAA + Neural Rendering work textures the host "
-                                  "runs on. The game and its backbuffer stay native-sized. Applied once 400 ms "
-                                  "after dragging stops, since each change rebuilds the shared set.");
-    if (g_pending_work_resolution != 0)
-        ImGui::TextDisabled("Pending: %d%%", g_pending_work_resolution);
-    else if (g.backbuffer_width != 0)
-        ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
-                            g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
+    else
+    {
+        if (g_pending_work_resolution == 0 && g_work_resolution_ui != g_cfg.work_resolution)
+            g_work_resolution_ui = g_cfg.work_resolution;
+        if (ImGui::SliderInt("Work resolution (%)", &g_work_resolution_ui, 50, 100))
+        {
+            g_pending_work_resolution = g_work_resolution_ui;
+            g_work_resolution_apply_after = GetTickCount64() + 400;
+        }
+        ImGui::SameLine(); HelpMarker("Scales both axes of the shared DLAA + Neural Rendering work textures the host "
+                                      "runs on. The game and its backbuffer stay native-sized. Applied once 400 ms "
+                                      "after dragging stops, since each change rebuilds the shared set.");
+        if (g_pending_work_resolution != 0)
+            ImGui::TextDisabled("Pending: %d%%", g_pending_work_resolution);
+        else if (g.backbuffer_width != 0)
+            ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
+                                g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
+    }
 
     static const char *kTri[] = { "Auto", "Force off", "Force on" };
     int hdr_idx = g_cfg.hdr + 1, di_idx = g_cfg.depth_inverted + 1;
@@ -1935,6 +2420,16 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
 // ---------------------------------------------------------------------------
 
+// Fired by ReShade before the device (for Vulkan: from inside its vkCreateInstance
+// hook, i.e. before the game's vkCreateDevice). That is the one moment the interop
+// extensions can still be added from in-process -- see feed_vk_hook.h.
+static bool OnCreateDevice(reshade::api::device_api api, uint32_t & /*api_version*/)
+{
+    if (api == reshade::api::device_api::vulkan)
+        FeedVkHookInstall();
+    return false;   // never change the requested API version
+}
+
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH)
@@ -1957,6 +2452,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         CfgWriteDefault();
         CfgReload();
 
+        reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
@@ -1967,11 +2463,13 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
     else if (reason == DLL_PROCESS_DETACH)
     {
         reshade::unregister_overlay(nullptr, DrawOverlay);
+        reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
         reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
         reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        FeedVkHookRemove();   // before this code is unmapped -- ReShade reloads add-ons per Vulkan instance
         HostClose();
         reshade::unregister_addon(module);
         Log("shut down cleanly.");

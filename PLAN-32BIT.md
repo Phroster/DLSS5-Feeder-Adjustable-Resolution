@@ -79,6 +79,20 @@ programs before building anything on top. Same spike proves the shared fence. If
 
 The allocator/fence ring stays host-side, unchanged (`BeginCommands`/`EndCommands`, ring of 3).
 
+**Protocol evolution since.** The shipped header is `src/feed_ipc.h`; the version is enforced
+exactly on both sides, because the message structs change size between versions and a mismatched
+pair would not merely misbehave, it would desync the pipe.
+
+| Version | Shipped in | Change |
+| --- | --- | --- |
+| 1 | 0.5.x | As designed above: D3D11 only. The game creates the four shared textures and sends its own handle values; the host duplicates them out and opens them on D3D12. |
+| 2 | 0.7.0 | `FeedHello::client_kind` and `FeedBuildAck::tex[]` / `tex_size[]`, for the **OpenGL** client — where the direction has to flip, because GL memory objects are import-only. The host creates and duplicates the handles *in*. A v2 host still reads a v1 client's shorter hello (`FEED_HELLO_V1_SIZE`) so it can refuse it with a real message rather than blocking on bytes that never come. |
+| 3 | (this release) | `FEED_CLIENT_VULKAN`, which reuses v2's host-creates direction unchanged — D3D12 cannot open Vulkan-exported memory either — plus `FeedBuildAck::output_fmt`. That last field is the only genuinely new idea: when the host owns the textures it also owns the Output *format*, because the typed-UAV-store fallback for BGRA8 can only be decided by a D3D12 device, and the game needs the real answer to import the image and to choose copy-vs-blit for the way home. |
+
+The direction question is the driver's, not ours, and the answer is per-API: D3D11 exports and
+D3D12 opens; GL and Vulkan cannot be opened by D3D12, so the host creates instead. Host-created is
+the better resource anyway — it is born with exactly the D3D12 flags NGX wants.
+
 ## 3. The NR add-on inside the helper
 
 `renodx-dlss5.addon64` is a ReShade add-on; a bare helper process has no ReShade. Options:

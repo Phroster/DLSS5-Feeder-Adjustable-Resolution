@@ -53,6 +53,7 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 - [Install for a 32-bit game](#install-for-a-32-bit-game-beta)
 - [Install for a DirectX 9 game](#install-for-a-directx-9-game-beta)
 - [Install for a Vulkan game](#install-for-a-vulkan-game)
+  - [32-bit Vulkan (DXVK)](#32-bit-vulkan-dxvk)
 - [Install for an OpenGL game](#install-for-an-opengl-game)
 - [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider)
 - [How it works](#how-it-works)
@@ -85,9 +86,15 @@ Proven working in seven games covering every supported path:
 In each, the DLSS 5 add-on reports `feature 18 created … inline feature 18 evaluation succeeded`,
 driven entirely by ReShade depth + estimated motion vectors.
 
-It is not game-specific: any D3D11, D3D12 or Vulkan game with a working ReShade depth buffer and a
-motion vector provider should work — 64-bit directly, 32-bit via a bundled 64-bit helper process,
-D3D9 via a wrapper.
+It is not game-specific: any D3D11, D3D12, Vulkan or OpenGL game with a working ReShade depth buffer
+and a motion vector provider should work — 64-bit directly, 32-bit via a bundled 64-bit helper
+process, D3D9 via a wrapper.
+
+**32-bit Vulkan (DXVK) is implemented but has no game row yet** (issue #15). The transport is the
+same `src/feed_vk.h` the 64-bit Vulkan path uses, compiled x86, with the host creating the shared
+textures the way the OpenGL path already does; the cross-bitness half is proven end-to-end on this
+hardware by `spike\spike-vkhost64.exe` + `spike\spike-vkclient32.exe`. Treat it as untested in a
+real game until a row appears above. See [`PLAN-VULKAN32.md`](PLAN-VULKAN32.md).
 
 **The OpenGL path is verified 32-bit-first**, which is the harder of its two halves: Worms Ultimate
 Mayhem runs the full cross-process route — the host creates the shared textures (GL memory objects
@@ -211,6 +218,24 @@ layer\run-with-feed-layer.bat "E:\path\to\game.exe"
 ```
 
 See [`layer/README.md`](layer/README.md) — it does the same job from outside the process.
+
+### 32-bit Vulkan (DXVK)
+
+Almost every 32-bit game that reaches Vulkan does it through
+**[DXVK](https://github.com/doitsujin/dxvk)**. Two differences:
+
+1. Install ReShade **as a Vulkan layer**, not as a local `dxgi.dll` or `d3d9.dll` — DXVK owns those
+   names in the game folder.
+2. Add the `host64\` folder from [Install for a 32-bit game](#install-for-a-32-bit-game-beta), and
+   install both halves from the same release.
+
+DLSS runs at the game's native resolution here, so the **Work resolution** slider is fixed at 100%.
+
+If `dlss5-feed.log` says the interop entry points are missing, use the 32-bit fallback layer:
+
+```
+layer\x86\run-with-feed-layer32.bat "E:\path\to\game.exe"
+```
 
 ## Install for an OpenGL game
 
@@ -361,6 +386,16 @@ loading style lands in the hook, above ReShade's own layer, which then passes th
 down. The hook is removed on DLL unload, since ReShade reloads add-ons per Vulkan instance.
 [`layer/VkLayer_feed_vk.dll`](layer/README.md) does the same from outside the process, as a fallback.
 
+**32-bit Vulkan** (DXVK) reuses every one of those pieces — `src/feed_vk.h` and
+`src/feed_vk_hook.h` are compiled into the x86 add-on unchanged — with the D3D12 middle moved out
+to the helper process, exactly as on the 32-bit D3D11 and OpenGL paths. One thing flips: the
+**host** creates the shared textures and duplicates the handles into the game, because D3D12 cannot
+open memory Vulkan exported. That is the same direction the OpenGL path already uses, so the pipe
+protocol needed only a new client kind and one extra field — the host owns the Output *format*
+there, since only its device can be asked whether this GPU supports a typed UAV store to BGRA8, and
+DXVK swapchains are almost always BGRA8. Getting that wrong is issue #11's washed-out image again.
+`spike\spike-vkhost64.exe` + `spike\spike-vkclient32.exe` prove the cross-bitness half on its own.
+
 ### The OpenGL path
 
 Same shape as the Vulkan path — a private D3D12 device creates the shared textures and fences, and
@@ -418,7 +453,7 @@ memory objects are import-only and a GL process cannot export one. Both directio
 
 | Piece | Notes |
 | --- | --- |
-| D3D11, D3D12, Vulkan or OpenGL game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan works out of the box (the add-on adds the interop extensions itself; [a small bundled layer](#install-for-a-vulkan-game) is the fallback); OpenGL needs nothing extra at all, but the game must be rendering on the NVIDIA GPU (see [Install for an OpenGL game](#install-for-an-opengl-game)). D3D10 is not supported. |
+| D3D11, D3D12, Vulkan or OpenGL game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan works out of the box at both bitnesses (the add-on adds the interop extensions itself; a small bundled layer is the fallback — [64-bit](#install-for-a-vulkan-game), [32-bit/DXVK](#32-bit-vulkan-dxvk)); OpenGL needs nothing extra at all, but the game must be rendering on the NVIDIA GPU (see [Install for an OpenGL game](#install-for-an-opengl-game)). D3D10 is not supported. |
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
 | DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | from its own author, **pinned to v4.55** — newer builds conflict with this project (see the warning near the top). Not included here. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
@@ -514,8 +549,8 @@ Common cases:
   (Windows **Settings ▸ Display ▸ Graphics**) and restart it. There is no fallback for this and
   there cannot be one — DLSS itself needs that GPU.
 * **32-bit game: "the host64\ folder is from a different release"** — the add-on and the helper
-  speak a versioned protocol (v2 added the OpenGL client kind). Reinstall both halves from the same
-  release rather than mixing them.
+  speak a versioned protocol (v2 added the OpenGL client kind, v3 the Vulkan one). Reinstall both
+  halves from the same release rather than mixing them.
 * **DLSS 5 panel stuck in STANDBY** — the add-on missed the first create; the built-in warm-up
   re-creates the feature a few seconds in, which normally clears it.
 
@@ -530,10 +565,10 @@ under `external/reshade/include` (BSD-3-Clause, Patrick Mours), as is **MinHook*
 | Script | Output | Needs |
 | --- | --- | --- |
 | `build.bat` | `build\dlss5-feed.addon64` | NGX SDK |
-| `build-addon32.bat` | `build\dlss5-feed.addon32` | ReShade headers only |
+| `build-addon32.bat` | `build\dlss5-feed.addon32` | Vulkan headers |
 | `host\build-host.bat` | `host\dlss5-feed-host64.exe` | NGX SDK |
-| `layer\build-layer.bat` | `layer\VkLayer_feed_vk.dll` (fallback for Vulkan games where the add-on's own `vkCreateDevice` hook cannot add the interop extensions) | Vulkan headers |
-| `spike\build-spike.bat` | the standalone proofs used during development: the 32↔64-bit shared-resource pair, plus `spike-gl64.exe` / `spike-gl32.exe`, which round-trip a texture and a fence between D3D12 and OpenGL, in-process and cross-process. They need an NVIDIA GPU to *run*, none to compile. | — |
+| `layer\build-layer.bat` | `layer\VkLayer_feed_vk.dll` and `layer\x86\VkLayer_feed_vk32.dll` (fallback for Vulkan games where the add-on's own `vkCreateDevice` hook cannot add the interop extensions; the 32-bit pair keeps its own subdirectory because the Vulkan loader tries every manifest on `VK_LAYER_PATH`) | Vulkan headers |
+| `spike\build-spike.bat` | the standalone proofs used during development: the 32↔64-bit shared-resource pair, plus `spike-gl64.exe` / `spike-gl32.exe` and `spike-vkhost64.exe` / `spike-vkclient32.exe`, which round-trip a texture and a fence between D3D12 and OpenGL / Vulkan, in-process and cross-process. They need an NVIDIA GPU to *run*, none to compile. | — |
 
 NGX links against the Release CRT, so the builds use `/MD`.
 
@@ -565,6 +600,8 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
 * The **32-bit and D3D9 paths are beta** — see [`PLAN-32BIT.md`](PLAN-32BIT.md) for the full design
   and known risks. Cross-process adds a small amount of scheduling jitter versus the in-process
   64-bit path (not measured as a problem so far).
+* **32-bit Vulkan has not run in a real game yet** — the cross-bitness interop is proven by the
+  spike pair, but nothing above it is. See [`PLAN-VULKAN32.md`](PLAN-VULKAN32.md).
 
 ## Credits
 

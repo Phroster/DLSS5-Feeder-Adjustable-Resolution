@@ -4,8 +4,11 @@
 // process can: it puts ReShade x64 (dxgi.dll) and renodx-dlss5.addon64 next to
 // itself, opens a hidden 1x1 window with a minimal D3D12 swapchain -- so from the
 // DLSS 5 add-on's point of view it IS a D3D12 game -- and runs the NGX DLAA
-// evaluate on frames the game delivers through cross-process shared textures
-// (created game-side on D3D11; see the phase-0 spike) and shared fences.
+// evaluate on frames the game delivers through cross-process shared textures and
+// shared fences. Which side creates the textures depends on the game's API and is
+// the driver's call, not ours: D3D11 games create them (the phase-0-proven
+// direction), OpenGL and Vulkan games cannot, so this host creates them instead and
+// duplicates the handles in. See src/feed_ipc.h.
 //
 //   dlss5-feed-host64.exe --test   stand-alone: synthetic pattern, no game needed
 //                                  (phase-1 proof: "feature 18 created" in ReShade.log)
@@ -23,12 +26,14 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <vector>
 
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
 
 #include "../src/feed_ipc.h"
+#include "../src/feed_fmt.h"
 
 // ---------------------------------------------------------------------------
 // Logging
@@ -92,6 +97,83 @@ static void DetectRenodxAddon()
         else
             Log("[host] EnableHooks=%s (user-set; leaving it alone)", v);
     }
+}
+
+// Detect Alex's Toolkit next to this exe: a third-party NGX interposer that wraps every
+// feature-18 (DLSS-NR) create the DLSS 5 add-on makes and runs it two or three times per
+// frame as a cascade (a private 1:1 native pass feeds its output to the real pass as
+// colour). It does not mishandle the guides -- every stage sees the same input
+// dimensions we publish, so the motion vectors and depth stay valid -- but each stage
+// keeps its OWN temporal history, so the cascade multiplies the effective history
+// length. With screen-space estimated motion vectors that means visible smearing behind
+// fast motion and a much slower settle after a hard camera cut. Report only.
+static void DetectToolkitAddon()
+{
+    char dir[MAX_PATH], path[MAX_PATH];
+    GetModuleFileNameA(nullptr, dir, MAX_PATH);
+    if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
+    sprintf_s(path, "%salexs-toolkit.addon64", dir);
+
+    // It advertises itself in its exported NAME string, the same way this feeder does.
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE)
+    {
+        Log("[host] Alex's Toolkit: not present -- DLSS 5 runs a single neural pass");
+        return;
+    }
+    char ver[64] = "?";
+    const DWORD size = GetFileSize(f, nullptr);
+    DWORD got = 0;
+    char *buf = (size > 0 && size < 16u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
+    if (buf != nullptr && ReadFile(f, buf, size, &got, nullptr) && got == size)
+    {
+        static const char kMark[] = "Alex's Toolkit ";
+        const DWORD mlen = sizeof(kMark) - 1;
+        for (DWORD i = 0; i + mlen < size; ++i)
+            if (memcmp(buf + i, kMark, mlen) == 0)
+            {
+                const char *v = buf + i + mlen;
+                size_t n = 0;
+                while (n + 1 < sizeof(ver) && i + mlen + n < size && v[n] >= 32 && v[n] < 127 && v[n] != '%')
+                    ++n;
+                if (n > 0) { memcpy(ver, v, n); ver[n] = '\0'; }
+                break;
+            }
+    }
+    free(buf);
+    CloseHandle(f);
+
+    // Its live settings. It re-reads this file itself while the game runs, so this is
+    // only what it will start with.
+    sprintf_s(path, "%salexs-toolkit.cfg", dir);
+    int enabled = 1, two_pass = 0, three_pass = 0;
+    FILE *cf = nullptr;
+    if (fopen_s(&cf, path, "rb") == 0 && cf != nullptr)
+    {
+        char text[2048];
+        const size_t tn = fread(text, 1, sizeof(text) - 1, cf);
+        text[tn] = '\0';
+        fclose(cf);
+        // Plain "key=value" lines with no [section] header: GetPrivateProfileInt cannot read it.
+        for (const char *p = text; *p != '\0'; ++p)
+        {
+            if (p != text && p[-1] != '\n' && p[-1] != '\r') continue;
+            if (_strnicmp(p, "enabled=", 8) == 0)          enabled    = atoi(p + 8);
+            else if (_strnicmp(p, "two_pass=", 9) == 0)    two_pass   = atoi(p + 9);
+            else if (_strnicmp(p, "three_pass=", 11) == 0) three_pass = atoi(p + 11);
+        }
+    }
+    const int passes = (enabled && two_pass) ? (three_pass ? 3 : 2) : 0;
+
+    if (passes >= 2)
+        Log("[host] Alex's Toolkit %s: %d-pass DLSS 5 cascade active -- roughly %dx the temporal history "
+            "(expect smearing behind fast motion and a slow settle after a camera cut); its own log is "
+            "alexs-toolkit.log next to this exe", ver, passes, passes);
+    else
+        Log("[host] Alex's Toolkit %s: present but the cascade is off (%s) -- DLSS 5 runs a single pass",
+            ver, enabled ? "two_pass=0" : "enabled=0");
+    Log("[host] Alex's Toolkit config: enabled=%d two_pass=%d three_pass=%d (it re-reads that file live)",
+        enabled, two_pass, three_pass);
 }
 
 static void Log(const char *fmt, ...)
@@ -641,13 +723,31 @@ static ID3D12Resource *MakeTex(UINT w, UINT h_, DXGI_FORMAT fmt, bool uav)
     return t;
 }
 
-// The shared half of MakeTex, for OpenGL clients: this host creates the texture --
-// GL memory objects are import-only, so the game cannot -- and hands out an NT handle
-// plus the allocation size the GL import needs. ALLOW_SIMULTANEOUS_ACCESS is what
-// pairs with GL_LAYOUT_GENERAL_EXT on the other side; SHARED puts it in a heap the
-// other process can open. This is also a better resource than the D3D11 route's:
-// it is born with exactly the flags NGX wants, with none of MakeSharedPair's
-// UAV-flag uncertainty.
+// NGX writes the Output through a UAV, and typed UAV *stores* to B8G8R8A8_UNORM are
+// an optional D3D12 feature -- only a device can answer whether this GPU has it, and
+// for a host-creating client (OpenGL, Vulkan) this host owns the only one. Where the
+// support is missing, fall back to RGBA and let the game's copy home convert: wrong
+// channel order beats a feature that cannot be created at all.
+static DXGI_FORMAT ResolveOutputFormatHost(DXGI_FORMAT want)
+{
+    if (want != DXGI_FORMAT_B8G8R8A8_UNORM || h.dev == nullptr) return want;
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {};
+    fs.Format = want;
+    if (SUCCEEDED(h.dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
+        (fs.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0)
+        return want;
+    Log("[host] B8G8R8A8_UNORM has no typed UAV store on this device; the output stays R8G8B8A8_UNORM "
+        "(the game's copy home will convert, so expect the washed-out image of issue #11)");
+    return DXGI_FORMAT_R8G8B8A8_UNORM;
+}
+
+// The shared half of MakeTex, for clients whose API cannot export importable memory
+// (OpenGL: memory objects are import-only; Vulkan: D3D12 cannot open what it exports).
+// This host creates the texture and hands out an NT handle plus the allocation size
+// the import needs. ALLOW_SIMULTANEOUS_ACCESS is what pairs with GL_LAYOUT_GENERAL_EXT
+// / VK_IMAGE_LAYOUT_GENERAL on the other side; SHARED puts it in a heap the other
+// process can open. This is also a better resource than the D3D11 route's: it is born
+// with exactly the flags NGX wants, with none of MakeSharedPair's UAV-flag uncertainty.
 static ID3D12Resource *MakeSharedTexHost(UINT w, UINT h_, DXGI_FORMAT fmt, bool uav,
                                          HANDLE *out_handle, uint64_t *out_size)
 {
@@ -749,18 +849,28 @@ static int Serve(DWORD game_pid)
     { Log("[host] bad hello"); return 1; }
     if (hello.version >= 2 && !ReadFull(pipe, &hello.client_kind, sizeof(hello.client_kind)))
     { Log("[host] truncated hello"); return 1; }
-    if (hello.version > FEED_IPC_VERSION)
-    {
-        Log("[host] the game add-on speaks protocol v%u, this host only v%u -- update host64\\",
-            hello.version, FEED_IPC_VERSION);
-        return 1;
-    }
-    const bool gl_client = hello.client_kind == FEED_CLIENT_GL;
+
+    // Answer first, THEN bail on a mismatch: the ack carries our version, so the
+    // add-on can name the problem in the game's log instead of just timing out.
+    // Nothing else may be read -- FeedBuild and FeedBuildAck changed size between
+    // versions, so a mismatched pair would desync the pipe on the very next message.
     FeedHelloAck ack = { FEED_IPC_MAGIC, FEED_IPC_VERSION };
     DWORD put = 0;
     WriteFile(pipe, &ack, sizeof(ack), &put, nullptr);
-    Log("[host] game pid %u connected (protocol v%u, %s client)", hello.pid, hello.version,
-        gl_client ? "OpenGL: this host creates the shared textures" : "D3D11: the game creates the shared textures");
+    if (hello.version != FEED_IPC_VERSION)
+    {
+        Log("[host] the game add-on speaks protocol v%u, this host v%u -- the two halves are from "
+            "different releases; reinstall dlss5-feed.addon32 and host64\\ together",
+            hello.version, FEED_IPC_VERSION);
+        return 1;
+    }
+
+    const bool host_creates = FeedHostCreatesTextures(hello.client_kind);
+    const char *client_name = hello.client_kind == FEED_CLIENT_GL     ? "OpenGL"
+                            : hello.client_kind == FEED_CLIENT_VULKAN ? "Vulkan"
+                            : "D3D11";
+    Log("[host] game pid %u connected (protocol v%u, %s client -- %s creates the shared textures)",
+        hello.pid, hello.version, client_name, host_creates ? "this host" : "the game");
 
     HANDLE hgame = OpenProcess(PROCESS_DUP_HANDLE, FALSE, hello.pid);
     if (hgame == nullptr) { Log("[host] OpenProcess failed %lu", GetLastError()); return 1; }
@@ -826,12 +936,18 @@ static int Serve(DWORD game_pid)
 
             bool ok = true;
             uint64_t game_tex[FEED_SLOTS] = {}, tex_size[FEED_SLOTS] = {};
-            if (gl_client)
+            // The Output format is the host's call whenever the host creates the
+            // textures -- only this process has the D3D12 device that can be asked
+            // about typed UAV stores. In transport mode there is no UAV at all and
+            // the copy is Color -> Output on this side, so the two must stay equal.
+            DXGI_FORMAT out_fmt = static_cast<DXGI_FORMAT>(b.output_fmt);
+            if (host_creates && b.transport == 0) out_fmt = ResolveOutputFormatHost(out_fmt);
+            if (host_creates)
             {
-                // OpenGL client: WE create, and duplicate the handles into the game,
-                // which imports them as GL textures (PLAN-OPENGL §5, design A).
+                // OpenGL / Vulkan client: WE create, and duplicate the handles into the
+                // game, which imports them (PLAN-OPENGL §5 design A; PLAN-VULKAN32 §2).
                 const DXGI_FORMAT fmt[FEED_SLOTS] = {
-                    static_cast<DXGI_FORMAT>(b.color_fmt), static_cast<DXGI_FORMAT>(b.output_fmt),
+                    static_cast<DXGI_FORMAT>(b.color_fmt), out_fmt,
                     DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT };
                 for (int i = 0; i < FEED_SLOTS && ok; ++i)
                 {
@@ -844,7 +960,10 @@ static int Serve(DWORD game_pid)
                     CloseHandle(local);   // the duplicate stands on its own; the resource keeps the memory
                     game_tex[i] = reinterpret_cast<uint64_t>(remote);
                 }
-                if (ok) Log("[host] created and handed over %d shared textures (%ux%u)", FEED_SLOTS, b.width, b.height);
+                if (ok)
+                    Log("[host] created and handed over %d shared textures (%ux%u, color %s, output %s)",
+                        FEED_SLOTS, b.width, b.height, FeedFmtName(static_cast<DXGI_FORMAT>(b.color_fmt)),
+                        FeedFmtName(out_fmt));
             }
             else
             {
@@ -867,7 +986,7 @@ static int Serve(DWORD game_pid)
             {
                 h.width = b.width; h.height = b.height;
                 h.color_fmt  = static_cast<DXGI_FORMAT>(b.color_fmt);
-                h.output_fmt = static_cast<DXGI_FORMAT>(b.output_fmt);
+                h.output_fmt = out_fmt;
                 mvsx = b.mv_scale_x; mvsy = b.mv_scale_y;
                 transport_only = b.transport != 0;
                 flags_active = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
@@ -905,6 +1024,7 @@ static int Serve(DWORD game_pid)
             back.ngx_result = static_cast<uint32_t>(rf);
             back.fence_in   = reinterpret_cast<uint64_t>(game_in);
             back.fence_out  = reinterpret_cast<uint64_t>(game_out);
+            back.output_fmt = static_cast<uint32_t>(out_fmt);
             for (int i = 0; i < FEED_SLOTS; ++i) { back.tex[i] = game_tex[i]; back.tex_size[i] = tex_size[i]; }
             WriteFile(pipe, &back, sizeof(back), &put, nullptr);
         }
@@ -1010,6 +1130,7 @@ int main(int argc, char **argv)
     g_show_window = !test && !hide;   // the visible window carries the DLSS 5 add-on's tuning panel
 
     DetectRenodxAddon();   // must run BEFORE ReShade loads, so an EnableHooks write is read
+    DetectToolkitAddon();
 
     if (!InitDisguise()) return 1;
     if (!InitNgx()) { Log("[host] NGX unavailable"); return 1; }

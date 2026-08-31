@@ -55,7 +55,7 @@
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
 
-#define FEED_VERSION "0.7.0"
+#define FEED_VERSION "0.8.0-beta.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -215,6 +215,125 @@ static void DetectRenodxAddon()
             Log("[feed] EnableHooks=%s (user-set; leaving it alone)", v);
     }
 }
+// ---------------------------------------------------------------------------
+// Alex's Toolkit (alexs-toolkit.addon64) -- a third-party NGX interposer that sits
+// between the DLSS 5 add-on and nvngx_dlssnr.dll. It hooks GetProcAddress in the
+// Generic NGX module, wraps every feature-18 (DLSS-NR) create, and for each real
+// feature the DLSS 5 add-on makes it creates one or two private copies at a 1:1
+// native contract. Per frame it then runs them as a cascade -- private pass ->
+// intermediate -> the real pass, which takes the intermediate as its colour.
+//
+// It does NOT mishandle our inputs: every stage has the same input dimensions as
+// the contract we publish, so the motion vectors and depth stay dimensionally
+// valid throughout (a 16k-frame capture shows zero fallbacks and no rejection).
+// What it costs is temporal: each stage keeps its OWN history, so a two-pass
+// cascade roughly doubles the effective history length and a three-pass one
+// triples it. With screen-space estimated motion vectors -- which are inherently
+// one frame late -- that reads as smearing and lag behind fast motion, and it
+// multiplies how long the image takes to settle after a hard camera cut.
+//
+// We only detect and report it. It arms itself at the final swapchain and must be
+// attached before the DLSS 5 add-on first resolves nvngx_dlssnr.dll, or it logs
+// "Generic already cached ... before toolkit attach" and stays pass-through for
+// the whole run. That first resolve is triggered by OUR first CreateFeature, so
+// the create_delay grace below is what keeps the ordering safe -- which is why
+// that grace is re-armed for every feature (re)build, not just the first.
+// ---------------------------------------------------------------------------
+
+static char g_toolkit_ver[64]     = "not found";
+static char g_toolkit_status[192] = "not present";
+static int  g_toolkit_passes      = 0;   // 0 = absent or disabled, 2 = two-pass, 3 = three-pass
+
+// Reads "key=<int>" from a small ini-style file. Returns 'fallback' if absent.
+static int ToolkitCfgInt(const char *text, const char *key, int fallback)
+{
+    const size_t klen = strlen(key);
+    for (const char *p = text; *p != '\0'; ++p)
+    {
+        if ((p != text && p[-1] != '\n' && p[-1] != '\r') || _strnicmp(p, key, klen) != 0 || p[klen] != '=')
+            continue;
+        return atoi(p + klen + 1);
+    }
+    return fallback;
+}
+
+static void DetectToolkitAddon()
+{
+    char dir[MAX_PATH];
+    GetModuleFileNameA(g_self, dir, MAX_PATH);
+    char *slash = strrchr(dir, '\\');
+    if (slash == nullptr) return;
+    slash[1] = '\0';
+
+    char path[MAX_PATH];
+    sprintf_s(path, "%salexs-toolkit.addon64", dir);
+
+    // The add-on advertises itself in its exported NAME string ("Alex's Toolkit <ver>"),
+    // the same way this one does. Scan the file rather than the loaded module: ReShade
+    // may not have loaded it yet when this runs.
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE)
+    {
+        Log("[feed] Alex's Toolkit: not present -- DLSS 5 runs a single neural pass");
+        return;
+    }
+    const DWORD size = GetFileSize(f, nullptr);
+    DWORD got = 0;
+    char *buf = (size > 0 && size < 16u * 1024 * 1024) ? static_cast<char *>(malloc(size)) : nullptr;
+    if (buf != nullptr && ReadFile(f, buf, size, &got, nullptr) && got == size)
+    {
+        static const char kMark[] = "Alex's Toolkit ";
+        const DWORD mlen = sizeof(kMark) - 1;
+        for (DWORD i = 0; i + mlen < size; ++i)
+            if (memcmp(buf + i, kMark, mlen) == 0)
+            {
+                const char *v = buf + i + mlen;
+                size_t n = 0;
+                while (n + 1 < sizeof(g_toolkit_ver) && i + mlen + n < size &&
+                       v[n] >= 32 && v[n] < 127 && v[n] != '%')
+                    ++n;
+                if (n > 0) { memcpy(g_toolkit_ver, v, n); g_toolkit_ver[n] = '\0'; }
+                break;
+            }
+    }
+    free(buf);
+    CloseHandle(f);
+
+    // Its live settings (it re-reads this file itself while the game runs, so this is
+    // only what it will start with).
+    int enabled = 1, two_pass = 0, three_pass = 0;
+    bool have_cfg = false;
+    sprintf_s(path, "%salexs-toolkit.cfg", dir);
+    if (FILE *cf = nullptr; fopen_s(&cf, path, "rb") == 0 && cf != nullptr)
+    {
+        char text[2048];
+        const size_t n = fread(text, 1, sizeof(text) - 1, cf);
+        text[n] = '\0';
+        fclose(cf);
+        have_cfg   = true;
+        enabled    = ToolkitCfgInt(text, "enabled", 1);
+        two_pass   = ToolkitCfgInt(text, "two_pass", 0);
+        three_pass = ToolkitCfgInt(text, "three_pass", 0);
+    }
+
+    g_toolkit_passes = (enabled && two_pass) ? (three_pass ? 3 : 2) : 0;
+
+    if (g_toolkit_passes >= 2)
+        _snprintf_s(g_toolkit_status, sizeof(g_toolkit_status), _TRUNCATE,
+                    "Alex's Toolkit %s: %d-pass DLSS 5 cascade active downstream -- expect roughly %dx the "
+                    "temporal history (more smearing behind fast motion, slower settle after a camera cut)",
+                    g_toolkit_ver, g_toolkit_passes, g_toolkit_passes);
+    else
+        _snprintf_s(g_toolkit_status, sizeof(g_toolkit_status), _TRUNCATE,
+                    "Alex's Toolkit %s: present but the cascade is off (%s) -- DLSS 5 runs a single pass",
+                    g_toolkit_ver, enabled ? "two_pass=0" : "enabled=0");
+
+    Log("[feed] %s", g_toolkit_status);
+    Log("[feed] Alex's Toolkit config: %s (enabled=%d two_pass=%d three_pass=%d); it re-reads that file live, "
+        "so the cascade can change without restarting", have_cfg ? "alexs-toolkit.cfg" : "no cfg file, using its defaults",
+        enabled, two_pass, three_pass);
+}
+
 
 // ---------------------------------------------------------------------------
 // Configuration (dlss5-feed.cfg next to the add-on, re-read every 60 frames)
@@ -1830,7 +1949,7 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
     // ourselves (ReShade's create_fence imports as the wrong external type). Then wrap
     // the VkSemaphores back into api::fence handles -- in ReShade's Vulkan backend an
     // api::fence handle IS a VkSemaphore -- so queue signal/wait stay inside its locks.
-    if (!FeedVkLoad(&g.vk, reinterpret_cast<VkDevice>(g.rs_dev->get_native())))
+    if (!FeedVkLoad(&g.vk, FeedVkDispatch<VkDevice>(g.rs_dev->get_native())))
     {
         // The KHR external-interop extensions were not enabled at vkCreateDevice. Our
         // vkCreateDevice hook (feed_vk_hook.h) normally appends them; if it never saw
@@ -1860,8 +1979,8 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
         FeedDisable("cross-API fence import failed (see dlss5-feed.log)");
         return false;
     }
-    g.rs_fence_in  = { reinterpret_cast<uint64_t>(g.vk_sem_in) };
-    g.rs_fence_out = { reinterpret_cast<uint64_t>(g.vk_sem_out) };
+    g.rs_fence_in  = { FeedVkValue(g.vk_sem_in) };
+    g.rs_fence_out = { FeedVkValue(g.vk_sem_out) };
 
     Log("[feed] session ready (Vulkan transport): dev12=%p queue=%p", (void *)g.dev12, (void *)g.queue);
     Log("############# feed: session open (Vulkan transport) #############");
@@ -2557,6 +2676,10 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
     // add-on may still be patching its vtable (that has crashed the process at EXEC 0x0),
     // and it re-patches after every runtime recreation.
     const bool needs_build12 = !g.frame_ready || w != g.width || h != g.height || cd.Format != g.bb_fmt;
+    // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
+    // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
+    // with it. Without this the second build races hooks that are only half in place.
+    if (g.frame_ready && needs_build12) g.create_grace = 0;
     if (ok && needs_build12 && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
@@ -2804,6 +2927,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
     const DXGI_FORMAT bbf = static_cast<DXGI_FORMAT>(cd.texture.format);
     const bool needs_build_vk = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt;
+    // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
+    // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
+    // with it. Without this the second build races hooks that are only half in place.
+    if (g.frame_ready && needs_build_vk) g.create_grace = 0;
     if (ok && needs_build_vk && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
@@ -2822,10 +2949,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 
     if (ok && g.frame_ready)
     {
-        VkCommandBuffer cb = reinterpret_cast<VkCommandBuffer>(cl->get_native());
-        VkImage bb_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(bb_res.handle));
-        VkImage mv_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(mv_res.handle));
-        VkImage dp_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(depth_res.handle));
+        VkCommandBuffer cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());
+        VkImage bb_img = FeedVkHandle<VkImage>(bb_res.handle);
+        VkImage mv_img = FeedVkHandle<VkImage>(mv_res.handle);
+        VkImage dp_img = FeedVkHandle<VkImage>(depth_res.handle);
 
         // Our imported images -> GENERAL (first frame after a build, from UNDEFINED).
         // ReShade never touches them; only these raw barriers do.
@@ -2850,7 +2977,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         if (g.mask_ok)
         {
             // The mask goes the same way, and is handed straight back to shader_resource here.
-            VkImage mk_img = reinterpret_cast<VkImage>(static_cast<uintptr_t>(mask_res.handle));
+            VkImage mk_img = FeedVkHandle<VkImage>(mask_res.handle);
             {
                 const resource       res[1]  = { mask_res };
                 const resource_usage from[1] = { resource_usage::shader_resource };
@@ -2970,7 +3097,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             // game's queue after the wait below -- GPU-ordered, no CPU stall.
             Breadcrumb("waiting for the result (Vulkan)");
             g.rs_queue->wait(g.rs_fence_out, n);
-            cb = reinterpret_cast<VkCommandBuffer>(cl->get_native());  // fresh buffer after the flush
+            cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());  // fresh buffer after the flush
             if (done)
             {
                 // Prefer the raw copy. vkCmdBlitImage converts, and that conversion is
@@ -3121,6 +3248,10 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
     const DXGI_FORMAT bbf = have_bb_desc ? static_cast<DXGI_FORMAT>(cd.texture.format)
                                          : DXGI_FORMAT_R8G8B8A8_UNORM;   // default FB: assume 8-bit; the blit converts anyway
     const bool needs_build_gl = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt;
+    // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
+    // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
+    // with it. Without this the second build races hooks that are only half in place.
+    if (g.frame_ready && needs_build_gl) g.create_grace = 0;
     if (ok && needs_build_gl && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
@@ -3384,6 +3515,10 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     const bool needs_build11 = !g.frame_ready || work_w != g.width || work_h != g.height ||
                                cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height ||
                                cd.Format != g.bb_fmt;
+    // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
+    // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
+    // with it. Without this the second build races hooks that are only half in place.
+    if (g.frame_ready && needs_build11) g.create_grace = 0;
     if (ok && needs_build11 && g.create_grace < g_cfg.create_delay)
     {
         if (++g.create_grace == 1)
@@ -3727,6 +3862,12 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     ImGui::Text("Feature: %s", g.frame_ready ? "ready" : "not built");
     if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
     ImGui::Text("DLSS 5 add-on: v%s (%s)", g_renodx_ver, g_renodx_lazy ? "v45+ engine" : "classic engine");
+    if (g_toolkit_passes >= 2)
+        ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                           "Alex's Toolkit %s: %d-pass cascade -- ~%dx temporal history (smearing, slow settle)",
+                           g_toolkit_ver, g_toolkit_passes, g_toolkit_passes);
+    else if (strcmp(g_toolkit_ver, "not found") != 0)
+        ImGui::Text("Alex's Toolkit %s: present, cascade off (single pass)", g_toolkit_ver);
     if (g.disabled && ImGui::Button("Re-enable"))
     {
         g.disabled = false;
@@ -3847,6 +3988,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         CfgWriteDefault();
         CfgReload();
         DetectRenodxAddon();
+        DetectToolkitAddon();
 
         reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);

@@ -29,10 +29,16 @@ it names this layer as the fallback.
 ## Use
 
 ```
-run-with-feed-layer.bat "E:\path\to\game.exe"
+run-with-feed-layer.bat        "E:\path\to\game.exe"     64-bit game
+x86\run-with-feed-layer32.bat  "E:\path\to\game.exe"     32-bit game (DXVK)
 ```
 
-That sets `VK_LAYER_PATH` (this folder) and `VK_INSTANCE_LAYERS=VK_LAYER_feed_vk`
+The 32-bit build lives in its own `x86\` subdirectory, and that is not tidiness:
+the Vulkan loader tries **every** manifest it finds on `VK_LAYER_PATH`, so two
+same-named manifests in one folder would have it load the wrong-bitness DLL and
+silently skip the layer. Each script points `VK_LAYER_PATH` at its own folder.
+
+Both set `VK_LAYER_PATH` and `VK_INSTANCE_LAYERS=VK_LAYER_feed_vk`
 for that launch only. Registry implicit-layer keys are deliberately avoided:
 overlays and capture tools rewrite `HKCU\...\Vulkan\ImplicitLayers` behind your
 back, and a per-launch environment variable cannot be clobbered or leak into
@@ -64,8 +70,16 @@ untouched list — it can never be the reason a game refuses to start.
 
 ## Building
 
-`build-layer.bat` (MSVC + the Vulkan headers under `external/vulkan`). Output:
-`VkLayer_feed_vk.dll`, used together with `VkLayer_feed_vk.json` in this folder.
+`build-layer.bat` (MSVC + the Vulkan headers under `external/vulkan`) builds both
+architectures from the same source: `VkLayer_feed_vk.dll` here, with
+`VkLayer_feed_vk.json`, and `x86\VkLayer_feed_vk32.dll` with
+`x86\VkLayer_feed_vk32.json`.
+
+Both link with `/DEF:feed_vk_layer.def`. On x86 `VKAPI_CALL` is `__stdcall`, so a
+bare `/EXPORT:` or `__declspec(dllexport)` would emit the decorated `_name@4` and
+the loader's `GetProcAddress("vkNegotiateLoaderLayerInterfaceVersion")` would miss
+it. A `.def` exports the plain name on both architectures, so there is no
+arch-specific export rule to get wrong.
 
 ## Credit
 

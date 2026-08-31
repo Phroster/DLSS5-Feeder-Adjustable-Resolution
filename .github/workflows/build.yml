@@ -109,7 +109,7 @@ jobs:
         shell: cmd
         run: call build.bat
 
-      - name: dlss5-feed.addon32 (32-bit in-game half -- D3D11/OpenGL)
+      - name: dlss5-feed.addon32 (32-bit in-game half -- D3D11/OpenGL/Vulkan)
         shell: cmd
         run: call build-addon32.bat
 
@@ -117,11 +117,11 @@ jobs:
         shell: cmd
         run: call host\build-host.bat
 
-      - name: VkLayer_feed_vk.dll (Vulkan interop layer)
+      - name: VkLayer_feed_vk.dll (Vulkan interop layer, x64 + x86)
         shell: cmd
         run: call layer\build-layer.bat
 
-      - name: spike (phase-0 cross-process sharing + OpenGL interop probes)
+      - name: spike (phase-0 cross-process sharing + OpenGL/Vulkan interop probes)
         shell: cmd
         run: call spike\build-spike.bat
 
@@ -139,8 +139,14 @@ jobs:
           cp host/dlss5-feed-host64.exe artifacts/
           cp layer/VkLayer_feed_vk.dll  artifacts/
           cp layer/VkLayer_feed_vk.json artifacts/
+          # The 32-bit layer keeps its own subdirectory: the Vulkan loader tries every
+          # manifest on VK_LAYER_PATH, so the two must never share one.
+          mkdir -p artifacts/x86
+          cp layer/x86/VkLayer_feed_vk32.dll        artifacts/x86/
+          cp layer/x86/VkLayer_feed_vk32.json       artifacts/x86/
+          cp layer/x86/run-with-feed-layer32.bat    artifacts/x86/
           cp shaders/DLSS5_Feed.fx      artifacts/
-          ls -l artifacts
+          ls -lR artifacts
 
       - uses: actions/upload-artifact@v4
         with:

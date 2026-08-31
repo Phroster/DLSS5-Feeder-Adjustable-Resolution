@@ -11,6 +11,12 @@ per-effect-preprocessor gotchas below) every time.
   local ReShade DLL. OpenGL → local `opengl32.dll` (ReShade's OpenGL install), and nothing
   else: no layer, no hook, no registry. D3D9 → needs dgVoodoo2 first (see README "Install
   for a DirectX 9 game"), out of scope for automated deploy.
+  - A **32-bit** game showing Vulkan is almost certainly running
+    [DXVK](https://github.com/doitsujin/dxvk) — check for `dxgi.dll`/`d3d9.dll`/`d3d11.dll`
+    next to the exe that are DXVK's, not the system's. That matters twice: ReShade must go
+    in as a **Vulkan layer** (those DLL names are taken), and the deploy is the 32-bit one,
+    `host64\` subfolder and all. Untested in a real game as of 0.8.0-beta.1 — see
+    `PLAN-VULKAN32.md`.
 - **GPU**: DLSS/NGX needs an RTX card. Confirm with
   `Get-CimInstance Win32_VideoController | Select Name` before doing anything else.
 
@@ -126,6 +132,9 @@ Then drop `deploy/templates/ReShadePreset.ini` in as `ReShadePreset.ini`, and ei
 the game/emulator already ships its own ReShade.ini — keep its other sections, only add/
 overwrite `[ADDON]`/`[GENERAL]`).
 
+Nothing else is required. `alexs-toolkit.addon64` in `deploy/` is optional and off the
+default path — see section 8 if you want the multi-pass DLSS 5 cascade.
+
 ## 4. Where ReShade itself comes from
 
 - **D3D11/D3D12 (64-bit or 32-bit)**: ReShade is a *local* `dxgi.dll` next to the game
@@ -152,6 +161,13 @@ overwrite `[ADDON]`/`[GENERAL]`).
   (drive letter changed), an old path for it may already be sitting in `Apps=` pointing at
   a folder that no longer has the exe — harmless to leave, but replace it with the current
   path rather than just appending a duplicate.
+  **32-bit Vulkan (DXVK)** needs the 32-bit ReShade Vulkan install, i.e. a
+  `ReShade32.{dll,json}` implicit layer, and the same `ReShadeApps.ini` gating. Everything
+  else is the ordinary 32-bit deploy (`dlss5-feed.addon32` + a full `host64\`). If
+  `dlss5-feed.log` then says the Vulkan interop entry points are missing, the fallback is
+  `layer\x86\run-with-feed-layer32.bat` — the 32-bit sibling of the layer below, in its own
+  subdirectory because the Vulkan loader tries every manifest on `VK_LAYER_PATH` and would
+  otherwise pick the 64-bit DLL and skip the layer.
 - **OpenGL (64-bit or 32-bit)**: ReShade is a *local* `opengl32.dll` next to the game .exe
   (matching bitness) — installer, pick the exe, API **OpenGL**, tick "Enable loading of
   add-ons". Nothing global, nothing to register, and no `AddonPath` needed: add-ons load
@@ -245,3 +261,38 @@ all — if not: wrong folder, wrong architecture, or the game turned out not to 
 follow step 6 above for the DLSS5-Feeder side. Also point them at `host64\`'s "32-bit DLSS 5
 Feeder" window (Home key in it) — the DLSS 5 add-on's full panel lives there, not in the
 game's own overlay.
+
+## 8. Optional: Alex's Toolkit (multi-pass DLSS 5 cascade)
+
+`deploy/alexs-toolkit.addon64` is a **third-party, optional** ReShade add-on that makes
+DLSS 5 run two or three times per frame. It is not part of a default deploy and nothing
+here needs it. Provenance and the full mechanism are in `deploy/SOURCES.md`.
+
+To use it, copy `alexs-toolkit.addon64` **and** `alexs-toolkit.cfg` into the folder where
+`renodx-dlss5.addon64` lives — the game folder for a 64-bit game, `host64\` for the
+32-bit split-process path. Settings (it re-reads the file live, no restart needed):
+
+```
+enabled=1
+two_pass=1     # 1 = B->A cascade (two passes). 0 = off, single pass.
+three_pass=0   # 1 = B->C->A cascade (three passes). Requires two_pass=1.
+```
+
+**Verify it actually armed.** It writes `alexs-toolkit.log` next to itself. Look for
+`complete signed resolver set captured; cascade interception is now armed` followed by
+`create #1 feature 18: A=... B=... C=...`. If instead you see
+`Generic already cached ... before toolkit attach`, it lost the load-order race and stayed
+pass-through for the whole run — the cascade did nothing that session.
+
+`dlss5-feed.log` / `dlss5-feed-host.log` now report it too, e.g.
+`Alex's Toolkit 0.9.0-beta: 2-pass DLSS 5 cascade active -- roughly 2x the temporal
+history`, and the ReShade overlay shows the same line.
+
+**Expect a temporal cost.** Every stage keeps its own history, so the cascade multiplies
+the effective history length. Motion vectors are *not* the problem — they stay
+dimensionally valid for every stage — but because ours are screen-space estimates that
+are already one frame late, the doubled history shows up as smearing behind fast motion
+and a slow settle after a hard camera cut. If a cutscene transition looks like the feeder
+briefly stopped working and then recovered, that is the cascade's history re-converging,
+not a failure: check `alexs-toolkit.log` for `fallback=` staying at 0 to confirm. Set
+`two_pass=0` if the trade isn't worth it for that game.

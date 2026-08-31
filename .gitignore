@@ -36,3 +36,8 @@ layer/*.obj
 layer/*.exp
 layer/*.lib
 layer/*.log
+# The 32-bit layer is built into its own subdirectory (the Vulkan loader tries every
+# manifest on VK_LAYER_PATH, so the two bitnesses must not share one). Its manifest and
+# launcher are tracked; the build output is not, same as the x64 pair above.
+layer/x86/*.dll
+layer/x86/*.pdb

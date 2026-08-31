@@ -1,5 +1,46 @@
 # 32-bit Vulkan support (issue #15 — "32 Bit DXVK Hook")
 
+> ## Implementation status — CODE COMPLETE, spike verified, not yet run in a game
+>
+> Phases 0–5 below are implemented. What changed against the plan as written, and why:
+>
+> * **Phase 2 was already half-done.** The OpenGL work (v0.7.0) shipped protocol v2 with a
+>   `client_kind` field and a host-creates-the-textures path — the exact mechanism this plan
+>   needed. So instead of inventing a `FeedBuild::api` field, Vulkan is simply a third
+>   `FeedClientKind`, and the host's Build handler branches on `FeedHostCreatesTextures()`
+>   rather than on GL specifically. `FEED_IPC_VERSION` went 2 → 3 for the one genuinely new
+>   field, `FeedBuildAck::output_fmt`.
+> * **`src/feed_fmt.h`** exists but the 64-bit add-on still carries its own copies: moving them
+>   would have been a behaviour-neutral edit to the most-proven file in the repo for no gain
+>   this release. The header's functions are `FeedFmt*`-prefixed so the 32-bit add-on can
+>   include it while the proven D3D11 branch keeps its own local `TypedColorFormat` untouched,
+>   as the plan intended.
+>
+> **Phase 0 ran on the dev machine (RTX 5090, 2026-08-31) and passed.** The four gating
+> questions are answered:
+>
+> | Probe | Answer |
+> | --- | --- |
+> | (a) 32-bit ICD extensions | All seven present — `external_memory{,_win32}`, `external_semaphore{,_win32}`, `dedicated_allocation`, `get_memory_requirements2`, `timeline_semaphore` — out of 271 device extensions, API 1.4 |
+> | (b) `src/feed_vk.h` as x86 | Compiles and `FeedVkLoad` resolves every entry point |
+> | (c) D3D12 texture import at 32-bit | Succeeds both **with and without** storage usage, on the same resource (the OUTPUT and COLOR cases) |
+> | (d) memory-type heuristic | Allowed mask `0x3`, lowest-set-bit picks index 0. That type reports *no* `DEVICE_LOCAL` bit — the NVIDIA ICD's external-import type — and the round trip is byte-correct, so the heuristic holds. Worth re-reading if another vendor ever matters. |
+>
+> Both directions of the frame counter crossed on a shared D3D12 fence, and both patterns
+> round-tripped through the same memory.
+>
+> **What is NOT verified:** anything above the transport. No 32-bit Vulkan game has run this —
+> not DXVK's `vkCreateDevice` resolution style against the in-process hook (risk 1), not the
+> BGRA8 output path (risk 2), not ReShade x86 as a Vulkan layer. Verification steps 3–6 below
+> are still owed.
+>
+> One gap worth naming inside phase 0 itself: the spike round-trips `R8G8B8A8_UNORM`, but the
+> real DXVK case is **BGRA8 with `VK_IMAGE_USAGE_STORAGE_BIT`** on the OUTPUT slot, which needs
+> the driver to report storage-image support for `VK_FORMAT_B8G8R8A8_UNORM`. NVIDIA does, and
+> the 64-bit DOOM path already leans on it, so this is very likely fine — but it is the one
+> format combination the phase-0 evidence does not actually cover. The import-failure log names
+> it explicitly if it ever bites.
+
 ## Context
 
 GitHub issue #15 (skoriandlp-arch) asks for a 32-bit Vulkan transport: WoW 3.3.5 (32-bit)

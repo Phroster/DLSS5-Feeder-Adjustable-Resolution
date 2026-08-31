@@ -1,12 +1,43 @@
-build/
-artifacts/
-.vs/
 *.obj
-*.res
-*.pdb
-*.ilk
 *.exp
 *.lib
+*.pdb
+*.res
+*.addon64
 *.log
-*.zip
-test-fixture/
+build/
+
+# NVIDIA NGX SDK (bring your own — see external/ngx/README.md); not redistributed here
+external/ngx/*.h
+external/ngx/*.lib
+external/ngx/libs/
+# Upstream bridge sources are not re-hosted; see README credits
+external/bridge-1.0.19/
+release/
+deploy/
+spike/*.exe
+spike/*.obj
+spike/*.log
+spike/*.err
+host/*.exe
+host/*.obj
+host/*.log
+host/*.err
+host/dxgi.dll
+host/*.addon64
+host/nvngx_*.dll
+host/reshade.ini
+host/ReShade.ini
+host/ReShadePreset.ini
+external/vulkan/vulkan/
+external/vulkan/vk_video/
+layer/*.dll
+layer/*.obj
+layer/*.exp
+layer/*.lib
+layer/*.log
+# The 32-bit layer is built into its own subdirectory (the Vulkan loader tries every
+# manifest on VK_LAYER_PATH, so the two bitnesses must not share one). Its manifest and
+# launcher are tracked; the build output is not, same as the x64 pair above.
+layer/x86/*.dll
+layer/x86/*.pdb

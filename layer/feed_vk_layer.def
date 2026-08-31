@@ -1,0 +1,10 @@
+; Export list for VkLayer_feed_vk.
+;
+; The manifest names exactly one entry point, vkNegotiateLoaderLayerInterfaceVersion,
+; and the loader looks it up by that undecorated name. On x86 VKAPI_CALL is __stdcall,
+; so a bare /EXPORT: (or __declspec(dllexport)) would emit the decorated _name@4 and
+; the loader's GetProcAddress would miss it. A .def exports the plain name on both
+; architectures, so the same file is used for x64 and x86 and there is no arch-specific
+; export rule to get wrong.
+EXPORTS
+    vkNegotiateLoaderLayerInterfaceVersion

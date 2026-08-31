@@ -1,6 +1,2 @@
-* text=auto
-*.ps1 text eol=crlf
-*.cpp text eol=crlf
-*.fx text eol=crlf
-*.rc text eol=crlf
-*.addon64 binary
+# Batch files must keep CRLF: cmd.exe mis-parses goto/labels in LF-only scripts.
+*.bat text eol=crlf

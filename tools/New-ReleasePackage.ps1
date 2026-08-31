@@ -20,19 +20,11 @@ if ($Version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
 # Keep the runtime package explicit. Recursive directory copies can silently include
 # an untracked experiment that happened to be present in a developer's checkout.
 $payloadFiles = @(
-    'README.md',
-    'LICENSE',
-    'THIRD_PARTY_NOTICES.md',
-    'CHANGELOG.md',
-    'RELEASE_NOTES.md',
-    'BUILDING.md',
-    'Build-Resolution-Control.ps1',
-    'Install-Resolution-Control.ps1',
-    'Verify-Resolution-Control.ps1',
-    'bin\dlss5-feed.addon64',
-    'src\dlss5-feed.cpp',
-    'src\version.rc',
-    'shaders\DLSS5_Feed.fx'
+    [ordered]@{ Source = 'README.md'; Destination = 'README.md' },
+    [ordered]@{ Source = 'LICENSE'; Destination = 'LICENSE' },
+    [ordered]@{ Source = 'THIRD_PARTY_NOTICES.md'; Destination = 'THIRD_PARTY_NOTICES.md' },
+    [ordered]@{ Source = 'bin\dlss5-feed.addon64'; Destination = 'dlss5-feed.addon64' },
+    [ordered]@{ Source = 'shaders\DLSS5_Feed.fx'; Destination = 'DLSS5_Feed.fx' }
 )
 
 if ((& git -C $repo rev-parse --is-inside-work-tree 2>$null) -ne 'true') {
@@ -45,10 +37,10 @@ if ($worktreeChanges.Count -ne 0) {
     throw "Refusing to package a dirty worktree. Commit or remove every change first.`n$($worktreeChanges -join "`n")"
 }
 
-foreach ($relative in $payloadFiles) {
-    & git -C $repo ls-files --error-unmatch -- $relative *> $null
+foreach ($item in $payloadFiles) {
+    & git -C $repo ls-files --error-unmatch -- $item.Source *> $null
     if ($LASTEXITCODE -ne 0) {
-        throw "Release payload is not tracked by Git: $relative"
+        throw "Release payload is not tracked by Git: $($item.Source)"
     }
 }
 
@@ -110,13 +102,13 @@ if ($releaseNotesText -notmatch ('(?m)^# Version ' + [regex]::Escape($Version) +
 try {
     New-Item -ItemType Directory -Path $packageRoot -Force | Out-Null
 
-    foreach ($relative in $payloadFiles) {
-        $source = Join-Path $repo $relative
+    foreach ($item in $payloadFiles) {
+        $source = Join-Path $repo $item.Source
         if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
             throw "Missing release file: $source"
         }
 
-        $destination = Join-Path $packageRoot $relative
+        $destination = Join-Path $packageRoot $item.Destination
         $destinationDirectory = Split-Path -Parent $destination
         New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
         Copy-Item -LiteralPath $source -Destination $destination -Force

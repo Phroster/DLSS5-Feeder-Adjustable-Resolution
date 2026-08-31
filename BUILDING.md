@@ -1,9 +1,9 @@
 # Building DLSS5-Feeder Adjustable Resolution
 
-The checked-in v0.3.1 binary was built from this repository's source against these
+The checked-in v0.4.0 binary is built from this repository's source against these
 recorded dependency revisions. The slider path was runtime-verified before the latest
-metadata-only rebuild; smoke-test the current binary in a compatible game again before
-publishing a new release:
+version/metadata rebuild; smoke-test the current binary in a compatible game before
+publishing or mirroring the release:
 
 - DLSS5-Feeder/ReShade headers:
   [`c452ddc09d3d3ec5e51a9ee2178ead6674fefbac`](https://github.com/jlrouzies-fr/DLSS5-Feeder/commit/c452ddc09d3d3ec5e51a9ee2178ead6674fefbac)

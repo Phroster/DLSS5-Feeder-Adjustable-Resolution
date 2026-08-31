@@ -118,58 +118,59 @@ corruption, stutter, or silent Neural Rendering loss occurs, disable them and ve
 Feeder by itself first. Keep RenoDX **Enable Upscaling (WIP)** disabled because this fork
 owns the final expansion.
 
-## Automatic installation
+## Install: copy two files
 
-The generic installer operates on the directory you select; it does not contain a game
-name or engine-specific patch.
+Download `DLSS5-Feeder-Adjustable-Resolution-v0.4.0.zip` from the
+[Releases page](https://github.com/Phroster/DLSS5-Feeder-Adjustable-Resolution/releases),
+then extract it anywhere. No PowerShell command or installer is required.
 
-Close the game, extract the package, and run:
+The release contains the two completed runtime files:
 
-```powershell
-.\Install-Resolution-Control.ps1 -GameDir 'D:\Games\ExampleGame'
+```text
+dlss5-feed.addon64
+DLSS5_Feed.fx
 ```
 
-If `-GameDir` is omitted, a folder picker opens. The installer:
+With the game closed:
 
-1. confirms the directory contains ReShade and the required local DLSS/RenoDX files;
-2. locates exactly one compatible LaunchPad shader and include directory;
-3. refuses to continue if an executable inside the selected directory is running;
-4. creates a scoped backup under
-   `_DLSS5-Feeder-Resolution-Control-Backup-yyyyMMdd-HHmmss`;
-5. installs `dlss5-feed.addon64` and `DLSS5_Feed.fx`; and
-6. places LaunchPad and DLSS5 Feed at the start of the active ReShade technique order.
-
-The scripts and add-on are not code-signed. Inspect downloaded files before running
-them. If Windows blocks the installer, unblock only that reviewed file:
-
-```powershell
-Unblock-File -LiteralPath .\Install-Resolution-Control.ps1
-```
-
-Do not disable antivirus protection or weaken the machine-wide PowerShell execution
-policy.
-
-## Manual installation
-
-1. Close the game and back up the existing add-on, active ReShade preset, and
-   `ReShade.ini`.
-2. Copy `bin\dlss5-feed.addon64` beside the game's executable.
-3. Copy `shaders\DLSS5_Feed.fx` beside `MartysMods_LAUNCHPAD.fx`. Its relative includes
-   require the adjacent `MartysMods` directory.
-4. Enable and order the techniques as:
+1. Back up any existing copies of those two files.
+2. Copy `dlss5-feed.addon64` beside the game's executable.
+3. Find `MartysMods_LAUNCHPAD.fx` in the game's ReShade shader directories.
+4. Copy `DLSS5_Feed.fx` into that same directory. Its relative includes require the
+   adjacent `MartysMods` directory.
+5. Launch the game and open ReShade's **Home** tab.
+6. Enable and order the techniques as:
 
    ```text
    MartysMods_Launchpad → DLSS5_Feed → other ReShade effects
    ```
 
-5. Confirm that DLSS Neural Rendering is active and RenoDX WIP upscaling is disabled.
+7. Confirm that DLSS Neural Rendering is active and RenoDX WIP upscaling is disabled.
+8. Expand **DLSS 5 Feed Work Resolution** and choose the desired percentage.
 
-Manual installation does not create the automatic restore script.
+That completes installation. The add-on saves the selected percentage automatically.
+
+## Optional automated installer
+
+The source repository also contains `Install-Resolution-Control.ps1`. It performs the
+same two-file installation while validating prerequisites, creating a scoped backup,
+and arranging the active technique order. It is optional and is not included in the
+minimal runtime ZIP.
+
+```powershell
+.\Install-Resolution-Control.ps1 -GameDir 'D:\Games\ExampleGame'
+```
+
+If `-GameDir` is omitted, a folder picker opens. Inspect scripts before running them;
+do not disable antivirus protection or weaken the machine-wide PowerShell execution
+policy.
+
+The manual two-file installation does not create an automatic restore script.
 
 ## Verification
 
 Launch the game, reach a normally rendered scene for several seconds, close the game,
-and run:
+and run the optional verifier from the source repository:
 
 ```powershell
 .\Verify-Resolution-Control.ps1 -GameDir 'D:\Games\ExampleGame'
@@ -201,7 +202,11 @@ file authenticity.
 
 ## Rollback
 
-With the game closed, run the restore script from the newest backup:
+For a manual installation, close the game and restore the two files you backed up. If
+neither file existed previously, remove only `dlss5-feed.addon64` and `DLSS5_Feed.fx`.
+
+If the optional automated installer was used, run its restore script from the newest
+backup:
 
 ```powershell
 & 'D:\Games\ExampleGame\_DLSS5-Feeder-Resolution-Control-Backup-yyyyMMdd-HHmmss\Restore-Resolution-Control.ps1'

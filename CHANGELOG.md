@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - 2026-08-31
 
 - Rebranded the fork as DLSS5-Feeder Adjustable Resolution and removed all bundled
   game-specific presets and post-processing shaders.
@@ -16,8 +16,8 @@
   checks and a SHA-256 sidecar, and removed temporary staging directories after use.
 - Recorded the tested upstream Feeder and NVIDIA DLSS SDK revisions and clarified
   third-party licensing boundaries.
-- Kept the core v0.3.1 slider behavior unchanged; rebuilt its binary only to correct
-  the exported configuration/log description.
+- Carried the proven v0.3.1 slider behavior forward unchanged, bumped the generic
+  release identity to v0.4.0, and corrected the exported configuration/log description.
 
 ## 0.3.1 - 2026-08-30
 

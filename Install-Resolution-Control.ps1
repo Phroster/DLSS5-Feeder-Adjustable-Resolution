@@ -152,7 +152,7 @@ $manifest = [ordered]@{
     schema = 1
     createdUtc = [DateTime]::UtcNow.ToString('o')
     gameDir = $game
-    packageVersion = '0.3.1'
+    packageVersion = '0.4.0'
     entries = $entries
 }
 $manifest | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $backupDir 'manifest.json') -Encoding utf8
@@ -232,7 +232,7 @@ try {
 }
 
 $installedHash = (Get-FileHash -LiteralPath $addonTarget -Algorithm SHA256).Hash
-Write-Host 'DLSS5 Feeder Work Resolution Slider 0.3.1 installed successfully.' -ForegroundColor Green
+Write-Host 'DLSS5 Feeder Adjustable Resolution 0.4.0 installed successfully.' -ForegroundColor Green
 Write-Host "Game:     $game"
 Write-Host "Preset:   $presetPath"
 Write-Host "Backup:   $backupDir"

@@ -1,9 +1,9 @@
-# Building NR50
+# Building DLSS5-Feeder Adjustable Resolution
 
 The checked-in v0.3.1 binary was built from this repository's source against these
 recorded dependency revisions. The slider path was runtime-verified before the latest
-metadata-only rebuild; smoke-test the current binary in MGS4 again before publishing a
-new release:
+metadata-only rebuild; smoke-test the current binary in a compatible game again before
+publishing a new release:
 
 - DLSS5-Feeder/ReShade headers:
   [`c452ddc09d3d3ec5e51a9ee2178ead6674fefbac`](https://github.com/jlrouzies-fr/DLSS5-Feeder/commit/c452ddc09d3d3ec5e51a9ee2178ead6674fefbac)
@@ -36,7 +36,7 @@ The expected inputs are:
 Build from the repository root:
 
 ```powershell
-.\Build-NR50.ps1 `
+.\Build-Resolution-Control.ps1 `
   -FeederRoot 'C:\src\DLSS5-Feeder' `
   -NgxRoot 'C:\SDKs\NVIDIA-DLSS'
 ```

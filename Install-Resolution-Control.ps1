@@ -20,10 +20,21 @@ function Assert-UnderGame([string] $Path, [string] $Root) {
     return $full
 }
 
+function Get-RunningExecutablesUnderRoot([string] $Root) {
+    $prefix = (Get-FullPath $Root) + [IO.Path]::DirectorySeparatorChar
+    return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.ExecutablePath -and
+        ([IO.Path]::GetFullPath([string]$_.ExecutablePath)).StartsWith(
+            $prefix,
+            [StringComparison]::OrdinalIgnoreCase
+        )
+    })
+}
+
 if (-not $GameDir) {
     Add-Type -AssemblyName System.Windows.Forms
     $picker = [Windows.Forms.FolderBrowserDialog]::new()
-    $picker.Description = 'Select the MGS4 directory containing mgs4.exe'
+    $picker.Description = 'Select the game directory containing ReShade.ini'
     $picker.ShowNewFolderButton = $false
     if ($picker.ShowDialog() -ne [Windows.Forms.DialogResult]::OK) {
         throw 'Installation cancelled.'
@@ -35,15 +46,13 @@ $game = Get-FullPath $GameDir
 if (-not (Test-Path -LiteralPath $game -PathType Container)) {
     throw "Game directory does not exist: $game"
 }
-if (-not (Test-Path -LiteralPath (Join-Path $game 'mgs4.exe') -PathType Leaf)) {
-    throw "mgs4.exe was not found in: $game"
-}
-if (Get-Process -Name 'mgs4' -ErrorAction SilentlyContinue) {
-    throw 'MGS4 is running. Close it before installing NR50.'
+$running = @(Get-RunningExecutablesUnderRoot $game)
+if ($running.Count -gt 0) {
+    $names = @($running | ForEach-Object { "{0} (PID {1})" -f $_.Name, $_.ProcessId }) -join ', '
+    throw "An executable inside the selected game directory is running. Close it before installing: $names"
 }
 
 $requiredFiles = @(
-    'dxgi.dll',
     'renodx-dlss5.addon64',
     'nvngx_dlss.dll',
     'nvngx_dlssnr.dll',
@@ -53,6 +62,14 @@ foreach ($relative in $requiredFiles) {
     if (-not (Test-Path -LiteralPath (Join-Path $game $relative) -PathType Leaf)) {
         throw "Missing prerequisite: $relative"
     }
+}
+
+$reshadeProxies = @('dxgi.dll', 'd3d11.dll')
+$foundProxies = @($reshadeProxies | Where-Object {
+    Test-Path -LiteralPath (Join-Path $game $_) -PathType Leaf
+})
+if ($foundProxies.Count -eq 0) {
+    throw "No supported ReShade proxy was found. Expected one of: $($reshadeProxies -join ', ')"
 }
 
 $shaderRoot = Join-Path $game 'reshade-shaders\Shaders'
@@ -97,7 +114,7 @@ foreach ($source in @($sourceAddon, $sourceShader)) {
 $addonTarget = Assert-UnderGame (Join-Path $game 'dlss5-feed.addon64') $game
 $shaderTarget = Assert-UnderGame (Join-Path $launchPad.Directory.FullName 'DLSS5_Feed.fx') $game
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$backupDir = Join-Path $game "_NR50-Backup-$stamp"
+$backupDir = Join-Path $game "_DLSS5-Feeder-Resolution-Control-Backup-$stamp"
 New-Item -ItemType Directory -Path $backupDir -ErrorAction Stop | Out-Null
 
 $entries = [Collections.Generic.List[object]]::new()
@@ -148,10 +165,18 @@ $ErrorActionPreference = 'Stop'
 $manifestPath = Join-Path $PSScriptRoot 'manifest.json'
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 $game = [IO.Path]::GetFullPath([string]$manifest.gameDir).TrimEnd([IO.Path]::DirectorySeparatorChar)
-if (Get-Process -Name 'mgs4' -ErrorAction SilentlyContinue) {
-    throw 'MGS4 is running. Close it before restoring the backup.'
-}
 $prefix = $game + [IO.Path]::DirectorySeparatorChar
+$running = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.ExecutablePath -and
+    ([IO.Path]::GetFullPath([string]$_.ExecutablePath)).StartsWith(
+        $prefix,
+        [StringComparison]::OrdinalIgnoreCase
+    )
+})
+if ($running.Count -gt 0) {
+    $names = @($running | ForEach-Object { "{0} (PID {1})" -f $_.Name, $_.ProcessId }) -join ', '
+    throw "An executable inside the recorded game directory is running. Close it before restoring: $names"
+}
 foreach ($entry in $manifest.entries) {
     if (-not [bool]$entry.modified) { continue }
     $target = [IO.Path]::GetFullPath((Join-Path $game ([string]$entry.targetRelative)))
@@ -167,12 +192,12 @@ foreach ($entry in $manifest.entries) {
         Write-Host "Restored $target"
     } elseif (Test-Path -LiteralPath $target -PathType Leaf) {
         Remove-Item -LiteralPath $target -Force
-        Write-Host "Removed NR50-created file $target"
+        Write-Host "Removed resolution-control file $target"
     }
 }
 Write-Host "Rollback complete. Backup retained at $PSScriptRoot" -ForegroundColor Green
 '@
-$restoreScript | Set-Content -LiteralPath (Join-Path $backupDir 'Restore-NR50.ps1') -Encoding utf8
+$restoreScript | Set-Content -LiteralPath (Join-Path $backupDir 'Restore-Resolution-Control.ps1') -Encoding utf8
 
 try {
     Copy-Item -LiteralPath $sourceAddon -Destination $addonTarget -Force
@@ -202,7 +227,7 @@ try {
     }
     $lines | Set-Content -LiteralPath $presetPath -Encoding utf8
 } catch {
-    Write-Warning "Installation failed after backup creation. Run '$backupDir\Restore-NR50.ps1' to restore the original state."
+    Write-Warning "Installation failed after backup creation. Run '$backupDir\Restore-Resolution-Control.ps1' to restore the original state."
     throw
 }
 
@@ -213,4 +238,4 @@ Write-Host "Preset:   $presetPath"
 Write-Host "Backup:   $backupDir"
 Write-Host "SHA-256:  $installedHash"
 Write-Host 'Keep RenoDX "Enable Upscaling WIP" disabled. The Feeder uses one shared DLAA + Neural Rendering work scale.'
-Write-Host 'Launch a scene, then run Verify-NR50.ps1.'
+Write-Host 'Launch a scene, then run Verify-Resolution-Control.ps1.'

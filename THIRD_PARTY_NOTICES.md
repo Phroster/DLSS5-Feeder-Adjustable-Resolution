@@ -11,9 +11,8 @@ DLSS5-Feeder contains work derived from
 2026 NIGos, also distributed under the MIT License. The applicable copyright notices
 are preserved in this repository's `LICENSE` file.
 
-The resolution-scale changes, installer/verifier tooling, and `NRDetailForge.fx` are
-project-specific work Copyright (c) 2026 Phroster and distributed under the same MIT
-License.
+The resolution-scale changes and installer/verifier tooling are project-specific work
+Copyright (c) 2026 Phroster and distributed under the same MIT License.
 
 The following components are prerequisites and are **not** included in this repository
 or its release package:
@@ -29,7 +28,7 @@ or its release package:
   redistributed here.
 - [ReShade](https://github.com/crosire/reshade), which is distributed under its BSD
   license.
-- Metal Gear Solid 4 or any other game content.
+- Any game content.
 
 This project is not affiliated with or endorsed by NVIDIA, RenoDX, ReShade,
 Marty's Mods, Konami, or the upstream DLSS5-Feeder authors.

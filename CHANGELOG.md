@@ -2,16 +2,15 @@
 
 ## Unreleased
 
-- Rewrote the public-facing documentation around the exact work-resolution contract:
-  the slider controls the injected equal-input/output DLAA plus Neural Rendering stage,
-  not MGS4's internal render resolution or total GPU utilization.
+- Rebranded the fork as DLSS5-Feeder Adjustable Resolution and removed all bundled
+  game-specific presets and post-processing shaders.
+- Rewrote the public-facing documentation around the exact generic work-resolution
+  contract: the slider controls the injected equal-input/output DLAA plus Neural
+  Rendering stage, not a game's internal render resolution or total GPU utilization.
 - Added exact work-resolution/pixel-count examples, practical scale guidance, manual
   installation, troubleshooting, known conflicts, and clearer verification limits.
-- Added the original optional `NRDetailForge.fx` version 2 shader: directional 17-tap
-  native-output reconstruction with separate detail bands, noise rejection, chroma
-  preservation, and adaptive anti-ringing protection.
-- Replaced the optional Clarity + RCAS preset stack with one coherent NR Detail Forge 2
-  pass and removed the misleading assumption that a preset forces the persisted scale.
+- Generalized installation, process detection, verification, backup naming, and script
+  names so the core no longer requires or identifies a particular game executable.
 - Restored Windows PowerShell 5.1 compatibility in the bounded installer.
 - Changed release packaging to an explicit file allowlist, added version-consistency
   checks and a SHA-256 sidecar, and removed temporary staging directories after use.
@@ -27,8 +26,6 @@
   changes no longer reload the ReShade effect or reset its UI.
 - Removed unsupported split input/output controls and RenoDX WIP-upscaling guidance.
 - Kept the 400 ms debounce, exact motion-vector scaling, persistence, and rollback.
-- Added an optional MGS4 visual preset using post-NR Colourfulness, Levels, low-strength
-  Clarity, and RCAS without redistributing third-party shaders.
 
 ## 0.3.0 - 2026-08-30 (withdrawn experiment)
 

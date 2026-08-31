@@ -15,8 +15,11 @@ function Fail([string] $Message) {
     Write-Host "[FAIL] $Message" -ForegroundColor Red
 }
 
-if (-not (Test-Path -LiteralPath (Join-Path $game 'mgs4.exe') -PathType Leaf)) {
-    throw "mgs4.exe was not found in: $game"
+if (-not (Test-Path -LiteralPath $game -PathType Container)) {
+    throw "Game directory does not exist: $game"
+}
+if (-not (Test-Path -LiteralPath (Join-Path $game 'ReShade.ini') -PathType Leaf)) {
+    throw "ReShade.ini was not found in: $game"
 }
 
 $addon = Join-Path $game 'dlss5-feed.addon64'

@@ -11,7 +11,7 @@ $repo = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $buildRoot = Join-Path $repo 'build'
 $artifacts = Join-Path $repo 'artifacts'
 $stage = Join-Path $buildRoot ("package-" + [guid]::NewGuid().ToString('N'))
-$packageRoot = Join-Path $stage "DLSS5-Feeder-NR50-v$Version"
+$packageRoot = Join-Path $stage "DLSS5-Feeder-Adjustable-Resolution-v$Version"
 
 if ($Version -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
     throw "Version must be a stable semantic version such as 0.4.0; got '$Version'."
@@ -25,17 +25,14 @@ $payloadFiles = @(
     'THIRD_PARTY_NOTICES.md',
     'CHANGELOG.md',
     'RELEASE_NOTES.md',
-    'VISUAL_TUNING.md',
     'BUILDING.md',
-    'Build-NR50.ps1',
-    'Install-NR50.ps1',
-    'Verify-NR50.ps1',
+    'Build-Resolution-Control.ps1',
+    'Install-Resolution-Control.ps1',
+    'Verify-Resolution-Control.ps1',
     'bin\dlss5-feed.addon64',
     'src\dlss5-feed.cpp',
     'src\version.rc',
-    'shaders\DLSS5_Feed.fx',
-    'shaders\NRDetailForge.fx',
-    'presets\MGS4-VisualTune.ini'
+    'shaders\DLSS5_Feed.fx'
 )
 
 if ((& git -C $repo rev-parse --is-inside-work-tree 2>$null) -ne 'true') {
@@ -95,7 +92,7 @@ if ($binaryVersion -ne $expectedBinaryVersion) {
 
 $sourceText = Get-Content -LiteralPath (Join-Path $repo 'src\dlss5-feed.cpp') -Raw
 $resourceText = Get-Content -LiteralPath (Join-Path $repo 'src\version.rc') -Raw
-$installerText = Get-Content -LiteralPath (Join-Path $repo 'Install-NR50.ps1') -Raw
+$installerText = Get-Content -LiteralPath (Join-Path $repo 'Install-Resolution-Control.ps1') -Raw
 $releaseNotesText = Get-Content -LiteralPath (Join-Path $repo 'RELEASE_NOTES.md') -Raw
 if ($sourceText -notmatch ('#define\s+FEED_VERSION\s+"' + [regex]::Escape($Version) + '-single"')) {
     throw "src\dlss5-feed.cpp does not declare FEED_VERSION $Version-single."
@@ -104,7 +101,7 @@ if ($resourceText -notmatch ('VALUE\s+"ProductVersion",\s+"' + [regex]::Escape($
     throw "src\version.rc does not declare ProductVersion $expectedBinaryVersion."
 }
 if ($installerText -notmatch ("packageVersion\s*=\s*'" + [regex]::Escape($Version) + "'")) {
-    throw "Install-NR50.ps1 does not declare packageVersion $Version."
+    throw "Install-Resolution-Control.ps1 does not declare packageVersion $Version."
 }
 if ($releaseNotesText -notmatch ('(?m)^# Version ' + [regex]::Escape($Version) + '$')) {
     throw "RELEASE_NOTES.md is not headed '# Version $Version'."
@@ -126,7 +123,7 @@ try {
     }
 
     New-Item -ItemType Directory -Path $artifacts -Force | Out-Null
-    $zip = Join-Path $artifacts "DLSS5-Feeder-NR50-v$Version.zip"
+    $zip = Join-Path $artifacts "DLSS5-Feeder-Adjustable-Resolution-v$Version.zip"
     Compress-Archive -LiteralPath $packageRoot -DestinationPath $zip -CompressionLevel Optimal -Force
 
     $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()

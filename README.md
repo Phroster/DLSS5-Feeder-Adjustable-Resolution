@@ -18,6 +18,14 @@
 > - **Real motion vectors on D3D9** — renodx-dlss evaluates only the finished backbuffer there
 >   (no temporal inputs); the feeder drives a full temporal evaluate from ReShade motion vectors.
 
+> ## ⚠️ Pin the DLSS 5 neural-rendering add-on to v4.55
+>
+> `renodx-dlss5.addon64` — the separate add-on this project detours, required by every install
+> below — has started building part of the synthetic DLSS contract itself in builds past v4.55.
+> Running a newer build alongside DLSS5-Feeder conflicts. **Use v4.55**, from the same RenoDX
+> Discord, `#DLSS5` channel:
+> <https://discord.com/channels/1408098019194310818/1542647972695904317/1543568908017995818>
+
 ## ⚠️ Not compatible with Nvidia Smooth Motion / Optiscaler. Disable them to avoid issues.
 
 # DLSS5-Feeder
@@ -115,9 +123,9 @@ in fast motion, softness on thin moving geometry), and the HUD is processed alon
    its `Shaders\` folder (the `lumenite_*.fx` files and `include\`) into `reshade-shaders\Shaders\`,
    and `Textures\lumenite_bluenoise256.png` into `reshade-shaders\Textures\`.
    *(Other providers: see [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider).)*
-4. Get **`renodx-dlss5.addon64`** and **`nvngx_dlssnr.dll`** — easiest via the
-   **[RHI installer](https://github.com/RankFTW/RHI/releases)**. Put both next to the game `.exe`,
-   plus a **`nvngx_dlss.dll`** (from any DLSS game, or [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper)).
+4. Get **`renodx-dlss5.addon64`** (**v4.55** — see the warning above) and **`nvngx_dlssnr.dll`** from
+   the RenoDX Discord. Put both next to the game `.exe`, plus a **`nvngx_dlss.dll`** (from any DLSS
+   game, or [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper)).
 5. Press **Home** for the ReShade overlay, select `DLSS5_Feed.fx`, set **`DLSS5_MV_PROVIDER` = `3`**
    in its Preprocessor definitions, and reload effects.
 6. In-game: enable **"LUMENITE: Kernel 2.0"**, then **DLSS 5 Feed** below it, then turn on neural
@@ -142,8 +150,9 @@ exists as 64-bit code.
    **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)**. Put
    `dlss5-feed.addon32` next to the game `.exe`, `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`,
    and `dlss5-feed-host64.exe` into a new `host64\` folder next to the game `.exe`.
-3. Put a 64-bit ReShade `dxgi.dll`, `renodx-dlss5.addon64`, `nvngx_dlssnr.dll` and `nvngx_dlss.dll`
-   into `host64\`. (Get the x64 `dxgi.dll` by running the ReShade installer once against any 64-bit game.)
+3. Put a 64-bit ReShade `dxgi.dll`, `renodx-dlss5.addon64` (**v4.55** — see the warning above),
+   `nvngx_dlssnr.dll` and `nvngx_dlss.dll` into `host64\`. (Get the x64 `dxgi.dll` by running the
+   ReShade installer once against any 64-bit game.)
 4. Install a motion-vector provider into the game's `reshade-shaders\`, same as steps 3 and 5 of the
    [64-bit instructions](#install-for-a-64-bit-game).
 5. Turn it on in-game as above. Day-to-day DLSS 5 settings live in **ReShade's overlay → Add-ons tab
@@ -411,7 +420,7 @@ memory objects are import-only and a GL process cannot export one. Both directio
 | --- | --- |
 | D3D11, D3D12, Vulkan or OpenGL game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan works out of the box (the add-on adds the interop extensions itself; [a small bundled layer](#install-for-a-vulkan-game) is the fallback); OpenGL needs nothing extra at all, but the game must be rendering on the NVIDIA GPU (see [Install for an OpenGL game](#install-for-an-opengl-game)). D3D10 is not supported. |
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
-| DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | from its own author; this project does not include it. |
+| DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | from its own author, **pinned to v4.55** — newer builds conflict with this project (see the warning near the top). Not included here. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
 | A motion vector provider | one of five, selected with the `DLSS5_MV_PROVIDER` definition — **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX) Kernel is recommended** (`=3`); also iMMERSE Launchpad, VORT, LumeniteFX QuantMotion, or anything writing `texMotionVectors` (qUINT, `dh_uber_motion`). **Not DRME — it does not compile on ReShade 6.8.** See [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider). Install it yourself — nothing third-party is bundled, and our shader includes no third-party files. |
 | `dlss5-feed.addon64` (or `.addon32` + `host64\`) + `DLSS5_Feed.fx` | this project. |

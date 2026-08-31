@@ -39,7 +39,7 @@
 #include "feed_ipc.h"
 #include "feed_gl.h"   // raw-OpenGL interop, the same header the 64-bit add-on uses
 
-#define FEED_VERSION "0.6.1"
+#define FEED_VERSION "0.7.0"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =

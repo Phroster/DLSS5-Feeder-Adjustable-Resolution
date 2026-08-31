@@ -30,7 +30,7 @@
 
 #include "feed_ipc.h"
 
-#define FEED_VERSION "0.6.0-beta.1"
+#define FEED_VERSION "0.6.0-beta.2"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -314,6 +314,7 @@ struct Feed32
     ID3D11ShaderResourceView *color_stage_srv;
     ID3D11Fence     *fence_in;    // we signal
     ID3D11Fence     *fence_out;   // host signals
+    bool             fence_wait_queued;  // a GPU-side Wait(fence_out, frame_n) is outstanding
     ID3D11DeviceContext4 *ctx4;
     ID3D11Device    *dev;         // not owned
 

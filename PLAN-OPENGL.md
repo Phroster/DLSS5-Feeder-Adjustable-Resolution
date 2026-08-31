@@ -1,5 +1,52 @@
 # DLSS5-Feeder for OpenGL games — plan (rev. 1)
 
+> ## Implementation status — DONE, verified in a game
+>
+> **All five phases are complete.** The 32-bit OpenGL path was verified first, in **Worms Ultimate
+> Mayhem** (32-bit GL, GLUT, 3840x2160, RTX 5090 / driver 616.56) on 2026-08-31: protocol v2
+> handshake as an OpenGL client, host-created shared textures handed over, `feature ready:
+> 3840x2160 DLAA`, and the DLSS 5 add-on reporting `feature 18 created` /
+> `inline feature 18 evaluation succeeded` — 3600+ frames, three clean host restarts with full
+> rebuilds, no GL errors. **Steady-state cost: 0.13 ms/frame of game CPU.**
+>
+> **The in-game answers to §2's unknowns:**
+>
+> * **(a) Yes** — the GL context is current on the `reshade_render_technique` thread; raw GL is
+>   legal there, exactly as fact 3 predicted.
+> * **(b) The technique target is a `GL_TEXTURE_2D`**, colour encoding **`GL_LINEAR`**. So the
+>   texture branch of the blit is the tested one, and the §8 sRGB trap does not arise: the reserved
+>   `gl_srgb` knob was **not** needed and has not been added.
+> * **(c) LumeniteFX Kernel compiles and runs under ReShade's GLSL codegen** — the one unknown with
+>   no design fallback. VORT and the others remain untested on GL.
+> * **(d)** answered for the 32-bit shape (the NR add-on arms in the *host*, which loads ReShade as
+>   `dxgi.dll` — the already-proven case). Still open for a 64-bit GL game, where the add-on would
+>   have to arm in a process where ReShade is `opengl32.dll`.
+> * **(e) No context churn** observed over ~3 minutes of play; the per-frame check cost nothing.
+> * **(f) Design A confirmed in a real game.** Design B (`WGL_NV_DX_interop2`) was never needed and
+>   is not implemented.
+>
+> Remaining gap: **no 64-bit OpenGL game has been run yet.** It shares `feed_gl.h` and the whole
+> transport with the verified 32-bit path, and `spike-gl64.exe` proves the in-process half, but
+> unknown (d) above is genuinely still open for it.
+>
+> ### What landed
+>
+> `src/feed_gl.h`; the 64-bit path (`InitSessionGl`, `MakeSharedTexGl`, `BuildResourcesGl`,
+> `FeedFrameGl`, the `FeedFrame` switch, teardown and `OnDestroyDevice` branches); the 32-bit path
+> by **design A** (protocol v2, host-side `MakeSharedTexHost`, the stub's `BuildSharedGl` /
+> `FeedFrameGl`); both spikes; build, CI, README. `OnCreateDevice` is unchanged, as designed.
+>
+> **Phase-0 spike results** (RTX 5090, driver 616.56, OpenGL 4.6 compatibility context), all green
+> before any game was involved: D3D12 → GL import of a shared texture
+> (`GL_HANDLE_TYPE_D3D12_RESOURCE_EXT`, dedicated memory, `GetResourceAllocationInfo` size) and of
+> both fences (`GL_HANDLE_TYPE_D3D12_FENCE_EXT`) works, and the frame counter crosses **in both
+> directions**, pixel-verified each way, in-process and cross-process.
+>
+> **One deployment lesson worth keeping:** this add-on needs `RESHADE_API_VERSION 20`, i.e. ReShade
+> **6.8+**. The Worms install had 6.7.3 (API 14), which refuses the add-on outright. ReShade ships a
+> single DLL for every API — the installer just renames it — so the cached `dxgi_x86.dll` copied in
+> as `opengl32.dll` is the correct ReShade for an OpenGL game. See DEPLOY-DEV.md §4.
+
 ## Context
 
 DLSS5-Feeder covers D3D11 (private D3D12 device + shared textures), D3D12 (same-device), Vulkan

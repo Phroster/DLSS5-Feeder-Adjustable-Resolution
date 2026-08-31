@@ -8,8 +8,9 @@ per-effect-preprocessor gotchas below) every time.
 
 - **Bitness**: `file <game>.exe` (or check Task Manager once it's running) → 32-bit or 64-bit.
 - **Render API**: 64-bit D3D11/D3D12 → local `dxgi.dll`. Vulkan → machine-wide layer, no
-  local ReShade DLL. D3D9 → needs dgVoodoo2 first (see README "Install for a DirectX 9 game"),
-  out of scope for automated deploy.
+  local ReShade DLL. OpenGL → local `opengl32.dll` (ReShade's OpenGL install), and nothing
+  else: no layer, no hook, no registry. D3D9 → needs dgVoodoo2 first (see README "Install
+  for a DirectX 9 game"), out of scope for automated deploy.
 - **GPU**: DLSS/NGX needs an RTX card. Confirm with
   `Get-CimInstance Win32_VideoController | Select Name` before doing anything else.
 
@@ -151,6 +152,22 @@ overwrite `[ADDON]`/`[GENERAL]`).
   (drive letter changed), an old path for it may already be sitting in `Apps=` pointing at
   a folder that no longer has the exe — harmless to leave, but replace it with the current
   path rather than just appending a duplicate.
+- **OpenGL (64-bit or 32-bit)**: ReShade is a *local* `opengl32.dll` next to the game .exe
+  (matching bitness) — installer, pick the exe, API **OpenGL**, tick "Enable loading of
+  add-ons". Nothing global, nothing to register, and no `AddonPath` needed: add-ons load
+  from ReShade's own directory, which is the game folder. Use `ReShade.ini.d3d` as the
+  template (its `[ADDON]`/`[GENERAL]` sections are API-agnostic).
+  **No separate download needed**: ReShade ships ONE DLL that serves every API and the
+  installer just renames it, so `deploy/reshade-dxgi/dxgi_x86.dll` copied in as
+  `opengl32.dll` is exactly right (verified 2026-08-31: 494 exports, all 24 `wgl*` present,
+  same export shape as a real ReShade OpenGL install).
+  **Check the ReShade version before anything else** — this add-on needs `RESHADE_API_VERSION
+  20`, i.e. ReShade **6.8+**. A pre-existing 6.7.x install (API 14) silently refuses to load
+  the add-on. `(Get-Item opengl32.dll).VersionInfo.FileVersion` settles it in one command;
+  the ReShade version is also the first line of `ReShade.log`.
+  **Check the GPU before blaming the add-on**: on a hybrid laptop the game may be rendering
+  on the iGPU, where the interop extensions do not exist. `dlss5-feed.log` prints
+  `GL_RENDERER` on the session-open line, which settles it in one look.
 
 ## 5. The preprocessor-definition gotcha
 

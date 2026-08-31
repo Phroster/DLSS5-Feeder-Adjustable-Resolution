@@ -22,7 +22,7 @@
 
 # DLSS5-Feeder
 
-**DLSS 5 neural rendering in games that ship without any DLSS — D3D11, D3D12, Vulkan, 32-bit, even DirectX 9.**
+**DLSS 5 neural rendering in games that ship without any DLSS — D3D11, D3D12, Vulkan, OpenGL, 32-bit, even DirectX 9.**
 
 DLSS 5's neural-rendering add-on only works by hooking a game's own DLSS calls. A game that has no
 DLSS never makes those calls, so the add-on sits idle. **DLSS5-Feeder makes the calls itself.** It
@@ -45,11 +45,13 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 - [Install for a 32-bit game](#install-for-a-32-bit-game-beta)
 - [Install for a DirectX 9 game](#install-for-a-directx-9-game-beta)
 - [Install for a Vulkan game](#install-for-a-vulkan-game)
+- [Install for an OpenGL game](#install-for-an-opengl-game)
 - [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider)
 - [How it works](#how-it-works)
   - [The 32-bit path](#the-32-bit-path)
   - [The DirectX 9 path](#the-directx-9-path)
   - [The Vulkan path](#the-vulkan-path)
+  - [The OpenGL path](#the-opengl-path)
 - [Requirements](#requirements)
 - [Configuration](#configuration)
 - [Logs and troubleshooting](#logs-and-troubleshooting)
@@ -60,7 +62,7 @@ game frame → ReShade effects → [motion vectors] → [DLSS5_Feed] → DLSS5-F
 
 ## Status
 
-Proven working in six games covering every supported path:
+Proven working in seven games covering every supported path:
 
 | Game | Bitness / API | Result |
 | --- | --- | --- |
@@ -70,6 +72,7 @@ Proven working in six games covering every supported path:
 | **BioShock Remastered** | 32-bit D3D11 (D3D9→D3D11 wrapper) | 4K, Luma HDR |
 | **Fable Anniversary** | 32-bit **D3D9** via dgVoodoo2 | 1440p, 60 fps |
 | **DOOM (2016)** | 64-bit **Vulkan** | 4K, D3D12 evaluate via cross-API interop |
+| **Worms Ultimate Mayhem** | 32-bit **OpenGL** | 4K, GL↔D3D12 interop + cross-process host, 0.13 ms/frame |
 
 In each, the DLSS 5 add-on reports `feature 18 created … inline feature 18 evaluation succeeded`,
 driven entirely by ReShade depth + estimated motion vectors.
@@ -77,6 +80,13 @@ driven entirely by ReShade depth + estimated motion vectors.
 It is not game-specific: any D3D11, D3D12 or Vulkan game with a working ReShade depth buffer and a
 motion vector provider should work — 64-bit directly, 32-bit via a bundled 64-bit helper process,
 D3D9 via a wrapper.
+
+**The OpenGL path is verified 32-bit-first**, which is the harder of its two halves: Worms Ultimate
+Mayhem runs the full cross-process route — the host creates the shared textures (GL memory objects
+are import-only), the game imports them raw and answers on a shared D3D12 fence. The 64-bit
+in-process OpenGL path shares that same `src/feed_gl.h` transport and is proven by
+`spike\spike-gl64.exe`, but has no game row of its own yet. See
+[The OpenGL path](#the-opengl-path) and [`PLAN-OPENGL.md`](PLAN-OPENGL.md).
 
 **This is beta software.** Expect the temporal quality of *estimated* motion vectors (some ghosting
 in fast motion, softness on thin moving geometry), and the HUD is processed along with the scene.
@@ -239,6 +249,30 @@ layer\run-with-feed-layer.bat "E:\path\to\game.exe"
 
 See [`layer/README.md`](layer/README.md). It does the same job from outside the process.
 
+## Install for an OpenGL game
+
+The simplest of the four. There is no hook, no layer and no registry entry — OpenGL has no
+creation-time opt-in for the interop extensions the transport needs, so if the driver has them,
+they are simply there.
+
+1. **ReShade for OpenGL is a local `opengl32.dll` next to the game exe.** Run ReShade's installer,
+   pick the game's `.exe`, choose **OpenGL**, and tick **"Enable loading of add-ons"**. Add-ons are
+   then discovered automatically from ReShade's own directory — the game folder.
+2. **Everything else is identical to the [64-bit instructions](#install-for-a-64-bit-game)** —
+   `dlss5-feed.addon64`, `DLSS5_Feed.fx`, a motion-vector provider, `renodx-dlss5.addon64` and the
+   `nvngx_*.dll` files, all next to the game `.exe`. The DLSS evaluate runs on a private D3D12
+   device (see [The OpenGL path](#the-opengl-path)); nothing extra is needed for that.
+
+For a **32-bit** OpenGL game, install the 32-bit ReShade (`opengl32.dll`, x86) plus
+`dlss5-feed.addon32` and the **`host64\`** folder exactly as in
+[Install for a 32-bit game](#install-for-a-32-bit-game-beta) — the helper, its bundled 64-bit
+ReShade and the DLSS 5 add-on live in there, unchanged. Install both halves from the same release:
+the two speak a versioned protocol and refuse a mismatched pair rather than misbehaving.
+
+> **Hybrid laptops:** force the game onto the NVIDIA GPU (Windows **Settings ▸ Display ▸ Graphics**,
+> or the NVIDIA control panel). On the integrated GPU the interop extensions do not exist, and the
+> feed disables itself with a message saying exactly that — DLSS could not have run there anyway.
+
 ## Motion vectors: choosing a provider
 
 DLSS5-Feeder does not estimate motion itself — it reads the output of a motion-vector shader you
@@ -375,11 +409,64 @@ loading style lands in the hook, above ReShade's own layer, which then passes th
 down. The hook is removed on DLL unload, since ReShade reloads add-ons per Vulkan instance.
 [`layer/VkLayer_feed_vk.dll`](layer/README.md) does the same from outside the process, as a fallback.
 
+### The OpenGL path
+
+Same shape as the Vulkan path — a private D3D12 device creates the shared textures and fences, and
+the game's API imports them — but everything the Vulkan path had to fight for comes free here, and
+one thing it could rely on does not exist.
+
+**What comes free.** There is no device hook and no layer. Vulkan bakes extensions in at
+`vkCreateDevice`, which is why the add-on has to hook that call; OpenGL has no equivalent opt-in —
+extensions are a property of the driver's context, resolved at runtime through `wglGetProcAddress`.
+If `GL_EXT_memory_object_win32` and `GL_EXT_semaphore_win32` are in the extension string, the
+transport works. If they are not, the frame is not being rendered on an NVIDIA GPU, so DLSS could
+not run either way and the feed says so and stops. Add-on discovery is also a non-question: ReShade
+*is* the local `opengl32.dll`, and add-ons load from its own directory.
+
+**What does not exist.** On Vulkan, ReShade's `api::fence` *is* a `VkSemaphore`, so the imported
+objects could be handed back and every queue operation kept inside ReShade's locks. On OpenGL an
+`api::fence` is documented as "an opaque value" — there is no way to wrap a raw GL semaphore into
+one. So the whole per-frame GL side is raw ([`src/feed_gl.h`](src/feed_gl.h)), which is safe here
+precisely where it was not on Vulkan: **OpenGL has no queue object.** Every command enters the
+current context's single in-order stream on the calling thread, and `reshade_render_technique` fires
+while ReShade is itself issuing GL commands on that thread and context. Our calls interleave in
+program order — there is no lock to bypass, and no barriers are needed at all.
+
+Per frame, inside the technique callback:
+
+* `glCopyImageSubData` copies the motion vectors, depth and trust mask into our imported aliases
+  (exact formats, no state touched); the colour is captured with `glBlitFramebuffer`, which converts
+  formats and channel order and can read what a raw copy cannot — a renderbuffer or the default
+  framebuffer.
+* `glSemaphoreParameterui64vEXT(GL_D3D12_FENCE_VALUE_EXT)` + `glSignalSemaphoreEXT` + `glFlush`
+  hands the frame to D3D12 (a D3D12 fence *is* a GL "D3D12 fence" semaphore, so the counter crosses
+  unchanged). The flush matters: without it the signal can sit in the client command buffer while
+  D3D12's GPU-side wait starves.
+* D3D12 waits, evaluates, and signals back — or CPU-signals on any failure, because
+  `glWaitSemaphoreEXT` has **no timeout** and a missing signal would hang the GL stream.
+* `glWaitSemaphoreEXT` stalls the GL stream on the GPU (never the CPU), and a final blit puts the
+  output back over the technique's render target.
+
+A small state guard saves and restores exactly what the blits touch — the two framebuffer bindings,
+the read/draw buffer selection, scissor and `GL_FRAMEBUFFER_SRGB` — and nothing else. `GL_FRAMEBUFFER_SRGB`
+is forced **off** for our blits on purpose: the frame we are handed is already encoded, and an sRGB
+encode on the way home is the OpenGL flavour of the washed-out image of issue #11.
+
+Because GL has no sized BGRA8 internal format and we choose the shared textures' formats, the GL
+path folds `B8G8R8A8`/`B8G8R8X8` to `R8G8B8A8` — harmless, because a blit is component-wise rather
+than byte-order-preserving. GL names live in the share group of the context current at import, so
+every frame checks `wglGetCurrentContext()` and rebuilds the session if the game switched contexts.
+
+The 32-bit OpenGL path uses the very same header, compiled x86, over the existing helper-process
+protocol — with one change forced by the API: **the host creates the shared textures**, because GL
+memory objects are import-only and a GL process cannot export one. Both directions
+(x86 extension parity, cross-process D3D12→GL import) are proven by `spike\spike-gl32.exe`.
+
 ## Requirements
 
 | Piece | Notes |
 | --- | --- |
-| D3D11, D3D12 or Vulkan game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan works out of the box (the add-on adds the interop extensions itself; [a small bundled layer](#install-for-a-vulkan-game) is the fallback). D3D10 is not supported. |
+| D3D11, D3D12, Vulkan or OpenGL game, 32- or 64-bit | NGX is 64-bit only, hence the helper process for 32-bit games. D3D9 works through [dgVoodoo2](#install-for-a-directx-9-game-beta); Vulkan works out of the box (the add-on adds the interop extensions itself; [a small bundled layer](#install-for-a-vulkan-game) is the fallback); OpenGL needs nothing extra at all, but the game must be rendering on the NVIDIA GPU (see [Install for an OpenGL game](#install-for-an-opengl-game)). D3D10 is not supported. |
 | ReShade 6.8+ **with add-on support** | Generic Depth add-on enabled and picking the scene depth. |
 | DLSS 5 neural-rendering add-on (`renodx-dlss5.addon64`) + `nvngx_dlssnr.dll` | from its own author; this project does not include it. |
 | `nvngx_dlss.dll` | a DLSS Super Resolution runtime next to the game (the driver's copy is used otherwise). |
@@ -469,6 +556,14 @@ Common cases:
   `dlss5-feed.log` say whether the hook was not installed, never reached, or what the driver
   refused. Fallback: launch via `layer\run-with-feed-layer.bat` (see
   [`layer/README.md`](layer/README.md)); `feed-vk-layer.log` next to the DLL shows what it added.
+* **OpenGL game: "the OpenGL interop extensions are missing on the rendering GPU"** — the log line
+  above it names the exact extension that was absent and prints `GL_RENDERER`. If that says anything
+  other than an NVIDIA GPU, the game is rendering on the wrong adapter: force it onto the NVIDIA one
+  (Windows **Settings ▸ Display ▸ Graphics**) and restart it. There is no fallback for this and
+  there cannot be one — DLSS itself needs that GPU.
+* **32-bit game: "the host64\ folder is from a different release"** — the add-on and the helper
+  speak a versioned protocol (v2 added the OpenGL client kind). Reinstall both halves from the same
+  release rather than mixing them.
 * **DLSS 5 panel stuck in STANDBY** — the add-on missed the first create; the built-in warm-up
   re-creates the feature a few seconds in, which normally clears it.
 
@@ -486,7 +581,7 @@ under `external/reshade/include` (BSD-3-Clause, Patrick Mours), as is **MinHook*
 | `build-addon32.bat` | `build\dlss5-feed.addon32` | ReShade headers only |
 | `host\build-host.bat` | `host\dlss5-feed-host64.exe` | NGX SDK |
 | `layer\build-layer.bat` | `layer\VkLayer_feed_vk.dll` (fallback for Vulkan games where the add-on's own `vkCreateDevice` hook cannot add the interop extensions) | Vulkan headers |
-| `spike\build-spike.bat` | the standalone 32↔64-bit shared-resource proof used during development | — |
+| `spike\build-spike.bat` | the standalone proofs used during development: the 32↔64-bit shared-resource pair, plus `spike-gl64.exe` / `spike-gl32.exe`, which round-trip a texture and a fence between D3D12 and OpenGL, in-process and cross-process. They need an NVIDIA GPU to *run*, none to compile. | — |
 
 NGX links against the Release CRT, so the builds use `/MD`.
 
@@ -503,7 +598,7 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
 
 * **DLAA contract, optional reduced work extent on 64-bit D3D11** — render resolution still
   equals DLAA output resolution, but the private work extent can be 50–100% of the native
-  backbuffer and is spatially expanded afterward. D3D12, Vulkan and 32-bit paths remain at
+  backbuffer and is spatially expanded afterward. D3D12, Vulkan, OpenGL and 32-bit paths remain at
   100%. This is not jittered DLSS Super Resolution.
 * Estimated motion vectors → temporal artifacts in fast motion; the UI is processed with the scene
   (a UI mask / pre-UI colour capture is future work).

@@ -1,0 +1,146 @@
+name: build
+
+# Every target in this repository is Windows/MSVC, so this is a single Windows job.
+# It exists to catch the ordinary things a pull request can break -- a missing
+# include, a signature that no longer matches its callers, a 32-bit-only overflow --
+# before anyone has to install ReShade and launch a game.
+#
+# What it deliberately does NOT do is run anything. DLSS needs an RTX GPU, an NGX
+# runtime and a real swapchain, and a hosted runner has none of those. A green tick
+# here means "it compiles and links", nothing more; the games table in the README
+# still has to be earned by hand.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------
+      # Third-party headers the repository deliberately does not vendor.
+      # Both live in public repositories, so this also works for pull
+      # requests from forks, which get no secrets.
+      # ------------------------------------------------------------------
+      - name: Resolve dependency revisions
+        id: deps
+        shell: bash
+        run: |
+          set -euo pipefail
+          ngx=$(git ls-remote https://github.com/NVIDIA/DLSS.git HEAD | cut -f1)
+          vk=$(git ls-remote https://github.com/KhronosGroup/Vulkan-Headers.git HEAD | cut -f1)
+          echo "ngx=$ngx" >> "$GITHUB_OUTPUT"
+          echo "vk=$vk"   >> "$GITHUB_OUTPUT"
+          echo "NGX $ngx / Vulkan-Headers $vk"
+
+      - name: Cache external headers
+        id: cache-external
+        uses: actions/cache@v4
+        with:
+          path: |
+            external/ngx
+            external/vulkan
+          key: external-${{ runner.os }}-ngx-${{ steps.deps.outputs.ngx }}-vk-${{ steps.deps.outputs.vk }}
+
+      - name: Fetch the NGX SDK
+        if: steps.cache-external.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The DLSS repository also carries the runtime DLLs, which are large and
+          # which this build does not need; a blobless sparse checkout pulls just
+          # the headers and the import library we link against.
+          git clone --filter=blob:none --no-checkout --depth 1 \
+              https://github.com/NVIDIA/DLSS.git "$RUNNER_TEMP/dlss"
+          git -C "$RUNNER_TEMP/dlss" sparse-checkout set --no-cone '/include/**' '/lib/**'
+          git -C "$RUNNER_TEMP/dlss" checkout
+
+          # Located rather than hardcoded: NVIDIA has moved these between releases,
+          # and a named failure here beats a confusing C1083 three steps later.
+          mkdir -p external/ngx/libs
+          find "$RUNNER_TEMP/dlss" -name 'nvsdk_ngx*.h' -exec cp {} external/ngx/ ';'
+          lib=$(find "$RUNNER_TEMP/dlss" -name 'nvsdk_ngx_d.lib' -path '*x86_64*' | head -n1)
+          if [ -z "$lib" ]; then
+            echo "::error::nvsdk_ngx_d.lib not found in the NVIDIA/DLSS checkout"
+            find "$RUNNER_TEMP/dlss" -name '*.lib'
+            exit 1
+          fi
+          cp "$lib" external/ngx/libs/
+          for h in nvsdk_ngx.h nvsdk_ngx_helpers.h nvsdk_ngx_defs.h; do
+            if [ ! -f "external/ngx/$h" ]; then
+              echo "::error::missing NGX header $h"
+              exit 1
+            fi
+          done
+          ls -l external/ngx external/ngx/libs
+
+      - name: Fetch the Vulkan headers
+        if: steps.cache-external.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/KhronosGroup/Vulkan-Headers.git "$RUNNER_TEMP/vkh"
+          mkdir -p external/vulkan/vulkan external/vulkan/vk_video
+          cp "$RUNNER_TEMP/vkh"/include/vulkan/*.h   external/vulkan/vulkan/
+          cp "$RUNNER_TEMP/vkh"/include/vk_video/*.h external/vulkan/vk_video/
+
+      # ------------------------------------------------------------------
+      # The builds. Each script finds its own toolchain through
+      # tools\vcvars.bat, so nothing here hardcodes a Visual Studio path.
+      # ------------------------------------------------------------------
+      - name: dlss5-feed.addon64 (64-bit add-on -- D3D11/D3D12/Vulkan + NGX)
+        shell: cmd
+        run: call build.bat
+
+      - name: dlss5-feed.addon32 (32-bit in-game half)
+        shell: cmd
+        run: call build-addon32.bat
+
+      - name: dlss5-feed-host64.exe (64-bit NGX host for 32-bit games)
+        shell: cmd
+        run: call host\build-host.bat
+
+      - name: VkLayer_feed_vk.dll (Vulkan interop layer)
+        shell: cmd
+        run: call layer\build-layer.bat
+
+      - name: spike (phase-0 cross-process sharing probe)
+        shell: cmd
+        run: call spike\build-spike.bat
+
+      # ------------------------------------------------------------------
+      # Artifacts, so a reviewer can try a pull request without installing
+      # MSVC and the NGX SDK first.
+      # ------------------------------------------------------------------
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cp build/dlss5-feed.addon64   artifacts/
+          cp build/dlss5-feed.addon32   artifacts/
+          cp host/dlss5-feed-host64.exe artifacts/
+          cp layer/VkLayer_feed_vk.dll  artifacts/
+          cp layer/VkLayer_feed_vk.json artifacts/
+          cp shaders/DLSS5_Feed.fx      artifacts/
+          ls -l artifacts
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dlss5-feeder-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error

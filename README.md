@@ -466,6 +466,15 @@ under `external/reshade/include` (BSD-3-Clause, Patrick Mours), as is **MinHook*
 
 NGX links against the Release CRT, so the builds use `/MD`.
 
+Each script picks up its toolchain through `toolscvars.bat`, which asks `vswhere` for the latest
+Visual Studio install with the C++ tools and falls back to a fixed BuildTools path. Set `VCVARSALL`
+to your own `vcvarsall.bat` to override it.
+
+**CI** — `.github/workflows/build.yml` builds all five targets on every pull request, fetching the
+NGX SDK and the Vulkan headers from their upstream repositories, and uploads the binaries as a
+workflow artifact. It only proves the tree compiles and links: DLSS needs an RTX GPU and a real
+swapchain, so nothing in the table under [Status](#status) can be verified there.
+
 ## Limitations and roadmap
 
 * **DLAA only** — render resolution = output resolution = the game's backbuffer. No upscaling perf

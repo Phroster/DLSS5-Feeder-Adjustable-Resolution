@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-call "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" >nul
+call "%~dp0tools\vcvars.bat" x64 || exit /b 1
 if not exist build mkdir build
 rc /nologo /fo build\version.res src\version.rc
 rem MinHook (external\minhook, BSD-2) backs the vkCreateDevice hook in src\feed_vk_hook.h.

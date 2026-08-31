@@ -101,6 +101,12 @@ jobs:
           cp "$RUNNER_TEMP/vkh"/include/vulkan/*.h   external/vulkan/vulkan/
           cp "$RUNNER_TEMP/vkh"/include/vk_video/*.h external/vulkan/vk_video/
 
+      - name: Validate Vulkan layer manifests
+        shell: pwsh
+        run: |
+          Get-Content layer/VkLayer_feed_vk.json -Raw | ConvertFrom-Json | Out-Null
+          Get-Content layer/x86/VkLayer_feed_vk32.json -Raw | ConvertFrom-Json | Out-Null
+
       # ------------------------------------------------------------------
       # The builds. Each script finds its own toolchain through
       # tools\vcvars.bat, so nothing here hardcodes a Visual Studio path.
@@ -139,6 +145,7 @@ jobs:
           cp host/dlss5-feed-host64.exe artifacts/
           cp layer/VkLayer_feed_vk.dll  artifacts/
           cp layer/VkLayer_feed_vk.json artifacts/
+          cp layer/run-with-feed-layer.bat artifacts/
           # The 32-bit layer keeps its own subdirectory: the Vulkan loader tries every
           # manifest on VK_LAYER_PATH, so the two must never share one.
           mkdir -p artifacts/x86

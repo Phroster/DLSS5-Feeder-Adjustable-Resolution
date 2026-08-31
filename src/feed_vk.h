@@ -289,6 +289,22 @@ static void FeedVkBlitImage(FeedVk *vk, VkCommandBuffer cb, VkImage src, VkImage
     vk->CmdBlitImage(cb, src, src_layout, dst, dst_layout, 1, &bl, VK_FILTER_NEAREST);
 }
 
+// Scale between independently sized images. Color/output use LINEAR while guide
+// textures use NEAREST. The exact-size helper above is intentionally retained for
+// the proven 100% path (particularly its sRGB-safe raw-copy preference).
+static void FeedVkBlitImageScaled(FeedVk *vk, VkCommandBuffer cb, VkImage src, VkImageLayout src_layout,
+                                  VkImage dst, VkImageLayout dst_layout,
+                                  UINT src_w, UINT src_h, UINT dst_w, UINT dst_h,
+                                  VkFilter filter)
+{
+    VkImageBlit bl = {};
+    bl.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    bl.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+    bl.srcOffsets[1]  = { static_cast<int32_t>(src_w), static_cast<int32_t>(src_h), 1 };
+    bl.dstOffsets[1]  = { static_cast<int32_t>(dst_w), static_cast<int32_t>(dst_h), 1 };
+    vk->CmdBlitImage(cb, src, src_layout, dst, dst_layout, 1, &bl, filter);
+}
+
 // DXGI_FORMAT -> VkFormat for the shared-resource formats this project uses.
 static VkFormat FeedVkFormat(DXGI_FORMAT f)
 {

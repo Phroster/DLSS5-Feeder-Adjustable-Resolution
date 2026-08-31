@@ -48,7 +48,7 @@
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 
-#define FEED_VERSION "0.8.0-beta.1"
+#define FEED_VERSION "0.8.0-beta.1-ar.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -215,6 +215,7 @@ static bool CfgReload()   // true when a build-affecting value changed
     if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
     const bool rebuild = next.mode != g_cfg.mode || next.hdr != g_cfg.hdr ||
                          next.depth_inverted != g_cfg.depth_inverted || next.flags != g_cfg.flags ||
+                         next.work_resolution != g_cfg.work_resolution ||
                          next.mv_scale_x != g_cfg.mv_scale_x || next.mv_scale_y != g_cfg.mv_scale_y;
     const bool changed = memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
     if (changed)
@@ -1120,15 +1121,16 @@ static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DX
 // unchanged -- the host's 'B' and 'F' handlers do not care which API asked.
 // ---------------------------------------------------------------------------
 
-static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handle)
+static bool BuildSharedGl(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
+                          DXGI_FORMAT bb_fmt, uint64_t rtv_handle)
 {
     Breadcrumb("building the shared textures (OpenGL)");
     ReleaseShared();
 
     g.width  = w;
     g.height = h;
-    g.backbuffer_width  = w;   // v1 GL is DLAA at 100%: no work-resolution scaling
-    g.backbuffer_height = h;
+    g.backbuffer_width  = backbuffer_w;
+    g.backbuffer_height = backbuffer_h;
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = GlSafeColorFormat(TypedColorFormat(bb_fmt));
     g.output_fmt = g_cfg.mode == 1 ? g.color_fmt : GlSafeColorFormat(OutputFormatFor(g.color_fmt));
@@ -1148,8 +1150,12 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
     b.depth_inverted = inverted ? 1 : 0;
     b.flags_override = g_cfg.flags;
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
-    b.mv_scale_x     = g_cfg.mv_scale_x;
-    b.mv_scale_y     = g_cfg.mv_scale_y;
+    // DLSS5_MV stores vectors in native-backbuffer pixels. Unlike D3D11, GL does
+    // not run a shader that can multiply every resampled vector, so fold the
+    // native->work conversion into NGX's vector scale instead. This is exactly
+    // equivalent and leaves the texture itself point-resampled at object edges.
+    b.mv_scale_x     = g_cfg.mv_scale_x * static_cast<float>(w) / static_cast<float>(backbuffer_w);
+    b.mv_scale_y     = g_cfg.mv_scale_y * static_cast<float>(h) / static_cast<float>(backbuffer_h);
     // b.tex stays zero: on this path the host creates, and answers with its handles.
 
     Breadcrumb("asking the host to build (OpenGL)");
@@ -1227,8 +1233,11 @@ static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handl
             ty, enc == GL_SRGB ? "GL_SRGB" : enc == GL_LINEAR ? "GL_LINEAR" : "unknown");
     }
 
-    Log("[feed32] shared set ready (OpenGL): %ux%u color fmt=%u output fmt=%u (host ngx 0x%08X, %s)",
-        w, h, g.color_fmt, g.output_fmt, ack.ngx_result, g_cfg.mode == 1 ? "transport" : "DLSS");
+    Log("[feed32] shared set ready (OpenGL): %ux%u (%d%% of %ux%u) color fmt=%u output fmt=%u "
+        "mv scale=%.3f,%.3f (host ngx 0x%08X, %s)",
+        w, h, g_cfg.work_resolution, backbuffer_w, backbuffer_h,
+        g.color_fmt, g.output_fmt, b.mv_scale_x, b.mv_scale_y,
+        ack.ngx_result, g_cfg.mode == 1 ? "transport" : "DLSS");
     g.built      = true;
     g.need_reset = true;
     g.consecutive_fails = 0;
@@ -1284,15 +1293,15 @@ static bool EnsureVulkanLoaded(reshade::api::effect_runtime *rt)
     return false;
 }
 
-static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
+static bool BuildSharedVk(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DXGI_FORMAT bb_fmt)
 {
     Breadcrumb("building the shared textures (Vulkan)");
     ReleaseShared();
 
     g.width  = w;
     g.height = h;
-    g.backbuffer_width  = w;   // v1 Vulkan is DLAA at 100%: no work-resolution scaling
-    g.backbuffer_height = h;
+    g.backbuffer_width  = backbuffer_w;
+    g.backbuffer_height = backbuffer_h;
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = FeedFmtTypedColor(bb_fmt);
     if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
@@ -1319,8 +1328,10 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     b.depth_inverted = inverted ? 1 : 0;
     b.flags_override = g_cfg.flags;
     b.transport      = g_cfg.mode == 1 ? 1 : 0;
-    b.mv_scale_x     = g_cfg.mv_scale_x;
-    b.mv_scale_y     = g_cfg.mv_scale_y;
+    // The shared MV image is point-resampled but still contains native-pixel
+    // magnitudes. Apply the work/native ratio through NGX's vector scale.
+    b.mv_scale_x     = g_cfg.mv_scale_x * static_cast<float>(w) / static_cast<float>(backbuffer_w);
+    b.mv_scale_y     = g_cfg.mv_scale_y * static_cast<float>(h) / static_cast<float>(backbuffer_h);
     // b.tex stays zero: on this path the host creates, and answers with its handles.
 
     Breadcrumb("asking the host to build (Vulkan)");
@@ -1393,13 +1404,17 @@ static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         }
     }
 
+    const bool scaled_output = w != backbuffer_w || h != backbuffer_h;
     Log("[feed32] copy home: %s (output %s -> backbuffer %s)",
+        scaled_output ? "vkCmdBlitImage (SCALES)" :
         FeedFmtSameTexelLayout(g.output_fmt, bb_fmt) ? "raw vkCmdCopyImage"
                                                      : "vkCmdBlitImage (CONVERTS: expect issue #11 washout)",
         FeedFmtName(g.output_fmt), FeedFmtName(bb_fmt));
-    Log("[feed32] shared set ready (Vulkan): %ux%u color %s output %s (host ngx 0x%08X, %s)",
-        w, h, FeedFmtName(g.color_fmt), FeedFmtName(g.output_fmt), ack.ngx_result,
-        g_cfg.mode == 1 ? "transport" : "DLSS");
+    Log("[feed32] shared set ready (Vulkan): %ux%u (%d%% of %ux%u) color %s output %s "
+        "mv scale=%.3f,%.3f (host ngx 0x%08X, %s)",
+        w, h, g_cfg.work_resolution, backbuffer_w, backbuffer_h,
+        FeedFmtName(g.color_fmt), FeedFmtName(g.output_fmt), b.mv_scale_x, b.mv_scale_y,
+        ack.ngx_result, g_cfg.mode == 1 ? "transport" : "DLSS");
     g.built      = true;
     g.need_reset = true;
     g.consecutive_fails = 0;
@@ -1624,6 +1639,7 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
 
+    if (ApplyPendingWorkResolution()) g.built = false;
     if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
 
@@ -1706,16 +1722,21 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
 
     const DXGI_FORMAT bbf = have_bb_desc ? static_cast<DXGI_FORMAT>(cd.texture.format)
                                          : DXGI_FORMAT_R8G8B8A8_UNORM;
+    const UINT work_w = ScaledExtent(w, g_cfg.work_resolution);
+    const UINT work_h = ScaledExtent(h, g_cfg.work_resolution);
     bool ok = true;
-    if (!g.built || w != g.width || h != g.height || bbf != g.bb_fmt)
+    if (!g.built || work_w != g.width || work_h != g.height ||
+        w != g.backbuffer_width || h != g.backbuffer_height || bbf != g.bb_fmt)
     {
         if (GetTickCount64() < g_retry_at)
             ok = false;                       // backing off after a failed build
         else
         {
-            Log("[feed32] building: %ux%u backbuffer fmt=%u (OpenGL, depth reversed=%d, mode=%d)",
-                w, h, bbf, g.depth_reversed ? 1 : 0, g_cfg.mode);
-            ok = BuildSharedGl(w, h, bbf, bb_res.handle);
+            Log("[feed32] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer fmt=%u "
+                "(OpenGL, depth reversed=%d, mode=%d)",
+                work_w, work_h, g_cfg.work_resolution, w, h, bbf,
+                g.depth_reversed ? 1 : 0, g_cfg.mode);
+            ok = BuildSharedGl(work_w, work_h, w, h, bbf, bb_res.handle);
             if (ok) g.consecutive_fails = 0;
             else if (!g.disabled) FeedFail("shared build");
         }
@@ -1729,14 +1750,37 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
             FeedGlStateGuard guard(&g.gl);
 
             Breadcrumb("copying inputs (OpenGL)");
-            FeedGlCopy(&g.gl, FeedGlHandleName(mv_res.handle),    g.gl_tex[FEED_MV],    w, h);
-            FeedGlCopy(&g.gl, FeedGlHandleName(depth_res.handle), g.gl_tex[FEED_DEPTH], w, h);
-            if (!FeedGlBlit(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
-                            bb_res.handle, false, g.gl_tex[FEED_COLOR], true, w, h))
+            const bool scaled = g.width != w || g.height != h;
+            bool captured = false;
+            if (!scaled)
+            {
+                // Preserve the established 100% path exactly: exact-format guide
+                // copies, and the same nearest colour blit used before scaling existed.
+                FeedGlCopy(&g.gl, FeedGlHandleName(mv_res.handle),    g.gl_tex[FEED_MV],    w, h);
+                FeedGlCopy(&g.gl, FeedGlHandleName(depth_res.handle), g.gl_tex[FEED_DEPTH], w, h);
+                captured = FeedGlBlit(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
+                                      bb_res.handle, false, g.gl_tex[FEED_COLOR], true, w, h);
+            }
+            else
+            {
+                // Colour is continuous; guides are not. Point sampling avoids
+                // inventing a depth surface or blending vectors across silhouettes.
+                captured = FeedGlBlitScaled(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
+                                             mv_res.handle, false, g.gl_tex[FEED_MV], true,
+                                             w, h, g.width, g.height, GL_NEAREST) &&
+                           FeedGlBlitScaled(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
+                                             depth_res.handle, false, g.gl_tex[FEED_DEPTH], true,
+                                             w, h, g.width, g.height, GL_NEAREST) &&
+                           FeedGlBlitScaled(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
+                                             bb_res.handle, false, g.gl_tex[FEED_COLOR], true,
+                                             w, h, g.width, g.height, GL_LINEAR);
+            }
+            if (!captured)
             {
                 static bool said = false;
-                if (!said) { said = true; Log("[feed32] the colour capture blit could not be set up (incomplete framebuffer)"); }
-                FeedFail("colour capture");
+                if (!said) { said = true; Log("[feed32] an OpenGL input resample could not be set up (incomplete framebuffer)"); }
+                FeedFail("input resample");
+                g.built = false;
                 QueryPerformanceCounter(&t1);
                 TimingTick(t0.QuadPart, t1.QuadPart);
                 return;
@@ -1761,12 +1805,25 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
                 const GLuint outputs[1] = { g.gl_tex[FEED_OUTPUT] };
                 FeedGlWait(&g.gl, g.gl_sem_out, n, outputs, 1);   // server-side; the host CPU-signals on failure
                 g.fence_wait_queued = true;                       // HostDrain must resolve this before any close
-                FeedGlBlit(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
-                           g.gl_tex[FEED_OUTPUT], true, bb_res.handle, false, w, h);
-                const UINT64 done = ++g.frames_done;
-                g.consecutive_fails = 0;
-                if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
-                    Log("[feed32] frame %llu delivered (%ux%u, reset=%d, OpenGL)", done, g.width, g.height, reset);
+                const bool copied_home = scaled
+                    ? FeedGlBlitScaled(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
+                                       g.gl_tex[FEED_OUTPUT], true, bb_res.handle, false,
+                                       g.width, g.height, w, h, GL_LINEAR)
+                    : FeedGlBlit(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
+                                 g.gl_tex[FEED_OUTPUT], true, bb_res.handle, false, w, h);
+                if (!copied_home)
+                {
+                    FeedFail("output expansion");
+                    g.built = false;
+                }
+                else
+                {
+                    const UINT64 done = ++g.frames_done;
+                    g.consecutive_fails = 0;
+                    if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                        Log("[feed32] frame %llu delivered (%ux%u -> %ux%u, reset=%d, OpenGL)",
+                            done, g.width, g.height, w, h, reset);
+                }
             }
 
             if (g.frames_done <= static_cast<UINT64>(g_cfg.log_frames))
@@ -1792,6 +1849,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
 
+    if (ApplyPendingWorkResolution()) g.built = false;
     if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
 
@@ -1853,16 +1911,21 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     if (!EnsureVulkanLoaded(rt)) return;
 
     const DXGI_FORMAT bbf = static_cast<DXGI_FORMAT>(cd.texture.format);
+    const UINT work_w = ScaledExtent(w, g_cfg.work_resolution);
+    const UINT work_h = ScaledExtent(h, g_cfg.work_resolution);
     bool ok = true;
-    if (!g.built || w != g.width || h != g.height || bbf != g.bb_fmt)
+    if (!g.built || work_w != g.width || work_h != g.height ||
+        w != g.backbuffer_width || h != g.backbuffer_height || bbf != g.bb_fmt)
     {
         if (GetTickCount64() < g_retry_at)
             ok = false;                       // backing off after a failed build
         else
         {
-            Log("[feed32] building: %ux%u backbuffer %s (Vulkan, depth reversed=%d, mode=%d)",
-                w, h, FeedFmtName(bbf), g.depth_reversed ? 1 : 0, g_cfg.mode);
-            ok = BuildSharedVk(w, h, bbf);
+            Log("[feed32] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer %s "
+                "(Vulkan, depth reversed=%d, mode=%d)",
+                work_w, work_h, g_cfg.work_resolution, w, h, FeedFmtName(bbf),
+                g.depth_reversed ? 1 : 0, g_cfg.mode);
+            ok = BuildSharedVk(work_w, work_h, w, h, bbf);
             if (ok) g.consecutive_fails = 0;
             else if (!g.disabled) FeedFail("shared build");
         }
@@ -1897,9 +1960,30 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                                                  resource_usage::copy_source };
                 cl->barrier(3, res, from, to);
             }
-            FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[FEED_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
-            FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[FEED_MV],    VK_IMAGE_LAYOUT_GENERAL, w, h);
-            FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[FEED_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
+            const bool scaled = g.width != w || g.height != h;
+            if (!scaled)
+            {
+                // Preserve the proven 100% path, especially the raw colour copy
+                // that avoids Vulkan's sRGB conversion on a blit.
+                FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                g.vk_img[FEED_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
+                FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                g.vk_img[FEED_MV], VK_IMAGE_LAYOUT_GENERAL, w, h);
+                FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                g.vk_img[FEED_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
+            }
+            else
+            {
+                FeedVkBlitImageScaled(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                      g.vk_img[FEED_COLOR], VK_IMAGE_LAYOUT_GENERAL,
+                                      w, h, g.width, g.height, VK_FILTER_LINEAR);
+                FeedVkBlitImageScaled(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                      g.vk_img[FEED_MV], VK_IMAGE_LAYOUT_GENERAL,
+                                      w, h, g.width, g.height, VK_FILTER_NEAREST);
+                FeedVkBlitImageScaled(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                      g.vk_img[FEED_DEPTH], VK_IMAGE_LAYOUT_GENERAL,
+                                      w, h, g.width, g.height, VK_FILTER_NEAREST);
+            }
 
             // Park the backbuffer as copy_dest to receive the result; hand mv/depth back.
             {
@@ -1935,7 +2019,11 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 // swapchain re-encodes it and the frame comes back washed out (issue #11).
                 // The frame we were handed is already encoded; the bytes must go home
                 // untouched. The blit stays only for layouts a raw copy cannot express.
-                if (FeedFmtSameTexelLayout(g.output_fmt, g.bb_fmt))
+                if (scaled)
+                    FeedVkBlitImageScaled(&g.vk, cb, g.vk_img[FEED_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                          bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                          g.width, g.height, w, h, VK_FILTER_LINEAR);
+                else if (FeedFmtSameTexelLayout(g.output_fmt, g.bb_fmt))
                     FeedVkCopyImage(&g.vk, cb, g.vk_img[FEED_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
                                     bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
                 else
@@ -1959,7 +2047,8 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 const UINT64 done = ++g.frames_done;
                 g.consecutive_fails = 0;
                 if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
-                    Log("[feed32] frame %llu delivered (%ux%u, reset=%d, Vulkan)", done, g.width, g.height, reset);
+                    Log("[feed32] frame %llu delivered (%ux%u -> %ux%u, reset=%d, Vulkan)",
+                        done, g.width, g.height, w, h, reset);
             }
         }
     }
@@ -2298,36 +2387,21 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     static const char *kModes[] = { "Inert", "Transport test (no NGX, left half only)", "Full DLSS path" };
     if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) dirty = true;
 
-    // Below 100% the guides have to be resampled into the shared set, which is a
-    // D3D11 pixel-shader pass this add-on only has on the D3D11 path. The OpenGL and
-    // Vulkan transports run DLAA at the native size, so the slider would lie.
-    if (g.is_gl || g.is_vulkan)
+    if (g_pending_work_resolution == 0 && g_work_resolution_ui != g_cfg.work_resolution)
+        g_work_resolution_ui = g_cfg.work_resolution;
+    if (ImGui::SliderInt("Work resolution (%)", &g_work_resolution_ui, 50, 100))
     {
-        ImGui::BeginDisabled();
-        int fixed = 100;
-        ImGui::SliderInt("Work resolution (%)", &fixed, 50, 100);
-        ImGui::EndDisabled();
-        ImGui::SameLine(); HelpMarker("Fixed at 100% on the OpenGL and Vulkan transports: DLSS runs at the "
-                                      "game's native resolution there.");
+        g_pending_work_resolution = g_work_resolution_ui;
+        g_work_resolution_apply_after = GetTickCount64() + 400;
     }
-    else
-    {
-        if (g_pending_work_resolution == 0 && g_work_resolution_ui != g_cfg.work_resolution)
-            g_work_resolution_ui = g_cfg.work_resolution;
-        if (ImGui::SliderInt("Work resolution (%)", &g_work_resolution_ui, 50, 100))
-        {
-            g_pending_work_resolution = g_work_resolution_ui;
-            g_work_resolution_apply_after = GetTickCount64() + 400;
-        }
-        ImGui::SameLine(); HelpMarker("Scales both axes of the shared DLAA + Neural Rendering work textures the host "
-                                      "runs on. The game and its backbuffer stay native-sized. Applied once 400 ms "
-                                      "after dragging stops, since each change rebuilds the shared set.");
-        if (g_pending_work_resolution != 0)
-            ImGui::TextDisabled("Pending: %d%%", g_pending_work_resolution);
-        else if (g.backbuffer_width != 0)
-            ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
-                                g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
-    }
+    ImGui::SameLine(); HelpMarker("Scales both axes of the shared DLAA + Neural Rendering work textures the host "
+                                  "runs on. The game and its backbuffer stay native-sized. Applied once 400 ms "
+                                  "after dragging stops, since each change rebuilds the shared set.");
+    if (g_pending_work_resolution != 0)
+        ImGui::TextDisabled("Pending: %d%%", g_pending_work_resolution);
+    else if (g.backbuffer_width != 0)
+        ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
+                            g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
 
     static const char *kTri[] = { "Auto", "Force off", "Force on" };
     int hdr_idx = g_cfg.hdr + 1, di_idx = g_cfg.depth_inverted + 1;

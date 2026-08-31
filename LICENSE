@@ -1,8 +1,9 @@
 MIT License
 
 Copyright (c) 2026 Jean-Laurent ROUZIES
+Adjustable-resolution modifications Copyright (c) 2026 Phroster
 
-Portions derived from dlss5-dx11-bridge, Copyright (c) 2026 NIGos (MIT), see external/bridge-1.0.19/LICENSE.
+Portions derived from dlss5-dx11-bridge, Copyright (c) 2026 NIGos (MIT), see https://github.com/NIGos/dlss5-dx11-bridge.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

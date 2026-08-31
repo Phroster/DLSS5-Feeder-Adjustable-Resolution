@@ -10,6 +10,8 @@ setlocal
 call "%~dp0..\tools\vcvars.bat" x64 || exit /b 1
 cl /nologo /O2 /EHsc /W3 spike-host64.cpp /Fe:spike-host64.exe d3d12.lib dxgi.lib
 if errorlevel 1 exit /b 1
+cl /nologo /O2 /EHsc /W3 /std:c++17 spike-scale12.cpp /Fe:spike-scale12.exe d3d12.lib dxgi.lib
+if errorlevel 1 exit /b 1
 cl /nologo /O2 /EHsc /W3 spike-gl64.cpp /Fe:spike-gl64.exe d3d12.lib dxgi.lib opengl32.lib gdi32.lib user32.lib
 if errorlevel 1 exit /b 1
 cl /nologo /O2 /EHsc /W3 spike-vkhost64.cpp /Fe:spike-vkhost64.exe d3d12.lib dxgi.lib

@@ -305,7 +305,7 @@ the other paths, and is not part of v1 — jitter-free DLAA has not needed it an
 | `ReleaseFrameResources` / `ShutdownSession` | GL branches: `glDeleteTextures`/`glDeleteMemoryObjectsEXT`/`glDeleteSemaphoresEXT`/`glDeleteFramebuffers` **only when `wglGetCurrentContext() == g.gl_ctx`** (else log-and-leak — the driver reclaims with the context); `glFinish` before same-size rebuilds, alongside the existing `DrainGpu` |
 | `OnDestroyDevice` | fourth branch: `dev->get_api() == device_api::opengl && dev == g.rs_dev` → `g_ngx_dying = true; ShutdownSession();` |
 | `OnCreateDevice` | **no change** (fact 4) |
-| Overlay (`DrawOverlay`) | no structural change — the work-resolution slider correctly stays D3D11-only; v1 GL is DLAA at 100% |
+| Overlay (`DrawOverlay`) | Historical v1 plan: work resolution stayed D3D11-only and GL used 100%. The adjustable-resolution fork subsequently added scaled GL support. |
 | `dlss5-feed.cfg` | no new keys for v1; a `gl_srgb` tri-state is reserved as the §8 escape hatch, added only if phase 3 shows an encoding mismatch |
 
 No opengl32.lib in `build.bat` — everything is runtime-resolved (and link-time binding would be

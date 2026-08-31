@@ -580,6 +580,22 @@ static bool FeedGlBlit(FeedGl *gl, GLuint fbo_read, GLuint fbo_draw,
     return true;
 }
 
+// The scaled sibling used by adjustable work resolution. Color/output use LINEAR;
+// guide textures use NEAREST so depth discontinuities and motion-vector fields are
+// not blended across object edges. Keeping the old exact-size helper above means the
+// established 100% path remains byte-for-byte the same at every call site.
+static bool FeedGlBlitScaled(FeedGl *gl, GLuint fbo_read, GLuint fbo_draw,
+                             uint64_t src, bool src_is_ours, uint64_t dst, bool dst_is_ours,
+                             GLsizei src_w, GLsizei src_h, GLsizei dst_w, GLsizei dst_h,
+                             GLenum filter)
+{
+    if (!FeedGlAttach(gl, GL_READ_FRAMEBUFFER, fbo_read, src, src_is_ours)) return false;
+    if (!FeedGlAttach(gl, GL_DRAW_FRAMEBUFFER, fbo_draw, dst, dst_is_ours)) return false;
+    FeedGlDrainErrors(gl);
+    gl->BlitFramebuffer(0, 0, src_w, src_h, 0, 0, dst_w, dst_h, GL_COLOR_BUFFER_BIT, filter);
+    return FeedGlDrainErrors(gl) == 0;
+}
+
 // GL_FRAMEBUFFER_ATTACHMENT_COLOR_ENCODING of whatever is attached for reading:
 // GL_LINEAR (0x2601) or GL_SRGB (0x8C40). Logged once per build so an sRGB-encoded
 // technique target is visible before it manifests as a washed-out image.

@@ -28,9 +28,31 @@
 
 ## ⚠️ Not compatible with Nvidia Smooth Motion / Optiscaler. Disable them to avoid issues.
 
-# DLSS5-Feeder
+# DLSS5-Feeder Adjustable Resolution
 
 **DLSS 5 neural rendering in games that ship without any DLSS — D3D11, D3D12, Vulkan, OpenGL, 32-bit, even DirectX 9.**
+
+This fork tracks upstream DLSS5-Feeder `v0.8.0-beta.1` and extends its persisted
+50–100% **Work resolution** control to every private-device transport: D3D11,
+Vulkan/DXVK and OpenGL in both 32-bit and 64-bit configurations. D3D9 inherits the
+control through dgVoodoo2 (D3D11) or DXVK (Vulkan). Native D3D12 deliberately remains
+fixed at 100% because it uses the game's own D3D12 device rather than a private bridge.
+
+Work resolution changes only the injected DLAA + Neural Rendering workload. The game
+and final backbuffer remain native-sized. A 50% setting means half of each axis, or
+approximately one quarter of the 100% work pixels. No visual preset or sharpening
+shader is included.
+
+| Game-facing path | 32-bit | 64-bit | Work resolution |
+| --- | :---: | :---: | --- |
+| D3D11 | Yes | Yes | 50–100% |
+| D3D9 through dgVoodoo2 | Yes | Yes | 50–100% through D3D11 |
+| D3D9 through DXVK | Yes | Yes | 50–100% through Vulkan; experimental |
+| Vulkan/DXVK | Yes | Yes | 50–100%; experimental |
+| OpenGL | Yes | Yes | 50–100%; experimental |
+| Native D3D12 | N/A | Yes | Fixed at 100% by design |
+
+Native untranslated D3D9 is not supported.
 
 DLSS 5's neural-rendering add-on only works by hooking a game's own DLSS calls. A game that has no
 DLSS never makes those calls, so the add-on sits idle. **DLSS5-Feeder makes the calls itself.** It
@@ -124,7 +146,7 @@ in fast motion, softness on thin moving geometry), and the HUD is processed alon
 1. Run **ReShade's installer** (https://reshade.me), point it at your game's `.exe`, choose
    **Direct3D 10/11/12**, and tick **"Enable loading of add-ons"**.
 2. Download **`dlss5-feed.addon64`** and **`DLSS5_Feed.fx`** from the
-   **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)**. Put
+   **[adjustable multi-API prerelease](https://github.com/Phroster/DLSS5-Feeder-Adjustable-Resolution/releases/tag/v0.8.0-beta.1-ar.1)**. Put
    `dlss5-feed.addon64` next to the game `.exe`, and `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`.
 3. Download **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX)** (Code ▸ Download ZIP). Copy
    its `Shaders\` folder (the `lumenite_*.fx` files and `include\`) into `reshade-shaders\Shaders\`,
@@ -154,7 +176,7 @@ exists as 64-bit code.
 
 1. Run ReShade's installer, point it at your game's `.exe` — it detects **32-bit** automatically.
 2. Download **`dlss5-feed.addon32`**, **`DLSS5_Feed.fx`** and **`dlss5-feed-host64.exe`** from the
-   **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)**. Put
+   **[adjustable multi-API prerelease](https://github.com/Phroster/DLSS5-Feeder-Adjustable-Resolution/releases/tag/v0.8.0-beta.1-ar.1)**. Put
    `dlss5-feed.addon32` next to the game `.exe`, `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`,
    and `dlss5-feed-host64.exe` into a new `host64\` folder next to the game `.exe`.
 3. Put a 64-bit ReShade `dxgi.dll`, `renodx-dlss5.addon64` (**v4.55** — see the warning above),
@@ -176,6 +198,11 @@ Press Home in that window to open it:
 
 D3D9 games need a translation layer first — **[dgVoodoo2](http://dege.freeweb.hu/dgVoodoo2/)** turns
 D3D9 into D3D11, and everything after that is a normal 32-bit install.
+
+Work resolution follows the translated API: dgVoodoo2 uses the D3D11 scaler, while a
+D3D9 game running through DXVK uses the Vulkan scaler. There is no native D3D9 feeder
+path; the required SM5 guide shaders and modern shared-resource fences do not exist in
+untranslated D3D9.
 
 **Not sure if you need this?** Launch the game with ReShade installed and check `ReShade.log`:
 `IDirect3DDevice9` means yes; `D3D11CreateDevice` means the game already runs on D3D11 — skip to
@@ -229,7 +256,9 @@ Almost every 32-bit game that reaches Vulkan does it through
 2. Add the `host64\` folder from [Install for a 32-bit game](#install-for-a-32-bit-game-beta), and
    install both halves from the same release.
 
-DLSS runs at the game's native resolution here, so the **Work resolution** slider is fixed at 100%.
+The **Work resolution** slider is available here. The 32-bit Vulkan/DXVK transport is
+still experimental and has transport-spike proof but no upstream real-game result yet;
+test 100% first before lowering it.
 
 If `dlss5-feed.log` says the interop entry points are missing, use the 32-bit fallback layer:
 
@@ -312,14 +341,22 @@ the pixel is flagged in a `DLSS5_Mask` texture the add-on passes to DLSS as its
   mode (render size = output size, no jitter). The DLSS 5 neural-rendering add-on
   (`renodx-dlss5.addon64`) detours that D3D12 evaluate and inserts its neural pass — it cannot tell
   the contract is synthetic.
-* On a **64-bit D3D11 game** the optional **Work resolution** slider can run the private
+* On a **D3D11 game** the optional **Work resolution** slider can run the private
   DLAA + Neural Rendering contract at 50–100% of each backbuffer axis. Color is resampled
   linearly; depth, motion vectors and the trust mask use point sampling; motion-vector
   magnitudes are corrected for the selected work extent. The result is linearly expanded
-  back over the native-size backbuffer. At 100% this reduces to the original copy path.
+  back over the native-size backbuffer. Both bitnesses support it; at 100% this reduces
+  to the original copy path.
 * On a **D3D12 game** there is no transport at all: NGX runs on the game's own device and queue,
   motion vectors and depth are consumed zero-copy straight from the effect textures, and the feature
-  survives alt-tabs and effect reloads untouched (only a real resolution change rebuilds).
+  survives alt-tabs and effect reloads untouched. Work resolution is intentionally fixed at 100%.
+* On **64-bit Vulkan and OpenGL**, the cross-API bridge images remain native-sized. A
+  private D3D12 scaler creates work-sized Color/Depth/MV/Mask textures before NGX and
+  linearly expands work Output back into the native shared Output. This preserves the
+  existing exact API-side copies, including Vulkan sRGB byte behavior.
+* On **32-bit Vulkan/DXVK and OpenGL**, the client creates or imports work-sized host
+  resources, scales color/output linearly, scales guides with nearest filtering, and
+  folds the exact work/native motion-vector ratio into NGX's MV scale.
 * NGX calls are wrapped in SEH, a command list the add-on crashed in is discarded rather than
   submitted, and NGX is reinitialized after repeated failures — a faulting closed-source add-on
   disables the feed instead of taking the game down.
@@ -477,7 +514,7 @@ if you prefer editing the file directly:
 | --- | --- | --- |
 | `enabled` | 1 | 0 disables everything. |
 | `mode` | 2 | 0 inert · 1 transport test (no NGX; on 32-bit it copies only the left half, so a split screen proves the round trip) · 2 full DLSS path. |
-| `work_resolution` | 100 | **64-bit D3D11 only.** 50–100% of each backbuffer axis for the private DLAA + Neural Rendering work textures. The Add-ons overlay slider applies once 400 ms after dragging stops. Other paths remain at 100%. |
+| `work_resolution` | 100 | 50–100% of each backbuffer axis for private-device D3D11, Vulkan/DXVK and OpenGL paths in either bitness. The game/backbuffer stays native. The Add-ons overlay applies one rebuild 400 ms after dragging stops. Native D3D12 remains at 100%. |
 | `hdr` | -1 | -1 auto (FP16 / R11G11B10 backbuffer = HDR), 0 force SDR, 1 force HDR. |
 | `depth_inverted` | -1 | -1 follow `RESHADE_DEPTH_INPUT_IS_REVERSED`, 0/1 force. |
 | `flags` | -1 | raw `DLSS.Feature.Create.Flags` override. |
@@ -572,7 +609,7 @@ under `external/reshade/include` (BSD-3-Clause, Patrick Mours), as is **MinHook*
 
 NGX links against the Release CRT, so the builds use `/MD`.
 
-Each script picks up its toolchain through `toolscvars.bat`, which asks `vswhere` for the latest
+Each script picks up its toolchain through `tools\vcvars.bat`, which asks `vswhere` for the latest
 Visual Studio install with the C++ tools and falls back to a fixed BuildTools path. Set `VCVARSALL`
 to your own `vcvarsall.bat` to override it.
 
@@ -583,10 +620,13 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
 
 ## Limitations and roadmap
 
-* **DLAA contract, optional reduced work extent on 64-bit D3D11** — render resolution still
-  equals DLAA output resolution, but the private work extent can be 50–100% of the native
-  backbuffer and is spatially expanded afterward. D3D12, Vulkan, OpenGL and 32-bit paths remain at
-  100%. This is not jittered DLSS Super Resolution.
+* **DLAA contract with an optional private work extent** — render resolution still equals
+  DLAA output resolution, but D3D11, Vulkan/DXVK and OpenGL private-device paths can use
+  50–100% of the native backbuffer and expand afterward. Native D3D12 stays at 100%.
+  This is not jittered DLSS Super Resolution.
+* **Scaled Vulkan/OpenGL is experimental** — all transports compile and the x86/x64
+  interop spikes pass, but less-than-100% paths still need real-game validation across
+  BGRA/RGBA, sRGB, R10G10B10A2 and FP16/HDR targets. Start at 100% and retain logs.
 * Estimated motion vectors → temporal artifacts in fast motion; the UI is processed with the scene
   (a UI mask / pre-UI colour capture is future work).
 * **Geometry vectors are experimental and off.** The camera-model fit is derived from the provider's
@@ -605,6 +645,11 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
 
 ## Credits
 
+* **Upstream DLSS5-Feeder:** Jean-Laurent ROUZIES and contributors. This fork is based
+  on upstream commit [`7d61175`](https://github.com/jlrouzies-fr/DLSS5-Feeder/commit/7d61175f796651098aa0895b0aff2a3e4e0598bc).
+* **Cross-API adjustable work resolution:** Phroster. The original D3D11 slider was
+  merged upstream in [PR #19](https://github.com/jlrouzies-fr/DLSS5-Feeder/pull/19);
+  this fork extends it to the private Vulkan/DXVK and OpenGL transports.
 * **D3D11↔D3D12 shared-texture / fence transport** adapted from NIGos'
   [dlss5-dx11-bridge](https://github.com/NIGos/dlss5-dx11-bridge) (MIT) — not re-hosted here.
 * **Motion vectors:** interop happens purely by declaring each provider's output texture
@@ -624,5 +669,5 @@ swapchain, so nothing in the table under [Status](#status) can be verified there
 
 ## License
 
-MIT — see [LICENSE](LICENSE). This covers only the code in this repository (`src/`, `shaders/`,
-`host/`); the dependencies above keep their own licenses.
+MIT — see [LICENSE](LICENSE). This covers project-authored code in this repository;
+vendored and external dependencies keep their own licenses.

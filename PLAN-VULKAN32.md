@@ -166,8 +166,9 @@ both):
 ### Phase 5 — docs + issue
 - README: "32-bit Vulkan game (DXVK)" install subsection — ReShade **x86 as a Vulkan
   layer**, NOT a local dxgi.dll (the d3d9.dll slot is DXVK's); host64\ folder unchanged;
-  work res fixed at 100%. Fix the support-matrix row (:382) that over-promises 32-bit
-  Vulkan today. Name DXVK as the audience. Append the v2 protocol to PLAN-32BIT.md.
+  historical v1 work res fixed at 100%. The adjustable-resolution fork subsequently
+  added scaled 32-bit Vulkan/DXVK support. Name DXVK as the audience. Append the v2
+  protocol to PLAN-32BIT.md.
 - Comment on issue #15 offering the reporter a dev build once local testing passes.
 
 ## Verification (each step gates the next)

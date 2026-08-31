@@ -54,8 +54,9 @@
 #include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
 #include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
+#include "feed_scale12.h" // private-D3D12 native<->work scaler for Vulkan/OpenGL
 
-#define FEED_VERSION "0.8.0-beta.1"
+#define FEED_VERSION "0.8.0-beta.1-ar.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -352,7 +353,7 @@ struct Cfg
     int   log_frames;      // how many first frames get a full parameter dump in the log
     int   create_delay;    // frames to hold the FIRST feature create (the DLSS 5 add-on arms its NGX hooks asynchronously)
     int   preset;          // DLSS render preset hint: 0 default, 5=E, 6=F (legacy CNN), 10=J, 11=K (transformer)
-    int   work_resolution; // 64-bit D3D11 only: 50..100 percent of each backbuffer axis
+    int   work_resolution; // 50..100 percent for private-device paths; native D3D12 stays at 100
     float mv_scale_x;      // multiplier applied to the motion vectors (the FX already outputs pixels)
     float mv_scale_y;
 };
@@ -476,7 +477,7 @@ static bool ApplyPendingWorkResolution()
     if (next == g_cfg.work_resolution) return false;
     g_cfg.work_resolution = next;
     CfgSave();
-    Log("[feed] settled D3D11 work resolution=%d%%; rebuilding private resources", g_cfg.work_resolution);
+    Log("[feed] settled work resolution=%d%%; rebuilding private resources", g_cfg.work_resolution);
     return true;
 }
 
@@ -647,6 +648,7 @@ struct Feed
     bool                 ngx_inited;
     NVSDK_NGX_Parameter *params;
     NVSDK_NGX_Handle    *feature;
+    feed_scale12::Context scale12; // reduced work set for Vulkan/OpenGL; unused at 100%
 
     // shared textures
     ID3D12Resource  *tex12[SLOT_COUNT];
@@ -868,6 +870,8 @@ static void FeedFail(const char *what)
 // D3D12 command submission (allocator ring + shared fence), from the bridge
 // ---------------------------------------------------------------------------
 
+static void MvProbeAbort(); // defined with the probe helpers below
+
 static bool BeginCommands()
 {
     const int slot = g.frame_slot;
@@ -887,30 +891,79 @@ static bool BeginCommands()
     return SUCCEEDED(g.list->Reset(g.alloc[slot], nullptr));
 }
 
-static UINT64 EndCommands()
+struct CommandSubmitResult
 {
-    g.list->Close();
+    UINT64 value = 0;
+    bool submitted = false;
+    bool tracked = false;
+};
+
+static CommandSubmitResult EndCommandsDetailed()
+{
+    CommandSubmitResult result = {};
+    const HRESULT close_hr = g.list->Close();
+    if (FAILED(close_hr))
+    {
+        Log("[feed] command-list Close failed 0x%08X; list was not submitted", static_cast<unsigned>(close_hr));
+        MvProbeAbort();
+        return result;
+    }
     ID3D12CommandList *lists[] = { g.list };
     g.queue->ExecuteCommandLists(1, lists);
     const UINT64 v = ++g.fence_value;
-    g.queue->Signal(g.fence12, v);
-    g.alloc_fence[g.frame_slot] = v;
+    result.value = v;
+    result.submitted = true;
+    const HRESULT signal_hr = g.queue->Signal(g.fence12, v);
+    if (FAILED(signal_hr))
+    {
+        Log("[feed] internal command fence Signal(%llu) failed 0x%08X",
+            static_cast<unsigned long long>(v), static_cast<unsigned>(signal_hr));
+        g.alloc_fence[g.frame_slot] = 0;
+        MvProbeAbort();
+        FeedDisable("the private D3D12 queue could not signal its command fence");
+    }
+    else
+    {
+        g.alloc_fence[g.frame_slot] = v;
+        result.tracked = true;
+    }
     g.frame_slot = (g.frame_slot + 1) % Feed::kFrames;
-    return v;
+    return result;
 }
 
-static void DrainGpu()
+static UINT64 EndCommands()
 {
-    if (g.queue == nullptr || g.fence12 == nullptr) return;
+    const CommandSubmitResult result = EndCommandsDetailed();
+    return result.tracked ? result.value : 0;
+}
+
+static bool DrainGpu()
+{
+    if (g.queue == nullptr || g.fence12 == nullptr) return true;
     const UINT64 v = ++g.fence_value;
-    g.queue->Signal(g.fence12, v);
+    const HRESULT signal_hr = g.queue->Signal(g.fence12, v);
+    if (FAILED(signal_hr))
+    {
+        Log("[feed] queue drain Signal(%llu) failed 0x%08X",
+            static_cast<unsigned long long>(v), static_cast<unsigned>(signal_hr));
+        return false;
+    }
     if (g.fence12->GetCompletedValue() < v && g.fence_event != nullptr)
     {
-        g.fence12->SetEventOnCompletion(v, g.fence_event);
+        const HRESULT event_hr = g.fence12->SetEventOnCompletion(v, g.fence_event);
+        if (FAILED(event_hr))
+        {
+            Log("[feed] queue drain SetEventOnCompletion failed 0x%08X", static_cast<unsigned>(event_hr));
+            return false;
+        }
         if (WaitForSingleObject(g.fence_event, 5000) != WAIT_OBJECT_0)
+        {
             Log("[feed] timed out draining the queue before teardown");
+            return false;
+        }
     }
     for (int i = 0; i < Feed::kFrames; ++i) g.alloc_fence[i] = 0;
+    return g.fence12->GetCompletedValue() >= v;
 }
 
 // NGX can access-violate inside its own code or inside the DLSS 5 add-on (a leaked, closed-source
@@ -1088,9 +1141,22 @@ static void Barrier(ID3D12Resource *res, D3D12_RESOURCE_STATES from, D3D12_RESOU
 // Resources
 // ---------------------------------------------------------------------------
 
-static void ReleaseFrameResources()
+static bool ReleaseFrameResources()
 {
-    DrainGpu();
+    if (!DrainGpu())
+    {
+        // Never free or replace resources that may still be referenced by queued GPU
+        // work. Disable and deliberately retain them until process/device teardown.
+        Log("[feed] GPU drain was not proven; retaining frame resources instead of freeing in-flight objects");
+        FeedDisable("the GPU did not complete before resource teardown");
+        g.frame_ready = false;
+        return false;
+    }
+    feed_scale12::FeedScale12Release(&g.scale12);
+    // Raw Vulkan aliases are not owned by ReShade's resource tracker. Ensure the
+    // game's queue is idle before destroying imported images/memory or rebuilding
+    // their backing D3D12 resources (mirrors the 32-bit transport teardown).
+    if (g.vk.ok && g.rs_queue != nullptr) g.rs_queue->wait_idle();
     // Vulkan transport: drop our raw VkImage imports (the memory is the D3D12 resource's;
     // freeing the import does not free the D3D12 resource, which SafeRelease(tex12) does).
     if (g.vk.ok)
@@ -1141,6 +1207,7 @@ static void ReleaseFrameResources()
         g.feature = nullptr;
     }
     g.frame_ready = false;
+    return true;
 }
 
 // One texture visible to both APIs: created on D3D12 and opened on D3D11, or the other
@@ -1296,7 +1363,15 @@ static bool RecreateFeatureOnly(UINT w, UINT h)
     bool crashed = false;
     if (CreateDlssFeature(w, h, inverted, &crashed))
     {
-        DrainGpu();  // the old feature's last evaluate may still be in flight
+        if (!DrainGpu())  // the old feature's last evaluate may still be in flight
+        {
+            NVSDK_NGX_Handle *fresh = g.feature;
+            g.feature = old;
+            SafeReleaseFeature(fresh); // newly created and never evaluated
+            g.frame_ready = false;
+            FeedDisable("the previous DLSS feature did not become idle during re-create");
+            return false; // retain the old feature until device/process teardown
+        }
         SafeReleaseFeature(old);
         return true;
     }
@@ -1315,7 +1390,7 @@ static bool BuildResources(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h,
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building shared textures");
-    ReleaseFrameResources();
+    if (!ReleaseFrameResources()) return false;
 
     ID3D11Device1 *dev1 = nullptr;
     if (FAILED(g.dev11->QueryInterface(__uuidof(ID3D11Device1), reinterpret_cast<void **>(&dev1))) || dev1 == nullptr)
@@ -1446,7 +1521,24 @@ static bool CreateDlssFeature(UINT w, UINT h, bool inverted, bool *crashed)
         if (crashed != nullptr) *crashed = true;
         return false;
     }
-    const UINT64 v = EndCommands();
+    const CommandSubmitResult submission = EndCommandsDetailed();
+    if (!submission.submitted)
+    {
+        Log("[feed] feature creation command list was not submitted");
+        SafeReleaseFeature(g.feature);
+        g.feature = nullptr;
+        return false;
+    }
+    if (!submission.tracked)
+    {
+        // ExecuteCommandLists happened, but completion cannot be proven. EndCommandsDetailed
+        // already disabled the feed; retain the feature/resources rather than releasing
+        // objects the untracked list may still reference.
+        Log("[feed] feature creation was submitted without a tracked completion fence; retaining resources");
+        g.frame_ready = false;
+        return false;
+    }
+    const UINT64 v = submission.value;
     if (g.fence12->GetCompletedValue() < v)
     {
         g.fence12->SetEventOnCompletion(v, g.fence_event);
@@ -1594,7 +1686,7 @@ fail:
 
 static void ShutdownSession()
 {
-    ReleaseFrameResources();
+    if (!ReleaseFrameResources()) return;
     if (g.params != nullptr) { if (!g_ngx_dying) NVSDK_NGX_D3D12_DestroyParameters(g.params); g.params = nullptr; }
     if (g.ngx_inited && g.dev12 != nullptr) { if (!g_ngx_dying) NVSDK_NGX_D3D12_Shutdown1(g.dev12); g.ngx_inited = false; }
     SafeRelease(g.blit_vs);
@@ -1778,7 +1870,7 @@ static bool BuildResources12(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         return RecreateFeatureOnly(w, h);
 
     Breadcrumb("building same-device textures");
-    ReleaseFrameResources();
+    if (!ReleaseFrameResources()) return false;
 
     g.width      = w;
     g.height     = h;
@@ -1989,7 +2081,8 @@ static bool InitSessionVk(reshade::api::effect_runtime *rt)
 }
 
 static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
-                            reshade::api::resource_usage vk_usage, reshade::api::resource_usage vk_initial)
+                            reshade::api::resource_usage vk_usage, reshade::api::resource_usage vk_initial,
+                            bool render_target = false)
 {
     // D3D12 half: shared committed resource, same shape MakeSharedPair creates.
     D3D12_HEAP_PROPERTIES hp = {};
@@ -2004,7 +2097,8 @@ static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
     rd.SampleDesc.Count = 1;
     rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
-                          (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
+                          (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE) |
+                          (render_target ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE);
     HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
                                                   nullptr, __uuidof(ID3D12Resource),
                                                   reinterpret_cast<void **>(&g.tex12[slot]));
@@ -2034,17 +2128,20 @@ static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
     return true;
 }
 
-static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
+static bool BuildResourcesVk(UINT work_w, UINT work_h, UINT native_w, UINT native_h, DXGI_FORMAT bb_fmt)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
-        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
-        return RecreateFeatureOnly(w, h);
+        work_w == g.width && work_h == g.height && native_w == g.backbuffer_width &&
+        native_h == g.backbuffer_height && bb_fmt == g.bb_fmt)
+        return RecreateFeatureOnly(work_w, work_h);
 
     Breadcrumb("building the Vulkan-shared textures");
-    ReleaseFrameResources();
+    if (!ReleaseFrameResources()) return false;
 
-    g.width      = w;
-    g.height     = h;
+    g.width      = work_w;
+    g.height     = work_h;
+    g.backbuffer_width  = native_w;
+    g.backbuffer_height = native_h;
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = TypedColorFormat(bb_fmt);
     g.output_fmt = ResolveOutputFormat(g.color_fmt, g.dev12);
@@ -2066,11 +2163,12 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
     // never has to barrier them there at all.
     const reshade::api::resource_usage copy_rw =
         reshade::api::resource_usage::copy_dest | reshade::api::resource_usage::copy_source;
-    if (!MakeSharedTexVk(SLOT_COLOR,  w, h, g.color_fmt,             false, copy_rw, reshade::api::resource_usage::copy_dest) ||
-        !MakeSharedTexVk(SLOT_OUTPUT, w, h, g.output_fmt,            true,  copy_rw, reshade::api::resource_usage::copy_source) ||
-        !MakeSharedTexVk(SLOT_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,   false, copy_rw, reshade::api::resource_usage::copy_dest) ||
-        !MakeSharedTexVk(SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false, copy_rw, reshade::api::resource_usage::copy_dest) ||
-        !MakeSharedTexVk(SLOT_MASK,   w, h, DXGI_FORMAT_R8_UNORM,     false, copy_rw, reshade::api::resource_usage::copy_dest))
+    const bool scaled = work_w != native_w || work_h != native_h;
+    if (!MakeSharedTexVk(SLOT_COLOR,  native_w, native_h, g.color_fmt,              false, copy_rw, reshade::api::resource_usage::copy_dest) ||
+        !MakeSharedTexVk(SLOT_OUTPUT, native_w, native_h, g.output_fmt,             true,  copy_rw, reshade::api::resource_usage::copy_source, scaled) ||
+        !MakeSharedTexVk(SLOT_DEPTH,  native_w, native_h, DXGI_FORMAT_R32_FLOAT,    false, copy_rw, reshade::api::resource_usage::copy_dest) ||
+        !MakeSharedTexVk(SLOT_MV,     native_w, native_h, DXGI_FORMAT_R16G16_FLOAT, false, copy_rw, reshade::api::resource_usage::copy_dest) ||
+        !MakeSharedTexVk(SLOT_MASK,   native_w, native_h, DXGI_FORMAT_R8_UNORM,     false, copy_rw, reshade::api::resource_usage::copy_dest))
     {
         ReleaseFrameResources();
         return false;
@@ -2078,8 +2176,32 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
+    if (work_w != native_w || work_h != native_h)
+    {
+        feed_scale12::Desc scale = {};
+        scale.device = g.dev12;
+        scale.native_color = g.tex12[SLOT_COLOR];
+        scale.native_output = g.tex12[SLOT_OUTPUT];
+        scale.native_depth = g.tex12[SLOT_DEPTH];
+        scale.native_mv = g.tex12[SLOT_MV];
+        scale.native_mask = g.tex12[SLOT_MASK];
+        scale.native_width = native_w;
+        scale.native_height = native_h;
+        scale.work_width = work_w;
+        scale.work_height = work_h;
+        scale.color_format = g.color_fmt;
+        scale.output_format = g.output_fmt;
+        if (!feed_scale12::FeedScale12Build(&g.scale12, scale))
+        {
+            Log("[feed] private D3D12 work scaler failed: %s (0x%08X)",
+                g.scale12.error, static_cast<unsigned>(g.scale12.last_error));
+            ReleaseFrameResources();
+            return false;
+        }
+    }
+
     bool crashed = false;
-    if (!CreateDlssFeature(w, h, inverted, &crashed))
+    if (!CreateDlssFeature(work_w, work_h, inverted, &crashed))
     {
         if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
         return false;
@@ -2259,7 +2381,8 @@ static bool InitSessionGl(reshade::api::effect_runtime *rt)
     return true;
 }
 
-static bool MakeSharedTexGl(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
+static bool MakeSharedTexGl(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
+                            bool render_target = false)
 {
     // D3D12 half: byte for byte what MakeSharedTexVk creates.
     D3D12_HEAP_PROPERTIES hp = {};
@@ -2274,7 +2397,8 @@ static bool MakeSharedTexGl(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
     rd.SampleDesc.Count = 1;
     rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
-                          (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
+                          (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE) |
+                          (render_target ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE);
     HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
                                                   nullptr, __uuidof(ID3D12Resource),
                                                   reinterpret_cast<void **>(&g.tex12[slot]));
@@ -2310,17 +2434,21 @@ static bool MakeSharedTexGl(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
     return true;
 }
 
-static bool BuildResourcesGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handle)
+static bool BuildResourcesGl(UINT work_w, UINT work_h, UINT native_w, UINT native_h,
+                             DXGI_FORMAT bb_fmt, uint64_t rtv_handle)
 {
     if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
-        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
-        return RecreateFeatureOnly(w, h);
+        work_w == g.width && work_h == g.height && native_w == g.backbuffer_width &&
+        native_h == g.backbuffer_height && bb_fmt == g.bb_fmt)
+        return RecreateFeatureOnly(work_w, work_h);
 
     Breadcrumb("building the OpenGL-shared textures");
-    ReleaseFrameResources();
+    if (!ReleaseFrameResources()) return false;
 
-    g.width      = w;
-    g.height     = h;
+    g.width      = work_w;
+    g.height     = work_h;
+    g.backbuffer_width  = native_w;
+    g.backbuffer_height = native_h;
     g.bb_fmt     = bb_fmt;
     g.color_fmt  = GlSafeColorFormat(TypedColorFormat(bb_fmt));
     g.output_fmt = GlSafeColorFormat(ResolveOutputFormat(g.color_fmt, g.dev12));
@@ -2351,11 +2479,12 @@ static bool BuildResourcesGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_ha
     Log("[feed] copy home: glBlitFramebuffer (output %s -> backbuffer %s)",
         FormatName(g.output_fmt), FormatName(bb_fmt));
 
-    if (!MakeSharedTexGl(SLOT_COLOR,  w, h, g.color_fmt,              false) ||
-        !MakeSharedTexGl(SLOT_OUTPUT, w, h, g.output_fmt,             true)  ||
-        !MakeSharedTexGl(SLOT_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,    false) ||
-        !MakeSharedTexGl(SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false) ||
-        !MakeSharedTexGl(SLOT_MASK,   w, h, DXGI_FORMAT_R8_UNORM,     false))
+    const bool scaled = work_w != native_w || work_h != native_h;
+    if (!MakeSharedTexGl(SLOT_COLOR,  native_w, native_h, g.color_fmt,              false) ||
+        !MakeSharedTexGl(SLOT_OUTPUT, native_w, native_h, g.output_fmt,             true, scaled)  ||
+        !MakeSharedTexGl(SLOT_DEPTH,  native_w, native_h, DXGI_FORMAT_R32_FLOAT,    false) ||
+        !MakeSharedTexGl(SLOT_MV,     native_w, native_h, DXGI_FORMAT_R16G16_FLOAT, false) ||
+        !MakeSharedTexGl(SLOT_MASK,   native_w, native_h, DXGI_FORMAT_R8_UNORM,     false))
     {
         ReleaseFrameResources();
         return false;
@@ -2363,13 +2492,226 @@ static bool BuildResourcesGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_ha
 
     if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
 
+    if (work_w != native_w || work_h != native_h)
+    {
+        feed_scale12::Desc scale = {};
+        scale.device = g.dev12;
+        scale.native_color = g.tex12[SLOT_COLOR];
+        scale.native_output = g.tex12[SLOT_OUTPUT];
+        scale.native_depth = g.tex12[SLOT_DEPTH];
+        scale.native_mv = g.tex12[SLOT_MV];
+        scale.native_mask = g.tex12[SLOT_MASK];
+        scale.native_width = native_w;
+        scale.native_height = native_h;
+        scale.work_width = work_w;
+        scale.work_height = work_h;
+        scale.color_format = g.color_fmt;
+        scale.output_format = g.output_fmt;
+        if (!feed_scale12::FeedScale12Build(&g.scale12, scale))
+        {
+            Log("[feed] private D3D12 work scaler failed: %s (0x%08X)",
+                g.scale12.error, static_cast<unsigned>(g.scale12.last_error));
+            ReleaseFrameResources();
+            return false;
+        }
+    }
+
     bool crashed = false;
-    if (!CreateDlssFeature(w, h, inverted, &crashed))
+    if (!CreateDlssFeature(work_w, work_h, inverted, &crashed))
     {
         if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
         return false;
     }
     return true;
+}
+
+// Shared private-D3D12 middle for the Vulkan and OpenGL transports. Their bridge
+// resources stay native-sized; when the scaler is active this helper downsamples
+// into a private work set, evaluates NGX there, and expands back into native Output.
+// Native D3D12 games never call this helper and remain fixed at 100%.
+enum class PrivateEvalResult
+{
+    unsent,
+    submitted_failed,
+    submitted_success
+};
+
+static PrivateEvalResult RunPrivateD3D12Evaluate(int reset)
+{
+    const bool scaled = g.scale12.ready;
+    if (!BeginCommands())
+    {
+        FeedFail("command list");
+        return PrivateEvalResult::unsent;
+    }
+
+    auto selected = [&](int slot) -> ID3D12Resource *
+    {
+        return scaled
+            ? feed_scale12::FeedScale12Work(&g.scale12, static_cast<feed_scale12::Slot>(slot))
+            : g.tex12[slot];
+    };
+
+    if (scaled)
+    {
+        if (!feed_scale12::FeedScale12RecordPrepare(&g.scale12, g.list, g.mask_ok))
+        {
+            Log("[feed] private D3D12 scaler prepare failed: %s (0x%08X)",
+                g.scale12.error, static_cast<unsigned>(g.scale12.last_error));
+            AbortCommands();
+            FeedFail("work-resolution prepare");
+            return PrivateEvalResult::unsent;
+        }
+    }
+    else
+    {
+        Barrier(g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    }
+
+    ID3D12Resource *color = selected(SLOT_COLOR);
+    ID3D12Resource *output = selected(SLOT_OUTPUT);
+    ID3D12Resource *depth = selected(SLOT_DEPTH);
+    ID3D12Resource *mv = selected(SLOT_MV);
+    ID3D12Resource *mask = selected(SLOT_MASK);
+    MvProbeRecord(mv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+
+    NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
+    ep.Feature.pInColor = color;
+    ep.Feature.pInOutput = output;
+    ep.Feature.InSharpness = 0.0f;
+    ep.pInDepth = depth;
+    ep.pInMotionVectors = mv;
+    ep.pInBiasCurrentColorMask = g.mask_ok ? mask : nullptr;
+    ep.InJitterOffsetX = 0.0f;
+    ep.InJitterOffsetY = 0.0f;
+    ep.InRenderSubrectDimensions.Width = g.width;
+    ep.InRenderSubrectDimensions.Height = g.height;
+    ep.InReset = reset;
+    ep.InMVScaleX = g_cfg.mv_scale_x;
+    ep.InMVScaleY = g_cfg.mv_scale_y;
+    ep.InPreExposure = 1.0f;
+    ep.InExposureScale = 1.0f;
+
+    Breadcrumb("running the private D3D12 evaluate");
+    DWORD ecode = 0;
+    const NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+    if (ecode != 0)
+    {
+        AbortCommands();
+        Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
+        FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
+        g.frame_ready = false;
+        return PrivateEvalResult::unsent;
+    }
+
+    if (NVSDK_NGX_FAILED(re))
+    {
+        if (scaled)
+            feed_scale12::FeedScale12RecordAbort(&g.scale12, g.list);
+        else
+        {
+            Barrier(g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+            Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+        }
+        const CommandSubmitResult submission = EndCommandsDetailed();
+        if (!submission.submitted)
+        {
+            FeedFail("command submission");
+            g.frame_ready = false;
+            return PrivateEvalResult::unsent;
+        }
+        Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
+        FeedFail("evaluate");
+        g.frame_ready = false;
+        return PrivateEvalResult::submitted_failed;
+    }
+
+    if (scaled)
+    {
+        if (!feed_scale12::FeedScale12RecordFinish(&g.scale12, g.list))
+        {
+            Log("[feed] private D3D12 scaler finish failed: %s (0x%08X)",
+                g.scale12.error, static_cast<unsigned>(g.scale12.last_error));
+            AbortCommands();
+            FeedFail("work-resolution expansion");
+            g.frame_ready = false;
+            return PrivateEvalResult::unsent;
+        }
+    }
+    else
+    {
+        Barrier(g.tex12[SLOT_COLOR], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(g.tex12[SLOT_DEPTH], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+        Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+    }
+    const CommandSubmitResult submission = EndCommandsDetailed();
+    if (!submission.submitted)
+    {
+        FeedFail("command submission");
+        g.frame_ready = false;
+        return PrivateEvalResult::unsent;
+    }
+    return PrivateEvalResult::submitted_success;
+}
+
+struct PrivateSignalResult
+{
+    bool released = false;
+    bool output_valid = false;
+};
+
+static PrivateSignalResult SignalPrivateD3D12Result(UINT64 value, PrivateEvalResult result)
+{
+    PrivateSignalResult outcome = {};
+    if (result != PrivateEvalResult::submitted_success) g.need_reset = true;
+    HRESULT hr = E_FAIL;
+    if (result != PrivateEvalResult::unsent)
+    {
+        // Queue-signal after every submitted list, including a failed evaluate's
+        // cleanup list. CPU-signalling immediately would let Vulkan/GL reuse the
+        // native bridges while that list was still reading or transitioning them.
+        hr = g.queue != nullptr ? g.queue->Signal(g.fence12_out, value) : E_POINTER;
+        if (FAILED(hr))
+        {
+            Log("[feed] queue Signal(output fence %llu) failed 0x%08X; draining before CPU fallback",
+                static_cast<unsigned long long>(value), static_cast<unsigned>(hr));
+            const bool drained = DrainGpu();
+            hr = g.fence12_out != nullptr ? g.fence12_out->Signal(value) : E_POINTER;
+            outcome.output_valid = result == PrivateEvalResult::submitted_success && drained;
+            if (!drained)
+            {
+                g.frame_ready = false;
+                FeedDisable("the private D3D12 queue could not be drained after an output-fence failure");
+            }
+        }
+        else
+            outcome.output_valid = result == PrivateEvalResult::submitted_success;
+    }
+    else
+    {
+        // Nothing reached the private queue, so a CPU signal is sufficient to release
+        // the game-side wait without presenting a stale output.
+        hr = g.fence12_out != nullptr ? g.fence12_out->Signal(value) : E_POINTER;
+    }
+
+    if (FAILED(hr))
+    {
+        Log("[feed] output fence signal %llu failed 0x%08X",
+            static_cast<unsigned long long>(value), static_cast<unsigned>(hr));
+        FeedDisable("the private transport output fence could not be signalled");
+        return outcome;
+    }
+    outcome.released = true;
+    return outcome;
 }
 
 // ---------------------------------------------------------------------------
@@ -2775,15 +3117,21 @@ static void FeedFrame12(reshade::api::effect_runtime *rt, reshade::api::command_
                 Breadcrumb("running the same-device evaluate");
                 DWORD ecode = 0;
                 NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+                UINT64 submitted_fence = 0;
                 if (ecode != 0)
                     AbortCommands();  // never execute a list NGX crashed while recording
                 else
-                    EndCommands();
+                    submitted_fence = EndCommands();
 
                 if (ecode != 0)
                 {
                     Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
                     FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
+                    g.frame_ready = false;
+                }
+                else if (submitted_fence == 0)
+                {
+                    FeedFail("command submission");
                     g.frame_ready = false;
                 }
                 else if (NVSDK_NGX_FAILED(re))
@@ -2857,6 +3205,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
 
+    if (ApplyPendingWorkResolution()) { g.frame_ready = false; g.create_grace = 0; }
     if ((g.frames_done % 60) == 0 && CfgReload()) g.frame_ready = false;
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
 
@@ -2926,7 +3275,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     if (!g.session_ready) ok = InitSessionVk(rt);
 
     const DXGI_FORMAT bbf = static_cast<DXGI_FORMAT>(cd.texture.format);
-    const bool needs_build_vk = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt;
+    const UINT work_w = ScaledExtent(w, g_cfg.work_resolution);
+    const UINT work_h = ScaledExtent(h, g_cfg.work_resolution);
+    const bool needs_build_vk = !g.frame_ready || work_w != g.width || work_h != g.height ||
+                                w != g.backbuffer_width || h != g.backbuffer_height || bbf != g.bb_fmt;
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
@@ -2940,9 +3292,9 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     }
     if (ok && needs_build_vk)
     {
-        Log("[feed] building: %ux%u backbuffer %s (Vulkan transport, depth reversed=%d)", w, h,
-            FormatName(bbf), g.depth_reversed ? 1 : 0);
-        ok = BuildResourcesVk(w, h, bbf);
+        Log("[feed] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer %s (Vulkan transport, depth reversed=%d)",
+            work_w, work_h, g_cfg.work_resolution, w, h, FormatName(bbf), g.depth_reversed ? 1 : 0);
+        ok = BuildResourcesVk(work_w, work_h, w, h, bbf);
         if (!ok) FeedFail("resource build");
         else g.consecutive_fails = 0;
     }
@@ -3030,73 +3382,25 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             g.rs_queue->flush_immediate_command_list();
             g.rs_queue->signal(g.rs_fence_in, n);
 
-            // D3D12: wait for the copies, evaluate, signal back. Unchanged machinery.
-            g.queue->Wait(g.fence12_in, n);
-            bool done = false;
-            if (!BeginCommands()) FeedFail("command list");
-            else
+            // D3D12: wait for the native bridge copies, optionally scale around NGX,
+            // then signal the native Output back to Vulkan.
+            const HRESULT input_wait = g.queue->Wait(g.fence12_in, n);
+            PrivateEvalResult eval_result = PrivateEvalResult::unsent;
+            if (FAILED(input_wait))
             {
-                Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                MvProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-                NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
-                ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
-                ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
-                ep.Feature.InSharpness = 0.0f;
-                ep.pInDepth          = g.tex12[SLOT_DEPTH];
-                ep.pInMotionVectors  = g.tex12[SLOT_MV];
-                ep.pInBiasCurrentColorMask = g.mask_ok ? g.tex12[SLOT_MASK] : nullptr;   // the shader's validation mask
-                ep.InJitterOffsetX   = 0.0f;
-                ep.InJitterOffsetY   = 0.0f;
-                ep.InRenderSubrectDimensions.Width  = g.width;
-                ep.InRenderSubrectDimensions.Height = g.height;
-                ep.InReset           = reset;
-                ep.InMVScaleX        = g_cfg.mv_scale_x;
-                ep.InMVScaleY        = g_cfg.mv_scale_y;
-                ep.InPreExposure     = 1.0f;
-                ep.InExposureScale   = 1.0f;
-
-                Breadcrumb("running the D3D12 evaluate (Vulkan transport)");
-                DWORD ecode = 0;
-                NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
-                if (ecode != 0)
-                {
-                    AbortCommands();  // never execute a list NGX crashed while recording
-                    Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
-                    FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
-                    g.frame_ready = false;
-                }
-                else
-                {
-                    Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-                    Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-                    Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-                    if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-                    Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-                    EndCommands();
-                    if (NVSDK_NGX_FAILED(re))
-                    {
-                        Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
-                        FeedFail("evaluate");
-                        g.frame_ready = false;
-                    }
-                    else
-                        done = true;
-                }
+                Log("[feed] private queue Wait(input fence %llu) failed 0x%08X",
+                    static_cast<unsigned long long>(n), static_cast<unsigned>(input_wait));
+                FeedFail("input fence wait");
             }
-            if (done)
-                g.queue->Signal(g.fence12_out, n);   // after the evaluate, GPU-ordered
             else
-                g.fence12_out->Signal(n);            // CPU-signal so the game never hangs on us
+                eval_result = RunPrivateD3D12Evaluate(reset);
+            const PrivateSignalResult signal_result = SignalPrivateD3D12Result(n, eval_result);
+            const bool done = eval_result == PrivateEvalResult::submitted_success && signal_result.output_valid;
 
             // The copy home lands on the fresh immediate list, which executes on the
             // game's queue after the wait below -- GPU-ordered, no CPU stall.
             Breadcrumb("waiting for the result (Vulkan)");
-            g.rs_queue->wait(g.rs_fence_out, n);
+            if (signal_result.released) g.rs_queue->wait(g.rs_fence_out, n);
             cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());  // fresh buffer after the flush
             if (done)
             {
@@ -3125,7 +3429,9 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 const UINT64 fn = ++g.frames_done;
                 g.consecutive_fails = 0;
                 if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
-                    Log("[feed] frame %llu delivered (%ux%u, reset=%d, Vulkan transport)", fn, g.width, g.height, reset);
+                    Log("[feed] frame %llu delivered (%ux%u at %d%% -> %ux%u, reset=%d, Vulkan transport)",
+                        fn, g.width, g.height, g_cfg.work_resolution,
+                        g.backbuffer_width, g.backbuffer_height, reset);
 
                 if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
                 {
@@ -3156,6 +3462,7 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
 
+    if (ApplyPendingWorkResolution()) { g.frame_ready = false; g.create_grace = 0; }
     if ((g.frames_done % 60) == 0 && CfgReload()) g.frame_ready = false;
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
 
@@ -3247,7 +3554,10 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
 
     const DXGI_FORMAT bbf = have_bb_desc ? static_cast<DXGI_FORMAT>(cd.texture.format)
                                          : DXGI_FORMAT_R8G8B8A8_UNORM;   // default FB: assume 8-bit; the blit converts anyway
-    const bool needs_build_gl = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt;
+    const UINT work_w = ScaledExtent(w, g_cfg.work_resolution);
+    const UINT work_h = ScaledExtent(h, g_cfg.work_resolution);
+    const bool needs_build_gl = !g.frame_ready || work_w != g.width || work_h != g.height ||
+                                w != g.backbuffer_width || h != g.backbuffer_height || bbf != g.bb_fmt;
     // Re-arm the grace on a resolution/format change too: that makes the DLSS 5 add-on
     // re-create its own feature, and any NGX interposer downstream (Alex's Toolkit) re-arms
     // with it. Without this the second build races hooks that are only half in place.
@@ -3261,9 +3571,9 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
     }
     if (ok && needs_build_gl)
     {
-        Log("[feed] building: %ux%u backbuffer %s (OpenGL transport, depth reversed=%d)", w, h,
-            FormatName(bbf), g.depth_reversed ? 1 : 0);
-        ok = BuildResourcesGl(w, h, bbf, bb_res.handle);
+        Log("[feed] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer %s (OpenGL transport, depth reversed=%d)",
+            work_w, work_h, g_cfg.work_resolution, w, h, FormatName(bbf), g.depth_reversed ? 1 : 0);
+        ok = BuildResourcesGl(work_w, work_h, w, h, bbf, bb_res.handle);
         if (!ok) FeedFail("resource build");
         else g.consecutive_fails = 0;
     }
@@ -3314,71 +3624,23 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
                 FeedGlSignal(&g.gl, g.gl_sem_in, n, inputs, g.mask_ok ? 4u : 3u);
             }
 
-            // D3D12: wait for the copies, evaluate, signal back. Unchanged machinery.
-            g.queue->Wait(g.fence12_in, n);
-            bool done = false;
-            if (!BeginCommands()) FeedFail("command list");
-            else
+            // D3D12: wait for the native bridge copies, optionally scale around NGX,
+            // then signal the native Output back to OpenGL.
+            const HRESULT input_wait = g.queue->Wait(g.fence12_in, n);
+            PrivateEvalResult eval_result = PrivateEvalResult::unsent;
+            if (FAILED(input_wait))
             {
-                Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                MvProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-
-                NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
-                ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
-                ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
-                ep.Feature.InSharpness = 0.0f;
-                ep.pInDepth          = g.tex12[SLOT_DEPTH];
-                ep.pInMotionVectors  = g.tex12[SLOT_MV];
-                ep.pInBiasCurrentColorMask = g.mask_ok ? g.tex12[SLOT_MASK] : nullptr;   // the shader's validation mask
-                ep.InJitterOffsetX   = 0.0f;
-                ep.InJitterOffsetY   = 0.0f;
-                ep.InRenderSubrectDimensions.Width  = g.width;
-                ep.InRenderSubrectDimensions.Height = g.height;
-                ep.InReset           = reset;
-                ep.InMVScaleX        = g_cfg.mv_scale_x;
-                ep.InMVScaleY        = g_cfg.mv_scale_y;
-                ep.InPreExposure     = 1.0f;
-                ep.InExposureScale   = 1.0f;
-
-                Breadcrumb("running the D3D12 evaluate (OpenGL transport)");
-                DWORD ecode = 0;
-                NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
-                if (ecode != 0)
-                {
-                    AbortCommands();  // never execute a list NGX crashed while recording
-                    Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
-                    FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
-                    g.frame_ready = false;
-                }
-                else
-                {
-                    Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-                    Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-                    Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-                    if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-                    Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
-                    EndCommands();
-                    if (NVSDK_NGX_FAILED(re))
-                    {
-                        Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
-                        FeedFail("evaluate");
-                        g.frame_ready = false;
-                    }
-                    else
-                        done = true;
-                }
+                Log("[feed] private queue Wait(input fence %llu) failed 0x%08X",
+                    static_cast<unsigned long long>(n), static_cast<unsigned>(input_wait));
+                FeedFail("input fence wait");
             }
-            if (done)
-                g.queue->Signal(g.fence12_out, n);   // after the evaluate, GPU-ordered
             else
-                g.fence12_out->Signal(n);            // CPU-signal so the GL stream never hangs on us
-                                                     // (glWaitSemaphoreEXT has no timeout)
+                eval_result = RunPrivateD3D12Evaluate(reset);
+            const PrivateSignalResult signal_result = SignalPrivateD3D12Result(n, eval_result);
+            const bool done = eval_result == PrivateEvalResult::submitted_success && signal_result.output_valid;
 
             Breadcrumb("waiting for the result (OpenGL)");
+            if (signal_result.released)
             {
                 const GLuint outputs[1] = { g.gl_tex[SLOT_OUTPUT] };
                 FeedGlWait(&g.gl, g.gl_sem_out, n, outputs, 1);   // server-side: the GPU stalls, the CPU does not
@@ -3392,7 +3654,9 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_
                 const UINT64 fn = ++g.frames_done;
                 g.consecutive_fails = 0;
                 if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
-                    Log("[feed] frame %llu delivered (%ux%u, reset=%d, OpenGL transport)", fn, g.width, g.height, reset);
+                    Log("[feed] frame %llu delivered (%ux%u at %d%% -> %ux%u, reset=%d, OpenGL transport)",
+                        fn, g.width, g.height, g_cfg.work_resolution,
+                        g.backbuffer_width, g.backbuffer_height, reset);
 
                 if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
                 {
@@ -3428,7 +3692,7 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
     auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cl->get_native());
     if (ctx == nullptr || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
 
-    if (ApplyPendingWorkResolution()) g.frame_ready = false;
+    if (ApplyPendingWorkResolution()) { g.frame_ready = false; g.create_grace = 0; }
     if ((g.frames_done % 60) == 0 && CfgReload()) g.frame_ready = false;
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
 
@@ -3612,7 +3876,13 @@ static void FeedFrame11(reshade::api::effect_runtime *rt, reshade::api::command_
                 Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
                 const UINT64 v_out = EndCommands();
 
-                if (NVSDK_NGX_FAILED(re))
+                if (v_out == 0)
+                {
+                    FeedFail("command submission");
+                    g.frame_ready = false;
+                    ok = false;
+                }
+                else if (NVSDK_NGX_FAILED(re))
                 {
                     Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
                     FeedFail("evaluate");
@@ -3879,8 +4149,11 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     ImGui::TextUnformatted("DLSS contract");
     static const char *kModes[] = { "Inert", "Transport test (no NGX)", "Full DLSS path" };
     if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) dirty = true;
-    const bool adjustable_work_resolution = rt != nullptr &&
-        rt->get_device()->get_api() == reshade::api::device_api::d3d11;
+    const reshade::api::device_api api = rt != nullptr
+        ? rt->get_device()->get_api() : static_cast<reshade::api::device_api>(0);
+    const bool adjustable_work_resolution = api == reshade::api::device_api::d3d11 ||
+                                             api == reshade::api::device_api::vulkan ||
+                                             api == reshade::api::device_api::opengl;
     if (adjustable_work_resolution)
     {
         if (g_pending_work_resolution == 0 && g_work_resolution_ui != g_cfg.work_resolution)
@@ -3900,7 +4173,7 @@ static void DrawOverlay(reshade::api::effect_runtime *rt)
     }
     else
     {
-        ImGui::TextDisabled("Work resolution: 100%% (adjustable path currently supports 64-bit D3D11)");
+        ImGui::TextDisabled("Work resolution: 100%% (native D3D12 stays fixed at the backbuffer size)");
     }
     static const char *kTri[] = { "Auto", "Force off", "Force on" };
     int hdr_idx = g_cfg.hdr + 1, di_idx = g_cfg.depth_inverted + 1;

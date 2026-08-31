@@ -92,7 +92,9 @@ static int MakeD12(D12 *d)
     d->rd.Format           = DXGI_FORMAT_R8G8B8A8_UNORM;
     d->rd.SampleDesc.Count = 1;
     d->rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-    d->rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    d->rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS |
+                             D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
     hr = d->dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &d->rd, D3D12_RESOURCE_STATE_COMMON,
                                          nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&d->tex));
     CHECK(hr, "CreateCommittedResource(shared texture)");

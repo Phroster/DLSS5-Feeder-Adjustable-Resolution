@@ -106,35 +106,22 @@ in fast motion, softness on thin moving geometry), and the HUD is processed alon
 
 ## Install for a 64-bit game
 
-1. **ReShade with add-on support** — from **https://reshade.me**, run the installer, pick your game's
-   `.exe`, choose **Direct3D 10/11/12**, and tick **"Enable loading of add-ons"** (the full /
-   unsigned build). This puts `dxgi.dll` next to the game.
-2. **DLSS5-Feeder** — from the
-   **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)** download
-   **`dlss5-feed.addon64`** and **`DLSS5_Feed.fx`**. Put `dlss5-feed.addon64` next to the game `.exe`
-   (same folder as `dxgi.dll`), and `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`.
-3. **Motion vectors** — the recommended provider is
-   **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX)** (its own repository; nothing of it
-   is bundled here). Green **Code ▸ Download ZIP**, then copy
-   - everything in its `Shaders\` — the `lumenite_*.fx` files **and** the `include\` folder —
-     into `reshade-shaders\Shaders\`
-   - `Textures\lumenite_bluenoise256.png` into `reshade-shaders\Textures\`
-
-   Four other providers are supported; see
-   [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider).
-   *(Our shader only reads the provider's output texture — it includes no third-party shader files.)*
-4. **DLSS 5 neural-rendering add-on** — `renodx-dlss5.addon64` and its model `nvngx_dlssnr.dll`.
-   Easiest is the **RHI** installer, which downloads and deploys them for you:
-   **https://github.com/RankFTW/RHI/releases** (or get them from the RenoDX Discord). Put both next
-   to the game `.exe`. Also drop a **`nvngx_dlss.dll`** there (any DLSS game has one, or use
-   [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper)).
-5. **Point the shader at that provider** — press **Home** for the ReShade overlay, select
-   `DLSS5_Feed.fx`, and in its **Preprocessor definitions** set **`DLSS5_MV_PROVIDER` = `3`**
-   (LumeniteFX Kernel), then reload effects. The shader's panel then reads
-   *"Motion vector provider: LumeniteFX Kernel"*.
-6. **Turn it on in-game** — enable **"LUMENITE: Kernel 2.0"**, then enable **DLSS 5 Feed**
-   *below it*, and enable neural rendering in the **DLSS 5 Neural Rendering** panel. Keep the
-   game's MSAA/SSAA **off**.
+1. Run **ReShade's installer** (https://reshade.me), point it at your game's `.exe`, choose
+   **Direct3D 10/11/12**, and tick **"Enable loading of add-ons"**.
+2. Download **`dlss5-feed.addon64`** and **`DLSS5_Feed.fx`** from the
+   **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)**. Put
+   `dlss5-feed.addon64` next to the game `.exe`, and `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`.
+3. Download **[LumeniteFX](https://github.com/umar-afzaal/LumeniteFX)** (Code ▸ Download ZIP). Copy
+   its `Shaders\` folder (the `lumenite_*.fx` files and `include\`) into `reshade-shaders\Shaders\`,
+   and `Textures\lumenite_bluenoise256.png` into `reshade-shaders\Textures\`.
+   *(Other providers: see [Motion vectors: choosing a provider](#motion-vectors-choosing-a-provider).)*
+4. Get **`renodx-dlss5.addon64`** and **`nvngx_dlssnr.dll`** — easiest via the
+   **[RHI installer](https://github.com/RankFTW/RHI/releases)**. Put both next to the game `.exe`,
+   plus a **`nvngx_dlss.dll`** (from any DLSS game, or [DLSS Swapper](https://github.com/beeradmoore/dlss-swapper)).
+5. Press **Home** for the ReShade overlay, select `DLSS5_Feed.fx`, set **`DLSS5_MV_PROVIDER` = `3`**
+   in its Preprocessor definitions, and reload effects.
+6. In-game: enable **"LUMENITE: Kernel 2.0"**, then **DLSS 5 Feed** below it, then turn on neural
+   rendering in the **DLSS 5 Neural Rendering** panel. Turn the game's MSAA/SSAA **off**.
 
 Check `dlss5-feed.log` (next to the game `.exe`) for `feature ready … DLAA`, `frame N delivered`,
 and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`. The overlay's
@@ -147,28 +134,20 @@ and `DLSS5_MV_PROVIDER=3 (LumeniteFX Kernel) -> Lumenite_Kernel (enabled)`. The 
 
 ## Install for a 32-bit game (beta)
 
-NGX and the DLSS 5 add-on are both 64-bit-only, so on a 32-bit game DLSS5-Feeder splits in two: a
-tiny 32-bit add-on lives in the game and ships frames to a bundled 64-bit helper process, which does
-all the actual DLSS/NGX work (details in [The 32-bit path](#the-32-bit-path)).
+32-bit games need one extra piece: a 64-bit helper that does the actual DLSS work, since NGX only
+exists as 64-bit code.
 
-1. **ReShade with add-on support** — as above, but the installer must detect your game as **32-bit**
-   and install the x86 build. (`dxgi.dll` should be ~4.4 MB; check its file properties if unsure.)
-2. **DLSS5-Feeder for 32-bit** — from the
-   **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)** download
-   **`dlss5-feed.addon32`**, **`DLSS5_Feed.fx`** and **`dlss5-feed-host64.exe`**.
-   - `dlss5-feed.addon32` → next to the game `.exe`
-   - `DLSS5_Feed.fx` → `reshade-shaders\Shaders\`
-   - create a **`host64\`** folder next to the game `.exe` and put `dlss5-feed-host64.exe` in it
-3. **Fill `host64\` with the 64-bit pieces** — the helper is a self-contained "game" of its own and
-   needs its **own** copies: a 64-bit ReShade `dxgi.dll`, `renodx-dlss5.addon64`, `nvngx_dlssnr.dll`
-   and `nvngx_dlss.dll`. (Run the ReShade installer once against any 64-bit game to obtain the x64
-   `dxgi.dll`, or extract `ReShade64.dll` from the installer and rename it.)
-4. **Motion vectors** — a provider into the game's `reshade-shaders\`, and the matching
-   `DLSS5_MV_PROVIDER` definition, exactly as in steps 3 and 5 of the 64-bit instructions.
-5. **Turn it on in-game** — as above, and check **ReShade's overlay → Add-ons tab → DLSS 5 Feed**:
-   the day-to-day DLSS 5 settings (neural uplift, NR intensity/style, …) are right there with an
-   **Apply** button — see [Configuration](#configuration). Set `host_window=0` on that page once
-   you are happy, since you should rarely need the separate window below.
+1. Run ReShade's installer, point it at your game's `.exe` — it detects **32-bit** automatically.
+2. Download **`dlss5-feed.addon32`**, **`DLSS5_Feed.fx`** and **`dlss5-feed-host64.exe`** from the
+   **[latest release](https://github.com/jlrouzies-fr/DLSS5-Feeder/releases/latest)**. Put
+   `dlss5-feed.addon32` next to the game `.exe`, `DLSS5_Feed.fx` into `reshade-shaders\Shaders\`,
+   and `dlss5-feed-host64.exe` into a new `host64\` folder next to the game `.exe`.
+3. Put a 64-bit ReShade `dxgi.dll`, `renodx-dlss5.addon64`, `nvngx_dlssnr.dll` and `nvngx_dlss.dll`
+   into `host64\`. (Get the x64 `dxgi.dll` by running the ReShade installer once against any 64-bit game.)
+4. Install a motion-vector provider into the game's `reshade-shaders\`, same as steps 3 and 5 of the
+   [64-bit instructions](#install-for-a-64-bit-game).
+5. Turn it on in-game as above. Day-to-day DLSS 5 settings live in **ReShade's overlay → Add-ons tab
+   → DLSS 5 Feed** — see [Configuration](#configuration).
 
 The first fed frame also spawns `host64\dlss5-feed-host64.exe`, which opens a window titled
 **"32-bit DLSS 5 Feeder"** — the add-on and the game never share a ReShade instance, so this is
@@ -179,99 +158,63 @@ Press Home in that window to open it:
 
 ## Install for a DirectX 9 game (beta)
 
-A real D3D9 device cannot work directly: ReShade on D3D9 caps at Shader Model 3, so **no** motion
-vector provider (ReshadeMotionEstimation, qUINT, … — all SM5) can even compile, and D3D9 has
-no shared NT handles or fences for the transport. The fix is to translate D3D9 to D3D11 first with
-**[dgVoodoo2](http://dege.freeweb.hu/dgVoodoo2/)**, which turns the game into the ordinary supported
-case — SM5 shaders, shareable textures, real fences.
+D3D9 games need a translation layer first — **[dgVoodoo2](http://dege.freeweb.hu/dgVoodoo2/)** turns
+D3D9 into D3D11, and everything after that is a normal 32-bit install.
 
-**Confirm you need this first:** run the game once with ReShade installed and look in `ReShade.log`.
-If the *runtime* is created after `Redirecting Direct3DCreate9` and you see `IDirect3DDevice9`, it is
-a genuine D3D9 game. (If instead you see `D3D11CreateDevice` and `Using feature level b000/b100`, the
-game already wraps to D3D11 — skip this section, it is just a normal 32-bit install.)
+**Not sure if you need this?** Launch the game with ReShade installed and check `ReShade.log`:
+`IDirect3DDevice9` means yes; `D3D11CreateDevice` means the game already runs on D3D11 — skip to
+[Install for a 32-bit game](#install-for-a-32-bit-game-beta).
 
-1. **Download dgVoodoo2** from **http://dege.freeweb.hu/dgVoodoo2/** and unzip it.
-2. **Copy three files next to the game's `.exe`** — this is the folder containing the executable,
-   which is often *not* the game's root folder (Fable Anniversary's is `Binaries\Win32\`):
-   - `MS\x86\D3D9.dll` — from the **`MS`** folder (DirectX), and **`x86`** for a 32-bit game
-     (`x64` only if the game is 64-bit)
-   - `dgVoodoo.conf`
-   - `dgVoodooCpl.exe`
-3. **Configure it.** Run `dgVoodooCpl.exe` **from that folder** (it only edits the `dgVoodoo.conf`
-   sitting beside it), or edit `dgVoodoo.conf` directly. In the **`[DirectX]`** section:
+1. Download dgVoodoo2 from **http://dege.freeweb.hu/dgVoodoo2/** and unzip it.
+2. Copy `MS\x86\D3D9.dll`, `dgVoodoo.conf` and `dgVoodooCpl.exe` next to the game's `.exe` (often
+   not the game's root folder — Fable Anniversary's is `Binaries\Win32\`).
+3. Run `dgVoodooCpl.exe` from that folder (or edit `dgVoodoo.conf` directly). In `[DirectX]`:
 
    | Setting | Value | Why |
    | --- | --- | --- |
-   | `DisableAndPassThru` | **`false`** | **The shipped default is `true`**, which makes dgVoodoo forward everything to the real D3D9 and do nothing at all. This is the single most common reason "dgVoodoo doesn't seem to do anything". |
-   | `VRAM` | **`1GB`** | The default `256` MB is a *virtual* card size reported to the game and causes **"ran out of video memory"** crashes regardless of your real GPU. Do not use `2GB`: 2048 MB in bytes is `0x80000000`, which overflows a signed 32-bit integer and old engines mishandle it. |
-   | `VideoCard` | `internal3D` | dgVoodoo's own virtual card; exposes the most capabilities. |
-   | `dgVoodooWatermark` | `true` | Temporarily — it is your proof dgVoodoo is actually running. |
+   | `DisableAndPassThru` | **`false`** | Ships as `true`, which disables dgVoodoo entirely — the #1 reason "dgVoodoo doesn't seem to do anything". |
+   | `VRAM` | **`1GB`** | The default (256 MB) causes "ran out of video memory" crashes regardless of your real GPU. Don't use `2GB` — some old engines mishandle it. |
+   | `VideoCard` | `internal3D` | dgVoodoo's own virtual card; the most capable option. |
+   | `dgVoodooWatermark` | `true` | Temporary — confirms dgVoodoo is actually running. |
 
-   And in **`[General]`**: `OutputAPI = d3d11_fl11_0` (or higher).
-4. **Verify before going further.** Launch the game: the **dgVoodoo watermark must appear**. If it
-   does not, dgVoodoo is not loading (wrong folder, wrong architecture, or `DisableAndPassThru` is
-   still `true`) and nothing else will work. `ReShade.log` should now show `D3D11CreateDevice`,
-   `Using feature level b000`, and `Recreated runtime environment` — a real D3D11 runtime.
-5. **Install DLSS5-Feeder normally** — follow
-   [Install for a 32-bit game](#install-for-a-32-bit-game-beta) (or the 64-bit steps for a 64-bit
-   D3D9 game). ReShade must be installed as **`dxgi.dll`**, never as `d3d9.dll` — dgVoodoo owns that
-   filename now and the two would fight.
+   In `[General]`: `OutputAPI = d3d11_fl11_0` (or higher).
+4. Launch the game — the **dgVoodoo watermark must appear**, or nothing else will work.
+5. Follow [Install for a 32-bit game](#install-for-a-32-bit-game-beta) (or the 64-bit steps for a
+   64-bit D3D9 game). Install ReShade as `dxgi.dll`, never `d3d9.dll` — dgVoodoo owns that name.
 6. Turn the watermark off once everything works.
 
 ## Install for a Vulkan game
 
 Same pieces as a 64-bit game — with two differences.
 
-1. **ReShade for Vulkan is a layer, not a `dxgi.dll`.** Its installer registers it globally and
-   gates it per-application, so make sure your game's exe is in that list (ReShade's installer adds
-   it when you point it at the exe). The add-ons still go next to the game exe, and the game's
-   `ReShade.ini` needs `AddonPath=.\` under `[ADDON]` so they are found there.
-2. **Everything else is identical** — `dlss5-feed.addon64`, `DLSS5_Feed.fx`, a motion-vector
-   provider, `renodx-dlss5.addon64` + the `nvngx_*.dll` files, exactly as in the
-   [64-bit instructions](#install-for-a-64-bit-game). The DLSS evaluate runs on a private D3D12
-   device (see [The Vulkan path](#the-vulkan-path)); nothing extra is needed for that.
+1. Run ReShade's installer, point it at your game's `.exe`, and choose **Vulkan**.
+2. Add `AddonPath=.\` under `[ADDON]` in the game's `ReShade.ini` (next to the exe).
+3. Everything else is identical to the [64-bit instructions](#install-for-a-64-bit-game).
 
-The transport needs the KHR external-interop extensions on the game's `VkDevice`, and most games do
-not enable them. **The add-on takes care of that by itself**: ReShade loads add-ons from inside its
-`vkCreateInstance` hook, i.e. before the game creates its device, so the add-on hooks
-`vkCreateDevice` and appends whichever of those extensions the driver supports (plus the
-`timelineSemaphore` feature). `dlss5-feed.log` lists, per extension, whether the game already had
-it, the add-on added it, or the driver lacks it. If the driver refuses the extended list, the call
-is retried untouched — the hook can never stop a game from starting.
+Most Vulkan games don't enable the extensions this needs — **the add-on adds them automatically**,
+so there's nothing else to configure. See [The Vulkan path](#the-vulkan-path) for the mechanism.
 
-**Only if `dlss5-feed.log` still says the interop entry points are missing** (the log says why:
-hook not installed, or installed but never reached — a game that creates its device some way the
-hook does not intercept), launch through the bundled out-of-process layer instead:
+**If `dlss5-feed.log` says the interop entry points are missing**, launch through the bundled
+fallback layer instead:
 
 ```
 layer\run-with-feed-layer.bat "E:\path\to\game.exe"
 ```
 
-See [`layer/README.md`](layer/README.md). It does the same job from outside the process.
+See [`layer/README.md`](layer/README.md) — it does the same job from outside the process.
 
 ## Install for an OpenGL game
 
-The simplest of the four. There is no hook, no layer and no registry entry — OpenGL has no
-creation-time opt-in for the interop extensions the transport needs, so if the driver has them,
-they are simply there.
+The simplest of the four — nothing extra to configure.
 
-1. **ReShade for OpenGL is a local `opengl32.dll` next to the game exe.** Run ReShade's installer,
-   pick the game's `.exe`, choose **OpenGL**, and tick **"Enable loading of add-ons"**. Add-ons are
-   then discovered automatically from ReShade's own directory — the game folder.
-2. **Everything else is identical to the [64-bit instructions](#install-for-a-64-bit-game)** —
-   `dlss5-feed.addon64`, `DLSS5_Feed.fx`, a motion-vector provider, `renodx-dlss5.addon64` and the
-   `nvngx_*.dll` files, all next to the game `.exe`. The DLSS evaluate runs on a private D3D12
-   device (see [The OpenGL path](#the-opengl-path)); nothing extra is needed for that.
+1. Run ReShade's installer, point it at your game's `.exe`, and choose **OpenGL**.
+2. Everything else is identical to the [64-bit instructions](#install-for-a-64-bit-game).
 
-For a **32-bit** OpenGL game, install the 32-bit ReShade (`opengl32.dll`, x86) plus
-`dlss5-feed.addon32` and the **`host64\`** folder exactly as in
-[Install for a 32-bit game](#install-for-a-32-bit-game-beta) — the helper, its bundled 64-bit
-ReShade and the DLSS 5 add-on live in there, unchanged. Install both halves from the same release:
-the two speak a versioned protocol and refuse a mismatched pair rather than misbehaving.
+For a **32-bit** OpenGL game, follow [Install for a 32-bit game](#install-for-a-32-bit-game-beta) —
+install both halves from the same release.
 
-> **Hybrid laptops:** force the game onto the NVIDIA GPU (Windows **Settings ▸ Display ▸ Graphics**,
-> or the NVIDIA control panel). On the integrated GPU the interop extensions do not exist, and the
-> feed disables itself with a message saying exactly that — DLSS could not have run there anyway.
+> **Hybrid laptops:** force the game onto the NVIDIA GPU (Windows **Settings ▸ Display ▸ Graphics**).
+> Otherwise the feed disables itself — DLSS needs that GPU.
 
 ## Motion vectors: choosing a provider
 

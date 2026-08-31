@@ -40,9 +40,10 @@ sampler DepthInput { Texture = DepthInputTex; };
 uniform int RESOLUTION_PERCENT <
     ui_type = "slider";
     ui_min = 50; ui_max = 100; ui_step = 1;
-    ui_label = "DLSS resolution scale";
-    ui_tooltip = "Controls the shared native DLSS/DLAA and Neural Rendering work resolution.\n"
-                 "The add-on resizes private inputs after you stop moving the slider; ReShade itself is not reloaded.";
+    ui_label = "DLAA + Neural Rendering work scale";
+    ui_tooltip = "Controls the shared work resolution of the injected DLAA and Neural Rendering stage.\n"
+                 "Lower values process fewer post-chain pixels; the game and backbuffer remain native-sized.\n"
+                 "The add-on applies the value after you stop moving the slider without reloading ReShade.";
 > = 50;
 
 uniform float2 MV_SIGN <
@@ -118,8 +119,8 @@ float3 PS_Debug(float4 vpos : SV_Position, float2 uv : TEXCOORD) : SV_Target
 
 technique DLSS5_Feed
 <
-    ui_label   = "DLSS 5 Feed Resolution Scale (place below MartysMods_Launchpad)";
-    ui_tooltip = "Supplies full-resolution color/depth/motion guides; the add-on applies one shared DLSS/DLAA/NR scale without reloading ReShade.";
+    ui_label   = "DLSS 5 Feed Work Resolution (place below MartysMods_Launchpad)";
+    ui_tooltip = "Supplies full-resolution color/depth/motion guides; the add-on applies one shared DLAA/Neural Rendering work scale without reloading ReShade.";
 >
 {
     pass Color         { VertexShader = VS_Feed; PixelShader = PS_Color;         RenderTarget = DLSS5_Color; }

@@ -1,11 +1,29 @@
 # Building NR50
 
+The checked-in v0.3.1 binary was built from this repository's source against these
+recorded dependency revisions. The slider path was runtime-verified before the latest
+metadata-only rebuild; smoke-test the current binary in MGS4 again before publishing a
+new release:
+
+- DLSS5-Feeder/ReShade headers:
+  [`c452ddc09d3d3ec5e51a9ee2178ead6674fefbac`](https://github.com/jlrouzies-fr/DLSS5-Feeder/commit/c452ddc09d3d3ec5e51a9ee2178ead6674fefbac)
+- NVIDIA DLSS SDK 310.7.0:
+  [`a291cc7d2cc642a51566f3dfd5376f635cd1b284`](https://github.com/NVIDIA/DLSS/commit/a291cc7d2cc642a51566f3dfd5376f635cd1b284)
+
+Newer upstream revisions may change interfaces or behavior. Pin these revisions when
+reproducing the existing binary, and review upstream changes deliberately before
+upgrading either dependency.
+
 ## Requirements
 
 - Windows 11 x64
 - Visual Studio 2022 Build Tools with the Desktop development with C++ workload
 - A local checkout of upstream DLSS5-Feeder, including its ReShade submodule headers
 - A separately obtained NVIDIA DLSS SDK checkout
+
+The NVIDIA SDK is subject to its own terms. Confirm that your intended build and
+distribution comply with those terms; this repository does not grant rights to SDK
+headers, libraries, or runtimes.
 
 The expected inputs are:
 
@@ -29,3 +47,7 @@ and `src\version.rc`, writes `build\Release\dlss5-feed.addon64`, copies the resu
 
 No NVIDIA SDK header, import library, runtime DLL, RenoDX binary, ReShade distribution,
 iMMERSE shader, or game file is copied into the repository or release package.
+
+Compiler, linker, and SDK revisions can affect the final binary hash. Always publish
+the hash produced by the build script and test the resulting add-on in a rendered scene
+before treating it as release-ready.

@@ -114,7 +114,10 @@ function Save-Target {
         $backupFile = $BackupName
         Copy-Item -LiteralPath $targetFull -Destination (Join-Path $backupDir $backupFile) -Force
     }
-    $relative = [IO.Path]::GetRelativePath($game, $targetFull)
+    # Assert-UnderGame already proved this target begins with "$game\". Using a
+    # validated substring keeps the installer compatible with Windows PowerShell 5.1,
+    # whose .NET Framework does not provide Path.GetRelativePath().
+    $relative = $targetFull.Substring($game.Length + 1)
     $entries.Add([ordered]@{
         targetRelative = $relative
         backupFile = $backupFile
@@ -204,10 +207,10 @@ try {
 }
 
 $installedHash = (Get-FileHash -LiteralPath $addonTarget -Algorithm SHA256).Hash
-Write-Host 'DLSS5 Feeder Single Resolution Slider 0.3.1 installed successfully.' -ForegroundColor Green
+Write-Host 'DLSS5 Feeder Work Resolution Slider 0.3.1 installed successfully.' -ForegroundColor Green
 Write-Host "Game:     $game"
 Write-Host "Preset:   $presetPath"
 Write-Host "Backup:   $backupDir"
 Write-Host "SHA-256:  $installedHash"
-Write-Host 'Keep RenoDX "Enable Upscaling WIP" disabled. The Feeder uses one shared native DLSS/DLAA/NR scale.'
+Write-Host 'Keep RenoDX "Enable Upscaling WIP" disabled. The Feeder uses one shared DLAA + Neural Rendering work scale.'
 Write-Host 'Launch a scene, then run Verify-NR50.ps1.'

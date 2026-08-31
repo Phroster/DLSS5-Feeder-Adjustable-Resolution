@@ -10,10 +10,10 @@
 // EvaluateFeature and reads the DLSS "contract" it finds there (Color, Depth,
 // MotionVectors, Output, sizes, jitter, reset...). Nothing in a DLSS-less game ever
 // issues those calls, so this add-on issues them itself: it takes the frame ReShade is
-// processing, the downsampled color/raw depth and motion vectors prepared by the
-// companion effect "DLSS5_Feed.fx" (which converts iMMERSE LaunchPad's optical flow),
-// copies the three into textures shared with a private D3D12 device, runs a genuine
-// native-resolution DLAA evaluate at the selected dimensions on that device -- where the
+// processing and the full-resolution color/raw depth/motion-vector guides prepared by
+// the companion effect "DLSS5_Feed.fx" (which converts iMMERSE LaunchPad's optical flow),
+// copies or resamples them into textures shared with a private D3D12 device, then runs an
+// equal-input/output DLAA evaluate at the selected work dimensions on that device -- where the
 // DLSS 5 add-on inserts its native-resolution Neural Rendering pass --
 // and copies the result back over the backbuffer, still inside ReShade's effect chain.
 //
@@ -22,8 +22,9 @@
 // The NGX side uses NVIDIA's NGX SDK static library, which locates and loads the
 // driver's _nvngx.dll by itself.
 //
-// Behaviour is driven by dlss5-feed.cfg (re-read while the game runs). dlss5-feed.log
-// records what was found, what was built and the result of every NGX call.
+// The slider is a ReShade uniform persisted in ReShade.ini. Advanced controls live in
+// dlss5-feed.cfg (re-read while the game runs), while dlss5-feed.log records what was found,
+// what was built and the result of every NGX call.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -48,9 +49,9 @@
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Feeds DLSS 5 neural rendering with ReShade's depth and LaunchPad motion vectors in games "
-    "without DLSS: dynamically resizes full-resolution ReShade guides into one shared native DLSS/DLAA plus NR "
+    "without native DLSS: dynamically resizes full-resolution ReShade guides into one shared DLAA plus Neural Rendering work-resolution "
     "contract on a private D3D12 device, then expands the result into the native backbuffer. Needs DLSS5_Feed.fx + "
-    "MartysMods LaunchPad. One 50-100% slider applies without reloading ReShade; diagnostics remain in dlss5-feed.cfg.";
+    "MartysMods LaunchPad. The slider persists through ReShade.ini without reloading ReShade; advanced controls use dlss5-feed.cfg and diagnostics use dlss5-feed.log.";
 
 // ---------------------------------------------------------------------------
 // Logging

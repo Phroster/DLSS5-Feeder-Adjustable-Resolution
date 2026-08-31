@@ -61,7 +61,7 @@ D3D9 via a wrapper.
 **This is beta software.** Expect the temporal quality of *estimated* motion vectors (some ghosting
 in fast motion, softness on thin moving geometry), and the HUD is processed along with the scene.
 
-> ### 0.6.0-beta: read this before installing
+> ### 0.6.1: read this before installing
 >
 > **The motion-vector provider is now chosen with a preprocessor definition** (`DLSS5_MV_PROVIDER`)
 > instead of being whichever shader happens to write `texMotionVectors`. Five providers are

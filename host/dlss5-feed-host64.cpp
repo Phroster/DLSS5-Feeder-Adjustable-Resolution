@@ -484,8 +484,17 @@ static bool InitDisguise()
     sd.BufferCount      = 2;
     sd.SwapEffect       = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     hr = factory->CreateSwapChainForHwnd(h.pump_queue, h.hwnd, &sd, nullptr, nullptr, &h.swap);
+    // By default DXGI watches this window and may act on window/foreground changes -- which,
+    // for a helper spawned behind a fullscreen game, can pull the game out of focus. We only
+    // ever use this swapchain to keep ReShade pumping, so tell DXGI to keep its hands off.
+    if (SUCCEEDED(hr))
+        factory->MakeWindowAssociation(h.hwnd, DXGI_MWA_NO_WINDOW_CHANGES | DXGI_MWA_NO_ALT_ENTER);
     factory->Release();
     if (FAILED(hr)) { Log("[host] CreateSwapChainForHwnd failed 0x%08X", hr); return false; }
+    // Park it at the bottom of the Z-order without activating, so a respawn never surfaces
+    // over the game. The user can still raise it from the taskbar to reach the add-on panel.
+    if (g_show_window)
+        SetWindowPos(h.hwnd, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     Log("[host] disguise up: hidden window + D3D12 swapchain (ReShade should be attached now)");
 
     for (int i = 0; i < 60; ++i) PumpPresent();   // let ReShade + the DLSS 5 add-on settle
@@ -883,6 +892,16 @@ static int Serve(DWORD game_pid)
             break;
         }
     }
+
+    // The game closed the pipe (a settings apply, a shutdown, or a crash). It queues a
+    // GPU-side wait on fence_out for every frame message it writes, and a successful
+    // pipe write does not mean we ever read it: exiting now could leave a wait that
+    // nothing will ever satisfy, wedging the game's whole GPU queue -- Present
+    // included -- until the driver TDRs (seen once as a system-wide freeze). Drain our
+    // own queue, then release every wait the game could possibly hold.
+    WaitFenceValue(h.fence, h.fence_value, 2000);
+    if (h.fence_out != nullptr) h.fence_out->Signal(UINT64_MAX);
+    Log("[host] pending game fence waits released; exiting");
     return 0;
 }
 

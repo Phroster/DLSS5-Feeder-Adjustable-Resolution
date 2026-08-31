@@ -30,7 +30,7 @@
 
 #include "feed_ipc.h"
 
-#define FEED_VERSION "0.6.0-beta.2"
+#define FEED_VERSION "0.6.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed (32-bit) " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
@@ -402,8 +402,38 @@ static void FeedFail(const char *what)
 // Host process + pipe
 // ---------------------------------------------------------------------------
 
+static void HostDrain()
+{
+    // A GPU-side Wait(fence_out, frame_n) is queued on the immediate context every
+    // frame BEFORE the host has signalled it. If the host goes away first, that wait
+    // can never be satisfied, and everything queued behind it -- Present included --
+    // wedges until the driver TDRs (seen as a system-wide freeze when it happened on
+    // a settings apply). Never let go of a live host before the last submitted frame
+    // has been signalled. The host also catch-up-signals fence_out on its way out,
+    // so with both sides healthy this resolves in milliseconds.
+    if (!g.fence_wait_queued || g.fence_out == nullptr) return;
+    g.fence_wait_queued = false;
+    if (g.fence_out->GetCompletedValue() >= g.frame_n) return;
+    if (g.hproc == nullptr || WaitForSingleObject(g.hproc, 0) != WAIT_TIMEOUT)
+    {
+        // The host is already dead and can no longer signal: the wait (if the GPU
+        // reached it) is unsatisfiable and there is nothing we can do from D3D11.
+        Log("[feed32] drain: host died before signalling frame %llu",
+            static_cast<unsigned long long>(g.frame_n));
+        return;
+    }
+    HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (evt == nullptr) return;
+    if (SUCCEEDED(g.fence_out->SetEventOnCompletion(g.frame_n, evt)) &&
+        WaitForSingleObject(evt, 2000) != WAIT_OBJECT_0)
+        Log("[feed32] drain: frame %llu never signalled by the host",
+            static_cast<unsigned long long>(g.frame_n));
+    CloseHandle(evt);
+}
+
 static void HostClose()
 {
+    HostDrain();   // BEFORE the pipe closes: the host must still be around to signal
     if (g.pipe != nullptr)  { CloseHandle(g.pipe); g.pipe = nullptr; }
     if (g.hproc != nullptr)
     {
@@ -412,6 +442,35 @@ static void HostClose()
         CloseHandle(g.hproc);
         g.hproc = nullptr;
     }
+    // The fences belong to the host that just went away; a new host creates new ones.
+    // Releasing them on EVERY close (not just the apply path) is what makes a respawn
+    // reopen from the new host's BuildAck instead of waiting on dead fences forever.
+    SafeRelease(g.fence_in);
+    SafeRelease(g.fence_out);
+}
+
+// Set when a restart is initiated from the overlay, so the game's own window can be put
+// back in front once the replacement host is up. Windows only honours SetForegroundWindow
+// from a process that is already foreground -- which the game is at the moment the user
+// clicks Apply, so we capture it there and spend it a couple of seconds later.
+static HWND g_restore_focus;
+
+static void CaptureGameFocus()
+{
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg != nullptr && GetWindowThreadProcessId(fg, &pid) != 0 && pid == GetCurrentProcessId())
+        g_restore_focus = fg;   // only ever restore a window that is ours
+}
+
+static void RestoreGameFocus()
+{
+    if (g_restore_focus == nullptr) return;
+    HWND w = g_restore_focus;
+    g_restore_focus = nullptr;
+    if (!IsWindow(w) || GetForegroundWindow() == w) return;
+    SetForegroundWindow(w);
+    Log("[feed32] focus returned to the game window");
 }
 
 static void HostLost(const char *why)
@@ -487,6 +546,7 @@ static bool EnsureHost()
     if (!PipeWrite(&hello, sizeof(hello)) || !PipeRead(&ack, sizeof(ack)) || ack.magic != FEED_IPC_MAGIC)
     { HostLost("handshake failed"); return false; }
     Log("[feed32] host connected (protocol v%u)", ack.version);
+    RestoreGameFocus();   // the replacement host is up; take the foreground back if we lost it
     return true;
 }
 
@@ -494,13 +554,78 @@ static bool EnsureHost()
 // The host's DLSS 5 settings, controlled from the game's own ReShade panel.
 // The renodx add-on reads [RenoDX.DLSS5] from the HOST's ReShade.ini at startup
 // (only its own panel can change them live), so applying = write that ini and
-// cycle the host. The game renders normally during the ~2 s gap.
+// cycle the host. The game renders normally during the gap, which is usually a couple of
+// seconds but can reach ~15 s -- the replacement host has to re-init NGX and reload the
+// ~165 MB DLSSNR model before it can serve a frame.
 // ---------------------------------------------------------------------------
 
-struct HostNR
+// This table mirrors the DLSS 5 add-on's own panel one-for-one: same order, same
+// labels, same widget kinds, same dropdown entries. Labels and combo entries were
+// taken verbatim from the add-on binary's string table, so they read identically
+// here and in the host window -- a slider here where the add-on has a dropdown is
+// how NRStyle=2 got written into a two-entry ("Natural"/"Cinematic") setting.
+//
+// Ranges: the add-on does not publish its min/max, so these are supersets of every
+// value observed in real ReShade.ini files written by the add-on's own panel on this
+// machine. Where a range is a judgement call the tooltip says so, and the host
+// window's own panel stays the final authority.
+enum NRKind { NR_BOOL, NR_COMBO, NR_FLOAT };
+
+struct NRSetting
 {
-    int   uplift, intensity, style, automask, uicorr;
-    float structure_, tone;
+    const char        *key;
+    const char        *label;
+    NRKind             kind;
+    float              def, lo, hi;
+    const char        *format;
+    const char *const *items;
+    int                item_count;
+    const char        *tooltip;
+};
+
+static const char *const kNRPresetItems[] = { "Default", "Preset #1", "Preset #2", "Preset #3" };
+// "Default" is shared with the preset list above -- the compiler pools the literal, which is
+// why only one copy of it appears in the add-on's string table.
+static const char *const kNRStyleItems[]  = { "Default", "Natural", "Cinematic" };
+static const char *const kNRDepthItems[]  = { "Use game NGX flag", "Force normal depth", "Force inverted depth" };
+
+// Section boundaries, matching the add-on's own grouping.
+enum { NR_TRANSFER_FIRST = 10, NR_GUIDE_FIRST = 13, NR_COUNT = 16 };
+
+static const NRSetting kNR[NR_COUNT] = {
+    { "NeuralUplift",      "Enable DLSS Neural Rendering", NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
+      "The add-on's master switch. Off leaves the DLAA output untouched." },
+    { "NREnableUpscaling", "Enable Upscaling",             NR_BOOL,   0.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
+      "Lets the neural pass also upscale. The feed already hands the host a native-sized "
+      "contract, so this is normally off; use 'Work resolution' above instead." },
+    { "NRPreset",          "NR Preset",                    NR_COMBO,  0.0f,  0.0f,  3.0f, nullptr, kNRPresetItems, 4,
+      "Maps to the DLSSNR render-preset hint." },
+    { "NRStyle",           "NR Style",                     NR_COMBO,  0.0f,  0.0f,  2.0f, nullptr, kNRStyleItems, 3,
+      "Default keeps the add-on's own choice; Natural and Cinematic force it." },
+    { "NRIntensity",       "NR Intensity",                 NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0,
+      "Overall strength of the relighting. Community guides suggest 1.00-1.05; the slider "
+      "allows the full observed 0-2 range." },
+    { "NRLocalTone",       "Local Tone Strength",          NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
+    { "NRLocalStructure",  "Local Structure Strength",     NR_FLOAT,  1.0f,  0.0f,  2.0f, "%.2f", nullptr, 0, nullptr },
+    { "NRSkinStructure",   "Skin Structure Strength",      NR_FLOAT, -1.0f, -1.0f,  1.0f, "%.2f", nullptr, 0,
+      "Facial detail. Defaults to -1; positive values sharpen skin." },
+    { "NRAutoMask",        "Automatic Mask",               NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0, nullptr },
+    { "NRUICorrection",    "NR UI Correction",             NR_BOOL,   1.0f,  0.0f,  1.0f, nullptr, nullptr, 0,
+      "Keeps HUD/UI from being re-lit. The feed inserts before ReShade's UI pass, so leave on." },
+
+    { "NRPaperWhiteScale", "Scene Paper-White Scale",      NR_FLOAT,  1.0f,  0.0f, 10.0f, "%.3f", nullptr, 0,
+      "Normalises scene brightness for the neural pass. 1.0 for an SDR game like this one; "
+      "for HDR titles match the game's own paper-white." },
+    { "NRTransferStrength","HDR Transfer Strength",        NR_FLOAT,  1.0f,  0.0f,  1.0f, "%.2f", nullptr, 0, nullptr },
+    { "NRColorStrength",   "Color Strength",               NR_FLOAT,  1.0f,  0.0f,  1.0f, "%.2f", nullptr, 0, nullptr },
+
+    { "NRDepthMode",       "Depth Convention",             NR_COMBO,  0.0f,  0.0f,  2.0f, nullptr, kNRDepthItems, 3,
+      "Independent of the feed's own 'Depth inverted' above: this one overrides what the "
+      "HOST tells NGX. Leave on 'Use game NGX flag'." },
+    { "NRMVecScaleX",      "Motion Scale X Multiplier",    NR_FLOAT,  1.0f,  0.0f,  4.0f, "%.2f", nullptr, 0,
+      "Applied by the add-on on top of the feed's own 'MV scale X' above -- they multiply." },
+    { "NRMVecScaleY",      "Motion Scale Y Multiplier",    NR_FLOAT,  1.0f,  0.0f,  4.0f, "%.2f", nullptr, 0,
+      "Applied by the add-on on top of the feed's own 'MV scale Y' above -- they multiply." },
 };
 
 static void HostIniPath(char *out)
@@ -510,60 +635,78 @@ static void HostIniPath(char *out)
         strcpy_s(s + 1, MAX_PATH - (s + 1 - out), "host64\\ReShade.ini");
 }
 
-static void ReadHostNR(HostNR *v)
-{
-    char p[MAX_PATH], buf[64];
-    HostIniPath(p);
-    v->uplift    = GetPrivateProfileIntA("RenoDX.DLSS5", "NeuralUplift", 1, p);
-    v->intensity = GetPrivateProfileIntA("RenoDX.DLSS5", "NRIntensity", 2, p);
-    v->style     = GetPrivateProfileIntA("RenoDX.DLSS5", "NRStyle", 0, p);
-    v->automask  = GetPrivateProfileIntA("RenoDX.DLSS5", "NRAutoMask", 1, p);
-    v->uicorr    = GetPrivateProfileIntA("RenoDX.DLSS5", "NRUICorrection", 1, p);
-    GetPrivateProfileStringA("RenoDX.DLSS5", "NRLocalStructure", "0.99", buf, sizeof(buf), p);
-    v->structure_ = static_cast<float>(atof(buf));
-    GetPrivateProfileStringA("RenoDX.DLSS5", "NRLocalTone", "0.45", buf, sizeof(buf), p);
-    v->tone = static_cast<float>(atof(buf));
-}
-
-static void WriteHostNR(const HostNR &v)
-{
-    char p[MAX_PATH], buf[64];
-    HostIniPath(p);
-    sprintf_s(buf, "%d", v.uplift);        WritePrivateProfileStringA("RenoDX.DLSS5", "NeuralUplift", buf, p);
-    sprintf_s(buf, "%d", v.intensity);     WritePrivateProfileStringA("RenoDX.DLSS5", "NRIntensity", buf, p);
-    sprintf_s(buf, "%d", v.style);         WritePrivateProfileStringA("RenoDX.DLSS5", "NRStyle", buf, p);
-    sprintf_s(buf, "%d", v.automask);      WritePrivateProfileStringA("RenoDX.DLSS5", "NRAutoMask", buf, p);
-    sprintf_s(buf, "%d", v.uicorr);        WritePrivateProfileStringA("RenoDX.DLSS5", "NRUICorrection", buf, p);
-    sprintf_s(buf, "%.6f", v.structure_);  WritePrivateProfileStringA("RenoDX.DLSS5", "NRLocalStructure", buf, p);
-    sprintf_s(buf, "%.6f", v.tone);        WritePrivateProfileStringA("RenoDX.DLSS5", "NRLocalTone", buf, p);
-}
-
 // Cache of the host's settings, shown and edited on the ReShade overlay page (Add-ons
 // tab -> DLSS 5 Feed). Loaded from the host's ini on first resolve so the panel always
 // starts from what is actually active, never a stale default.
-static HostNR g_host_nr;
-static bool   g_host_nr_loaded;
+static float g_nr[NR_COUNT];
+static bool  g_nr_present[NR_COUNT];   // the key existed in the host's ini
+static bool  g_nr_touched[NR_COUNT];   // edited here since the last load
+static bool  g_host_nr_loaded;
+
+static void ReadHostNR()
+{
+    char p[MAX_PATH], buf[64];
+    HostIniPath(p);
+    for (int i = 0; i < NR_COUNT; ++i)
+    {
+        // A sentinel default separates "absent" from "present and equal to our default":
+        // we must not write back a guessed default over a key the add-on owns.
+        GetPrivateProfileStringA("RenoDX.DLSS5", kNR[i].key, "\x01", buf, sizeof(buf), p);
+        g_nr_present[i] = (buf[0] != '\x01');
+        g_nr[i]         = g_nr_present[i] ? static_cast<float>(atof(buf)) : kNR[i].def;
+        g_nr_touched[i] = false;
+    }
+}
+
+static void WriteHostNR()
+{
+    char p[MAX_PATH], buf[64];
+    HostIniPath(p);
+    for (int i = 0; i < NR_COUNT; ++i)
+    {
+        // Only keys the add-on already had, or that the user actually moved here. Writing
+        // our guessed default for an untouched key would silently overwrite the add-on's
+        // own (unpublished) default with ours.
+        if (!g_nr_present[i] && !g_nr_touched[i]) continue;
+        if (kNR[i].kind == NR_FLOAT) sprintf_s(buf, "%g", g_nr[i]);
+        else                         sprintf_s(buf, "%d", static_cast<int>(g_nr[i]));
+        WritePrivateProfileStringA("RenoDX.DLSS5", kNR[i].key, buf, p);
+        g_nr_present[i] = true;
+        g_nr_touched[i] = false;
+    }
+}
+
+static void LogHostNR(const char *what)
+{
+    char line[512];
+    int  n = sprintf_s(line, "[feed32] %s:", what);
+    for (int i = 0; i < NR_COUNT && n > 0 && n < static_cast<int>(sizeof(line)) - 48; ++i)
+    {
+        if (kNR[i].kind == NR_FLOAT) n += sprintf_s(line + n, sizeof(line) - n, " %s=%g", kNR[i].key, g_nr[i]);
+        else                         n += sprintf_s(line + n, sizeof(line) - n, " %s=%d", kNR[i].key, static_cast<int>(g_nr[i]));
+        if (!g_nr_present[i] && !g_nr_touched[i]) n += sprintf_s(line + n, sizeof(line) - n, "(default)");
+    }
+    Log("%s", line);
+}
 
 static void HostClose();   // below
 
 static void HostApplySettings()
 {
-    Log("[feed32] applying DLSS 5 host settings: uplift=%d intensity=%d style=%d structure=%.2f tone=%.2f automask=%d uicorr=%d",
-        g_host_nr.uplift, g_host_nr.intensity, g_host_nr.style, g_host_nr.structure_, g_host_nr.tone,
-        g_host_nr.automask, g_host_nr.uicorr);
+    LogHostNR("applying DLSS 5 host settings");
+    CaptureGameFocus();   // spent once the replacement host has connected
 
     // Order matters: the host's ReShade saves its ini ON EXIT and would clobber our
-    // values -- close the host first, write after, respawn on the next frame.
+    // values -- close the host first (HostClose drains the in-flight frame and
+    // releases the shared fences), write after, respawn on the next frame.
     HostClose();
-    WriteHostNR(g_host_nr);
+    WriteHostNR();
 
-    SafeRelease(g.fence_in);    // the new host creates new fences; reopen from its BuildAck
-    SafeRelease(g.fence_out);
     g.built = false;
     g.disabled = false;
     g.consecutive_fails = 0;
     g_retry_at = 0;
-    Warn("DLSS 5 settings applied -- restarting the host (~2 s)");
+    Warn("DLSS 5 settings applied -- restarting the host (up to 15 s)");
 }
 
 // ---------------------------------------------------------------------------
@@ -1127,6 +1270,7 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
             {
                 Breadcrumb("waiting for the host's result");
                 g.ctx4->Wait(g.fence_out, n);       // GPU-side; the host CPU-signals on failure
+                g.fence_wait_queued = true;         // HostDrain must resolve this before any close
                 BlitOutputToBackbuffer(ctx, rtv11);
                 const UINT64 done = ++g.frames_done;
                 g.consecutive_fails = 0;
@@ -1176,11 +1320,9 @@ static void ResolveHandles(reshade::api::effect_runtime *rt)
 
     if (!g_host_nr_loaded)
     {
-        ReadHostNR(&g_host_nr);
+        ReadHostNR();
         g_host_nr_loaded = true;
-        Log("[feed32] host DLSS 5 settings loaded into the overlay page: uplift=%d intensity=%d style=%d structure=%.2f tone=%.2f automask=%d uicorr=%d",
-            g_host_nr.uplift, g_host_nr.intensity, g_host_nr.style, g_host_nr.structure_, g_host_nr.tone,
-            g_host_nr.automask, g_host_nr.uicorr);
+        LogHostNR("host DLSS 5 settings loaded into the overlay page");
     }
 
     char v[16] = {};
@@ -1263,15 +1405,13 @@ static void OnDestroyDevice(reshade::api::device *dev)
     if (g.dev != nullptr && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev)
     {
         Log("[feed32] game device destroyed; shutting down");
+        HostClose();     // drain + end the host while the fences are still alive
         ReleaseShared();
-        SafeRelease(g.fence_in);
-        SafeRelease(g.fence_out);
         SafeRelease(g.ctx4);
         SafeRelease(g.blit_vs);
         SafeRelease(g.blit_ps);
         SafeRelease(g.blit_sampler);
         g.dev = nullptr;
-        HostClose();
     }
 }
 
@@ -1360,18 +1500,70 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
     ImGui::Separator();
     ImGui::TextUnformatted("DLSS 5 neural-rendering settings (on the host)");
-    bool uplift = g_host_nr.uplift != 0, automask = g_host_nr.automask != 0, uicorr = g_host_nr.uicorr != 0;
-    ImGui::Checkbox("Neural uplift", &uplift);           g_host_nr.uplift   = uplift   ? 1 : 0;
-    ImGui::SliderInt("NR intensity", &g_host_nr.intensity, 0, 5);
-    ImGui::SliderInt("NR style", &g_host_nr.style, 0, 3);
-    ImGui::SliderFloat("NR local structure", &g_host_nr.structure_, 0.0f, 1.0f);
-    ImGui::SliderFloat("NR local tone", &g_host_nr.tone, 0.0f, 1.0f);
-    ImGui::Checkbox("NR auto mask", &automask);          g_host_nr.automask = automask ? 1 : 0;
-    ImGui::Checkbox("NR UI correction", &uicorr);        g_host_nr.uicorr   = uicorr   ? 1 : 0;
+    ImGui::SameLine();
+    HelpMarker("The same settings, in the same order, as the \"DLSS 5 Neural Rendering\" panel in "
+               "the host window -- mirrored here so you do not have to alt-tab. They live in the "
+               "host's own ReShade.ini, which it reads at startup, so applying them restarts the "
+               "host. Settings you never touch here are left exactly as the add-on wrote them.");
+
+    // The overlay can be opened before the first effect-runtime resolve has loaded these.
+    if (!g_host_nr_loaded) { ReadHostNR(); g_host_nr_loaded = true; }
+
+    for (int i = 0; i < NR_COUNT; ++i)
+    {
+        if (i == NR_TRANSFER_FIRST)
+        {
+            ImGui::Spacing();
+            ImGui::TextDisabled("Control-compatible color transfer");
+        }
+        else if (i == NR_GUIDE_FIRST)
+        {
+            ImGui::Spacing();
+            ImGui::TextDisabled("Guide overrides (leave at defaults unless diagnostics require them)");
+        }
+
+        const NRSetting &s = kNR[i];
+        bool edited = false;
+        if (s.kind == NR_BOOL)
+        {
+            bool b = g_nr[i] != 0.0f;
+            if (ImGui::Checkbox(s.label, &b)) { g_nr[i] = b ? 1.0f : 0.0f; edited = true; }
+        }
+        else if (s.kind == NR_COMBO)
+        {
+            int idx = static_cast<int>(g_nr[i]);
+            if (idx < 0 || idx >= s.item_count) idx = 0;   // a value the add-on could not have written
+            if (ImGui::Combo(s.label, &idx, s.items, s.item_count)) { g_nr[i] = static_cast<float>(idx); edited = true; }
+        }
+        else
+        {
+            if (ImGui::SliderFloat(s.label, &g_nr[i], s.lo, s.hi, s.format)) edited = true;
+        }
+        if (edited) g_nr_touched[i] = true;
+
+        if (s.tooltip != nullptr) { ImGui::SameLine(); HelpMarker(s.tooltip); }
+
+        // Flag a stored value the add-on's own widget could never produce (an older build of
+        // this panel wrote NRStyle=2 into a two-entry dropdown).
+        if (s.kind == NR_COMBO && (g_nr[i] < 0.0f || g_nr[i] >= static_cast<float>(s.item_count)))
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f),
+                               "   stored value %d is out of range - pick one above to correct it",
+                               static_cast<int>(g_nr[i]));
+        else if (!g_nr_present[i] && !g_nr_touched[i])
+            { ImGui::SameLine(); ImGui::TextDisabled("(add-on default)"); }
+    }
+
+    ImGui::Spacing();
     if (ImGui::Button("Apply to the DLSS 5 host"))
         HostApplySettings();
     ImGui::SameLine();
-    ImGui::TextDisabled("(restarts the helper process, ~2 s without DLSS)");
+    if (ImGui::Button("Reload from host"))
+    {
+        ReadHostNR();
+        LogHostNR("host DLSS 5 settings reloaded from the overlay page");
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(applying restarts the helper process; up to 15 s without DLSS)");
 
     if (dirty) CfgSave();
 }

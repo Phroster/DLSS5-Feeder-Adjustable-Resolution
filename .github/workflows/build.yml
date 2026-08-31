@@ -105,11 +105,11 @@ jobs:
       # The builds. Each script finds its own toolchain through
       # tools\vcvars.bat, so nothing here hardcodes a Visual Studio path.
       # ------------------------------------------------------------------
-      - name: dlss5-feed.addon64 (64-bit add-on -- D3D11/D3D12/Vulkan + NGX)
+      - name: dlss5-feed.addon64 (64-bit add-on -- D3D11/D3D12/Vulkan/OpenGL + NGX)
         shell: cmd
         run: call build.bat
 
-      - name: dlss5-feed.addon32 (32-bit in-game half)
+      - name: dlss5-feed.addon32 (32-bit in-game half -- D3D11/OpenGL)
         shell: cmd
         run: call build-addon32.bat
 
@@ -121,7 +121,7 @@ jobs:
         shell: cmd
         run: call layer\build-layer.bat
 
-      - name: spike (phase-0 cross-process sharing probe)
+      - name: spike (phase-0 cross-process sharing + OpenGL interop probes)
         shell: cmd
         run: call spike\build-spike.bat
 

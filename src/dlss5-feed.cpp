@@ -1,6 +1,7 @@
 ﻿// dlss5-feed - ReShade add-on
 //
-// Makes DLSS 5 neural rendering work in a D3D11 or D3D12 game that has no DLSS of its own.
+// Makes DLSS 5 neural rendering work in a D3D11, D3D12, Vulkan or OpenGL game that has
+// no DLSS of its own.
 //
 // The DLSS 5 add-on (renodx-dlss5) only detours NVSDK_NGX_D3D12_CreateFeature /
 // EvaluateFeature and reads the DLSS "contract" it finds there (Color, Depth,
@@ -17,6 +18,12 @@
 // In a D3D12 game there is no transport at all: NGX runs on the game's own device
 // and queue (the DLSS 5 add-on's native scenario), with the motion vectors and
 // depth consumed zero-copy straight from the effect textures.
+// Vulkan and OpenGL games reuse the private-D3D12 shape, with the shared textures
+// and fences created on D3D12 and imported into the game's API -- raw, because
+// ReShade's own import uses the wrong external handle type. See feed_vk.h (Vulkan,
+// where the imports are handed back to ReShade so queue operations stay in its
+// locks) and feed_gl.h (OpenGL, where they cannot be and the whole per-frame path
+// is raw -- which is safe, since GL has no queue object to race).
 // The NGX side uses NVIDIA's NGX SDK static library, which locates and loads the
 // driver's _nvngx.dll by itself.
 //
@@ -46,15 +53,16 @@
 
 #include "feed_vk.h"   // raw-Vulkan interop for the Vulkan transport (see PLAN-VULKAN)
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions the transport needs
+#include "feed_gl.h"   // raw-OpenGL interop for the OpenGL transport (see PLAN-OPENGL)
 
 #define FEED_VERSION "0.6.1"
 
 extern "C" __declspec(dllexport) const char *NAME = "DLSS 5 Feed " FEED_VERSION;
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
-    "Feeds DLSS 5 neural rendering with ReShade's depth and estimated motion vectors in D3D11 and "
-    "D3D12 games without DLSS: runs a real DLSS DLAA pass where the DLSS 5 add-on hooks in (a private "
-    "D3D12 device for D3D11 games, the game's own device for D3D12) and writes the result back into "
-    "the frame. Needs DLSS5_Feed.fx and a motion-vector provider (DRME, qUINT, Launchpad, VORT or LumeniteFX; pick it with the DLSS5_MV_PROVIDER definition). "
+    "Feeds DLSS 5 neural rendering with ReShade's depth and estimated motion vectors in D3D11, "
+    "D3D12, Vulkan and OpenGL games without DLSS: runs a real DLSS DLAA pass where the DLSS 5 add-on "
+    "hooks in (a private D3D12 device for D3D11, Vulkan and OpenGL games, the game's own device for "
+    "D3D12) and writes the result back into the frame.Needs DLSS5_Feed.fx and a motion-vector provider (DRME, qUINT, Launchpad, VORT or LumeniteFX; pick it with the DLSS5_MV_PROVIDER definition). "
     "Settings in dlss5-feed.cfg.";
 
 // ---------------------------------------------------------------------------
@@ -496,7 +504,7 @@ struct Feed
     reshade::api::fence    rs_fence_in, rs_fence_out;  // wrap vk_sem_* for ReShade queue signal/wait
     ID3D12Fence           *fence12_in, *fence12_out;  // the same fences, D3D12 side
     HANDLE                 fence_in_handle, fence_out_handle;
-    HANDLE                 tex_shared_vk[SLOT_COUNT];
+    HANDLE                 tex_shared_ext[SLOT_COUNT];   // shared NT handles (Vulkan and OpenGL transports)
     // raw-Vulkan imports of the D3D12 shared objects (ReShade's create_* import them
     // as the wrong external type). Wrapped back into rs_fence_* for ReShade queue ops.
     FeedVk                 vk;
@@ -505,6 +513,16 @@ struct Feed
     VkSemaphore            vk_sem_in, vk_sem_out;
     bool                   vk_layout_init;   // our images transitioned UNDEFINED->GENERAL once
     UINT64                 vk_frame;
+
+    // OpenGL transport: raw-GL imports of the very same D3D12 shared objects. Nothing
+    // is handed back to ReShade here -- an api::fence on GL is an opaque value, not a
+    // GL semaphore name, so the whole per-frame GL side is raw (see feed_gl.h).
+    FeedGl                 gl;
+    HGLRC                  gl_ctx;           // the context the imports live in (share-group check)
+    GLuint                 gl_tex[SLOT_COUNT], gl_memobj[SLOT_COUNT];
+    GLuint                 gl_sem_in, gl_sem_out;
+    GLuint                 gl_fbo_read, gl_fbo_draw;
+    UINT64                 gl_frame;
 
     // NGX
     bool                 ngx_inited;
@@ -668,6 +686,17 @@ static DXGI_FORMAT ResolveOutputFormat(DXGI_FORMAT color_typed, ID3D12Device *de
     Log("[feed] B8G8R8A8_UNORM has no typed UAV store on this device; output stays R8G8B8A8_UNORM "
         "(the copy home converts, so expect the washed-out image of issue #11)");
     return DXGI_FORMAT_R8G8B8A8_UNORM;
+}
+
+// OpenGL has no sized BGRA8 internal format, and we choose the shared textures'
+// formats -- so on the GL path none is ever created. The colour moves by blit, which
+// is component-wise (semantic RGBA, not byte order), so a BGRA-flavoured game surface
+// lands correctly in an RGBA8 shared texture and comes home the same way.
+static DXGI_FORMAT GlSafeColorFormat(DXGI_FORMAT typed)
+{
+    if (typed == DXGI_FORMAT_B8G8R8A8_UNORM || typed == DXGI_FORMAT_B8G8R8X8_UNORM)
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    return typed;
 }
 
 static bool IsHdrFormat(DXGI_FORMAT typed)
@@ -951,8 +980,30 @@ static void ReleaseFrameResources()
             if (g.vk_img[i] != VK_NULL_HANDLE) { g.vk.DestroyImage(g.vk.dev, g.vk_img[i], nullptr); g.vk_img[i] = VK_NULL_HANDLE; }
             if (g.vk_mem[i] != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_mem[i], nullptr);   g.vk_mem[i] = VK_NULL_HANDLE; }
         }
+    // OpenGL transport: same idea -- deleting the texture and its memory object drops
+    // our alias, not the D3D12 resource behind it. GL objects can only be deleted from
+    // the context they live in; from anywhere else they are left to the driver, which
+    // reclaims them with the context.
+    if (g.gl.ok)
+    {
+        if (g.gl.wglGetCurrentContext() == g.gl_ctx && g.gl_ctx != nullptr)
+        {
+            g.gl.Finish();   // the shared textures must be idle before the D3D12 side goes
+            for (int i = 0; i < SLOT_COUNT; ++i)
+            {
+                if (g.gl_tex[i]    != 0) { g.gl.DeleteTextures(1, &g.gl_tex[i]);           g.gl_tex[i]    = 0; }
+                if (g.gl_memobj[i] != 0) { g.gl.DeleteMemoryObjectsEXT(1, &g.gl_memobj[i]); g.gl_memobj[i] = 0; }
+            }
+        }
+        else
+        {
+            bool any = false;
+            for (int i = 0; i < SLOT_COUNT; ++i) if (g.gl_tex[i] != 0) { any = true; g.gl_tex[i] = 0; g.gl_memobj[i] = 0; }
+            if (any) Log("[feed] the GL context is not current here; the imported textures are left to the driver");
+        }
+    }
     for (int i = 0; i < SLOT_COUNT; ++i)
-        if (g.tex_shared_vk[i] != nullptr) { CloseHandle(g.tex_shared_vk[i]); g.tex_shared_vk[i] = nullptr; }
+        if (g.tex_shared_ext[i] != nullptr) { CloseHandle(g.tex_shared_ext[i]); g.tex_shared_ext[i] = nullptr; }
     g.vk_layout_init = false;
     SafeRelease(g.output_srv);
     SafeRelease(g.color_stage_srv);
@@ -1450,6 +1501,23 @@ static void ShutdownSession()
         if (g.vk_sem_in  != VK_NULL_HANDLE) { g.vk.DestroySemaphore(g.vk.dev, g.vk_sem_in,  nullptr); g.vk_sem_in  = VK_NULL_HANDLE; }
         if (g.vk_sem_out != VK_NULL_HANDLE) { g.vk.DestroySemaphore(g.vk.dev, g.vk_sem_out, nullptr); g.vk_sem_out = VK_NULL_HANDLE; }
     }
+    if (g.gl.ok)
+    {
+        if (g.gl.wglGetCurrentContext() == g.gl_ctx && g.gl_ctx != nullptr)
+        {
+            if (g.gl_sem_in   != 0) { g.gl.DeleteSemaphoresEXT(1, &g.gl_sem_in);   g.gl_sem_in   = 0; }
+            if (g.gl_sem_out  != 0) { g.gl.DeleteSemaphoresEXT(1, &g.gl_sem_out);  g.gl_sem_out  = 0; }
+            if (g.gl_fbo_read != 0) { g.gl.DeleteFramebuffers(1, &g.gl_fbo_read);  g.gl_fbo_read = 0; }
+            if (g.gl_fbo_draw != 0) { g.gl.DeleteFramebuffers(1, &g.gl_fbo_draw);  g.gl_fbo_draw = 0; }
+        }
+        else if (g.gl_sem_in != 0 || g.gl_fbo_read != 0)
+        {
+            Log("[feed] the GL context is not current here; the semaphores and FBOs are left to the driver");
+            g.gl_sem_in = g.gl_sem_out = g.gl_fbo_read = g.gl_fbo_draw = 0;
+        }
+        g.gl = {};
+    }
+    g.gl_ctx = nullptr;
     g.rs_fence_in = {}; g.rs_fence_out = {};
     SafeRelease(g.fence12_in);
     SafeRelease(g.fence12_out);
@@ -1457,6 +1525,7 @@ static void ShutdownSession()
     if (g.fence_out_handle != nullptr) { CloseHandle(g.fence_out_handle); g.fence_out_handle = nullptr; }
     g.rs_dev   = nullptr;
     g.vk_frame = 0;
+    g.gl_frame = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1821,7 +1890,7 @@ static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
                                                   nullptr, __uuidof(ID3D12Resource),
                                                   reinterpret_cast<void **>(&g.tex12[slot]));
     if (SUCCEEDED(hr))
-        hr = g.dev12->CreateSharedHandle(g.tex12[slot], nullptr, GENERIC_ALL, nullptr, &g.tex_shared_vk[slot]);
+        hr = g.dev12->CreateSharedHandle(g.tex12[slot], nullptr, GENERIC_ALL, nullptr, &g.tex_shared_ext[slot]);
     if (FAILED(hr))
     {
         Log("[feed] %s: shared D3D12 texture failed 0x%08X", kSlotName[slot], hr);
@@ -1837,7 +1906,7 @@ static bool MakeSharedTexVk(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav,
         Log("[feed] %s: no VkFormat mapping for %s", kSlotName[slot], FormatName(fmt));
         return false;
     }
-    if (!FeedVkImportImage(&g.vk, g.tex_shared_vk[slot], w, h, vkf, uav, &g.vk_img[slot], &g.vk_mem[slot]))
+    if (!FeedVkImportImage(&g.vk, g.tex_shared_ext[slot], w, h, vkf, uav, &g.vk_img[slot], &g.vk_mem[slot]))
     {
         Log("[feed] texture import FAILED: %s %ux%u %s (raw Vulkan external-memory import)", kSlotName[slot], w, h, FormatName(fmt));
         return false;
@@ -1883,6 +1952,291 @@ static bool BuildResourcesVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
         !MakeSharedTexVk(SLOT_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,   false, copy_rw, reshade::api::resource_usage::copy_dest) ||
         !MakeSharedTexVk(SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false, copy_rw, reshade::api::resource_usage::copy_dest) ||
         !MakeSharedTexVk(SLOT_MASK,   w, h, DXGI_FORMAT_R8_UNORM,     false, copy_rw, reshade::api::resource_usage::copy_dest))
+    {
+        ReleaseFrameResources();
+        return false;
+    }
+
+    if (g_cfg.mode < 2) { g.frame_ready = true; g.need_reset = true; Log("[feed] transport ready (mode %d, no NGX feature)", g_cfg.mode); return true; }
+
+    bool crashed = false;
+    if (!CreateDlssFeature(w, h, inverted, &crashed))
+    {
+        if (crashed) FeedDisable("creating the DLSS feature crashed (the DLSS 5 add-on may be incompatible)");
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Session, OpenGL transport: the Vulkan path with the import third swapped out.
+// The evaluate still runs on a private D3D12 device (the DLSS 5 add-on is
+// D3D12-only); what changes is how the game's API gets at the shared textures and
+// fences. Unlike Vulkan there is no device hook and no layer: OpenGL has no
+// creation-time opt-in, so the interop extensions are simply either in the current
+// context's extension string or not -- and if they are not, this frame is not being
+// rendered on an NVIDIA GPU, where DLSS could not run anyway.
+// ---------------------------------------------------------------------------
+
+static bool InitSessionGl(reshade::api::effect_runtime *rt)
+{
+    Breadcrumb("opening the D3D12 session (OpenGL transport)");
+    Log("################ feed: opening D3D12 session (OpenGL transport) ################");
+    g_ngx_dying = false;
+
+    g.rs_dev = rt->get_device();
+    if (g.rs_dev == nullptr)
+    {
+        FeedDisable("the ReShade device is not reachable");
+        return false;
+    }
+    // rs_queue is deliberately left null: the GL path issues zero ReShade API calls
+    // per frame (no fence to hand back, so no queue signal/wait to route through it).
+
+    // The GL half first: if the interop extensions are missing there is nothing to
+    // set up, and saying so before spinning up NGX keeps the log readable.
+    if (!FeedGlLoad(&g.gl))
+    {
+        Log("[feed] OpenGL interop unavailable: %s", g.gl.missing);
+        Log("[feed] renderer=\"%s\" version=\"%s\" context=%p thread=%lu",
+            g.gl.renderer, g.gl.version, (void *)(g.gl.wglGetCurrentContext ? g.gl.wglGetCurrentContext() : nullptr),
+            GetCurrentThreadId());
+        Log("[feed] GL_EXT_memory_object_win32 + GL_EXT_semaphore_win32 are NVIDIA-supported on every");
+        Log("[feed] DLSS-capable driver. Their absence means this frame is not being rendered on the");
+        Log("[feed] NVIDIA GPU -- on a hybrid laptop, force the game onto it (Windows graphics settings).");
+        FeedDisable("the OpenGL interop extensions are missing on the rendering GPU -- see dlss5-feed.log");
+        return false;
+    }
+    g.gl_ctx = g.gl.wglGetCurrentContext();
+    Log("[feed] OpenGL: renderer=\"%s\" version=\"%s\" context=%p thread=%lu (interop extensions present)",
+        g.gl.renderer, g.gl.version, (void *)g.gl_ctx, GetCurrentThreadId());
+
+    // Private D3D12 device, loaded so ReShade hooks it -- that hook is what lets the
+    // DLSS 5 add-on see the device. Proven under dxgi.dll and Vulkan-layer loading;
+    // whether it also holds with ReShade loaded as opengl32.dll is read from the
+    // add-on's "hooks installed" line in the game's ReShade.log.
+    HMODULE d3d12 = LoadLibraryW(L"d3d12.dll");
+    auto create_device = d3d12 ? reinterpret_cast<PFN_D3D12CreateDevice_>(GetProcAddress(d3d12, "D3D12CreateDevice")) : nullptr;
+    if (create_device == nullptr)
+    {
+        Log("[feed] no D3D12CreateDevice");
+        FeedDisable("d3d12.dll unavailable");
+        return false;
+    }
+    HRESULT hr = create_device(nullptr, D3D_FEATURE_LEVEL_11_0, __uuidof(ID3D12Device), reinterpret_cast<void **>(&g.dev12));
+    if (FAILED(hr) || g.dev12 == nullptr)
+    {
+        Log("[feed] D3D12CreateDevice failed 0x%08X", hr);
+        FeedDisable("the private D3D12 device failed");
+        return false;
+    }
+    g.dev12_owned = true;
+
+    wchar_t data_path[MAX_PATH] = {};
+    GetModuleFileNameW(g_self, data_path, MAX_PATH);
+    if (wchar_t *s = wcsrchr(data_path, L'\\')) *(s + 1) = L'\0';
+
+    Breadcrumb("initialising NGX (OpenGL transport)");
+    NVSDK_NGX_Result r = NVSDK_NGX_D3D12_Init(0x1000000ULL, data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
+    Log("[feed] NVSDK_NGX_D3D12_Init -> 0x%08X (%s)", r, NgxResultName(r));
+    if (NVSDK_NGX_FAILED(r))
+    {
+        r = NVSDK_NGX_D3D12_Init_with_ProjectID("a0f57b54-1daf-4934-90ae-c4035c19df04", NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+                                                "1.0", data_path, g.dev12, nullptr, NVSDK_NGX_Version_API);
+        Log("[feed] NVSDK_NGX_D3D12_Init_with_ProjectID -> 0x%08X (%s)", r, NgxResultName(r));
+    }
+    if (NVSDK_NGX_FAILED(r))
+    {
+        ShutdownSession();
+        FeedDisable("NGX would not initialise");
+        return false;
+    }
+    g.ngx_inited = true;
+
+    NVSDK_NGX_Parameter *caps = nullptr;
+    r = NVSDK_NGX_D3D12_GetCapabilityParameters(&caps);
+    if (NVSDK_NGX_SUCCEED(r) && caps != nullptr)
+    {
+        int avail = 0;
+        caps->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &avail);
+        Log("[feed] NGX capabilities: SuperSampling.Available=%d", avail);
+        if (!avail)
+        {
+            ShutdownSession();
+            FeedDisable("DLSS is not available on this GPU/driver");
+            return false;
+        }
+    }
+    r = NVSDK_NGX_D3D12_AllocateParameters(&g.params);
+    if (NVSDK_NGX_FAILED(r) || g.params == nullptr)
+    {
+        Log("[feed] AllocateParameters failed 0x%08X", r);
+        ShutdownSession();
+        FeedDisable("NGX parameter allocation failed");
+        return false;
+    }
+
+    D3D12_COMMAND_QUEUE_DESC qd = {};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    g.dev12->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), reinterpret_cast<void **>(&g.queue));
+    for (int i = 0; i < Feed::kFrames; ++i)
+        g.dev12->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator),
+                                        reinterpret_cast<void **>(&g.alloc[i]));
+    if (g.alloc[0] != nullptr)
+        g.dev12->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.alloc[0], nullptr,
+                                   __uuidof(ID3D12GraphicsCommandList), reinterpret_cast<void **>(&g.list));
+    if (g.list != nullptr) g.list->Close();
+    g.fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g.dev12->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12));
+    if (g.queue == nullptr || g.list == nullptr || g.fence12 == nullptr || g.fence_event == nullptr)
+    {
+        Log("[feed] D3D12 queue/list/fence creation failed");
+        ShutdownSession();
+        FeedDisable("could not create the D3D12 objects");
+        return false;
+    }
+
+    // The two cross-API fences: created shared on D3D12, imported into GL as
+    // semaphores whose value is set per use (GL_D3D12_FENCE_VALUE_EXT), so the frame
+    // counter crosses unchanged -- a D3D12 fence and a GL "D3D12 fence" semaphore are
+    // the same kernel object.
+    hr = g.dev12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12_in));
+    if (SUCCEEDED(hr)) hr = g.dev12->CreateSharedHandle(g.fence12_in, nullptr, GENERIC_ALL, nullptr, &g.fence_in_handle);
+    if (SUCCEEDED(hr)) hr = g.dev12->CreateFence(0, D3D12_FENCE_FLAG_SHARED, __uuidof(ID3D12Fence), reinterpret_cast<void **>(&g.fence12_out));
+    if (SUCCEEDED(hr)) hr = g.dev12->CreateSharedHandle(g.fence12_out, nullptr, GENERIC_ALL, nullptr, &g.fence_out_handle);
+    if (FAILED(hr))
+    {
+        Log("[feed] shared fence creation failed 0x%08X", hr);
+        ShutdownSession();
+        FeedDisable("shared fence creation failed");
+        return false;
+    }
+
+    g.gl_sem_in  = FeedGlImportFence(&g.gl, g.fence_in_handle);
+    g.gl_sem_out = FeedGlImportFence(&g.gl, g.fence_out_handle);
+    Log("[feed] D3D12 fence -> GL semaphore import (GL_HANDLE_TYPE_D3D12_FENCE_EXT): in=%s out=%s",
+        g.gl_sem_in ? "OK" : "FAILED", g.gl_sem_out ? "OK" : "FAILED");
+    if (g.gl_sem_in == 0 || g.gl_sem_out == 0)
+    {
+        ShutdownSession();
+        FeedDisable("cross-API fence import failed (see dlss5-feed.log)");
+        return false;
+    }
+
+    // The two persistent FBOs the colour blits attach through.
+    g.gl.GenFramebuffers(1, &g.gl_fbo_read);
+    g.gl.GenFramebuffers(1, &g.gl_fbo_draw);
+    if (g.gl_fbo_read == 0 || g.gl_fbo_draw == 0)
+    {
+        Log("[feed] glGenFramebuffers failed (GL error 0x%04X)", FeedGlDrainErrors(&g.gl));
+        ShutdownSession();
+        FeedDisable("could not create the GL framebuffer objects");
+        return false;
+    }
+
+    Log("[feed] session ready (OpenGL transport): dev12=%p queue=%p glctx=%p", (void *)g.dev12, (void *)g.queue, (void *)g.gl_ctx);
+    Log("############# feed: session open (OpenGL transport) #############");
+    g.session_ready = true;
+    return true;
+}
+
+static bool MakeSharedTexGl(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav)
+{
+    // D3D12 half: byte for byte what MakeSharedTexVk creates.
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width            = w;
+    rd.Height           = h;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = fmt;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+                          (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
+    HRESULT hr = g.dev12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                  nullptr, __uuidof(ID3D12Resource),
+                                                  reinterpret_cast<void **>(&g.tex12[slot]));
+    if (SUCCEEDED(hr))
+        hr = g.dev12->CreateSharedHandle(g.tex12[slot], nullptr, GENERIC_ALL, nullptr, &g.tex_shared_ext[slot]);
+    if (FAILED(hr))
+    {
+        Log("[feed] %s: shared D3D12 texture failed 0x%08X", kSlotName[slot], hr);
+        return false;
+    }
+
+    // Game half: import the D3D12 memory into a GL texture. The size a GL memory
+    // object needs is the D3D12 ALLOCATION size, not w*h*bpp -- padding and tiling
+    // make the two differ, and the import fails on the wrong one.
+    const GLenum glf = FeedGlFormat(fmt);
+    if (glf == 0)
+    {
+        Log("[feed] %s: no GL internal format for %s", kSlotName[slot], FormatName(fmt));
+        return false;
+    }
+    const D3D12_RESOURCE_ALLOCATION_INFO ai = g.dev12->GetResourceAllocationInfo(0, 1, &rd);
+    if (!FeedGlImportImage(&g.gl, g.tex_shared_ext[slot], ai.SizeInBytes,
+                           static_cast<GLsizei>(w), static_cast<GLsizei>(h), glf,
+                           &g.gl_tex[slot], &g.gl_memobj[slot]))
+    {
+        Log("[feed] texture import FAILED: %s %ux%u %s (GL_HANDLE_TYPE_D3D12_RESOURCE_EXT, %llu bytes, GL error 0x%04X)",
+            kSlotName[slot], w, h, FormatName(fmt), static_cast<unsigned long long>(ai.SizeInBytes),
+            FeedGlDrainErrors(&g.gl));
+        return false;
+    }
+    Log("[feed] %-6s %ux%u %s shared D3D12 (%llu bytes) -> imported as GL texture %u",
+        kSlotName[slot], w, h, FormatName(fmt), static_cast<unsigned long long>(ai.SizeInBytes), g.gl_tex[slot]);
+    return true;
+}
+
+static bool BuildResourcesGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handle)
+{
+    if (g.session_ready && g_cfg.mode >= 2 && g.feature != nullptr && g.tex12[SLOT_COLOR] != nullptr &&
+        w == g.width && h == g.height && bb_fmt == g.bb_fmt)
+        return RecreateFeatureOnly(w, h);
+
+    Breadcrumb("building the OpenGL-shared textures");
+    ReleaseFrameResources();
+
+    g.width      = w;
+    g.height     = h;
+    g.bb_fmt     = bb_fmt;
+    g.color_fmt  = GlSafeColorFormat(TypedColorFormat(bb_fmt));
+    g.output_fmt = GlSafeColorFormat(ResolveOutputFormat(g.color_fmt, g.dev12));
+    g.hdr        = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+    const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+
+    if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
+    {
+        Log("[feed] backbuffer format %u (%s) is not supported", bb_fmt, FormatName(bb_fmt));
+        FeedDisable("unsupported backbuffer format");
+        return false;
+    }
+
+    // What the technique's render target actually is decides which blit branch runs,
+    // and its colour encoding decides whether the sRGB trap of issue #11 can bite.
+    {
+        FeedGlStateGuard guard(&g.gl);
+        const GLenum ty = FeedGlHandleType(rtv_handle);
+        const GLint enc = FeedGlColorEncoding(&g.gl, g.gl_fbo_read, rtv_handle);
+        Log("[feed] technique target: %s (GL object type 0x%04X, name %u), colour encoding %s",
+            rtv_handle == 0 ? "the DEFAULT framebuffer" :
+            ty == GL_RENDERBUFFER ? "a renderbuffer" :
+            ty == GL_TEXTURE_2D ? "a GL_TEXTURE_2D" : "an unexpected GL object",
+            ty, FeedGlHandleName(rtv_handle),
+            enc == GL_SRGB ? "GL_SRGB (blits stay with GL_FRAMEBUFFER_SRGB off, so the bytes move raw)" :
+            enc == GL_LINEAR ? "GL_LINEAR" : "unknown");
+    }
+    Log("[feed] copy home: glBlitFramebuffer (output %s -> backbuffer %s)",
+        FormatName(g.output_fmt), FormatName(bb_fmt));
+
+    if (!MakeSharedTexGl(SLOT_COLOR,  w, h, g.color_fmt,              false) ||
+        !MakeSharedTexGl(SLOT_OUTPUT, w, h, g.output_fmt,             true)  ||
+        !MakeSharedTexGl(SLOT_DEPTH,  w, h, DXGI_FORMAT_R32_FLOAT,    false) ||
+        !MakeSharedTexGl(SLOT_MV,     w, h, DXGI_FORMAT_R16G16_FLOAT, false) ||
+        !MakeSharedTexGl(SLOT_MASK,   w, h, DXGI_FORMAT_R8_UNORM,     false))
     {
         ReleaseFrameResources();
         return false;
@@ -2661,6 +3015,275 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
 }
 
 // ---------------------------------------------------------------------------
+// Per frame, OpenGL transport. The D3D12 middle is FeedFrameVk's, unchanged; the
+// game-side halves are raw GL. No barriers of any kind are needed: every command
+// enters the context's single in-order stream, so our reads are already ordered
+// after the provider's writes, and the semaphore signal/wait carries the cross-API
+// release/acquire. Not one ReShade API call is issued here beyond the lookups.
+// ---------------------------------------------------------------------------
+
+static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::command_list * /*cl*/, reshade::api::resource_view rtv)
+{
+    using namespace reshade::api;
+
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.frame_ready = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+
+    device *dev_api = rt->get_device();
+
+    resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
+    if (g.mv_var.handle != 0)    rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
+    if (g.depth_var.handle != 0) rt->get_texture_binding(g.depth_var, &d_srv, &d_srgb);
+    if (mv_srv.handle == 0 || d_srv.handle == 0)
+    {
+        if (!g.missing_reported)
+        {
+            g.missing_reported = true;
+            Warn("DLSS5_Feed.fx textures not found (technique %s). Install DLSS5_Feed.fx + a motion vector provider and enable both.",
+                 g.technique.handle ? "found" : "MISSING");
+        }
+        return;
+    }
+
+    const resource bb_res    = dev_api->get_resource_from_view(rtv);
+    const resource mv_res    = dev_api->get_resource_from_view(mv_srv);
+    const resource depth_res = dev_api->get_resource_from_view(d_srv);
+    if (mv_res.handle == 0 || depth_res.handle == 0) return;
+    // bb_res.handle == 0 is legal on GL and means the DEFAULT framebuffer, which the
+    // blit path attaches as FBO 0 + GL_BACK. Only its DESCRIPTION is then unavailable,
+    // so the sizes come from the motion vectors instead (which are backbuffer-sized
+    // by construction: DLSS5_Feed.fx declares them at BUFFER_WIDTH x BUFFER_HEIGHT).
+
+    // Optional validation mask (older shaders have none).
+    resource mask_res = {};
+    g.mask_ok = false;
+    if (g.mask_var.handle != 0)
+    {
+        resource_view m_srv = {}, m_srgb = {};
+        rt->get_texture_binding(g.mask_var, &m_srv, &m_srgb);
+        if (m_srv.handle != 0) mask_res = dev_api->get_resource_from_view(m_srv);
+    }
+
+    const resource_desc md = dev_api->get_resource_desc(mv_res);
+    const resource_desc dd = dev_api->get_resource_desc(depth_res);
+    const bool have_bb_desc = bb_res.handle != 0;
+    const resource_desc cd = have_bb_desc ? dev_api->get_resource_desc(bb_res) : md;
+    const UINT w = cd.texture.width, h = cd.texture.height;
+    // The guides are copied with glCopyImageSubData, which needs real textures on both
+    // sides -- effect textures always are, but a wrong assumption here would surface as
+    // a silent GL error and a black frame, so it is checked with everything else.
+    const bool guides_are_textures = FeedGlHandleType(mv_res.handle) == GL_TEXTURE_2D &&
+                                     FeedGlHandleType(depth_res.handle) == GL_TEXTURE_2D;
+    if (w != md.texture.width || h != md.texture.height || w != dd.texture.width || h != dd.texture.height ||
+        cd.texture.samples != 1 || !guides_are_textures ||
+        md.texture.format != format::r16g16_float || dd.texture.format != format::r32_float)
+    {
+        static bool said_gl = false;
+        if (!said_gl)
+        {
+            said_gl = true;
+            Log("[feed] input mismatch: color %ux%u fmt=%u samp=%u | mv %ux%u fmt=%u | depth %ux%u fmt=%u"
+                " | mv/depth GL types 0x%04X/0x%04X -- skipping",
+                w, h, (unsigned)cd.texture.format, cd.texture.samples, md.texture.width, md.texture.height,
+                (unsigned)md.texture.format, dd.texture.width, dd.texture.height, (unsigned)dd.texture.format,
+                FeedGlHandleType(mv_res.handle), FeedGlHandleType(depth_res.handle));
+        }
+        return;
+    }
+    if (mask_res.handle != 0)
+    {
+        const resource_desc kd = dev_api->get_resource_desc(mask_res);
+        g.mask_ok = kd.texture.width == w && kd.texture.height == h &&
+                    kd.texture.format == format::r8_unorm &&
+                    FeedGlHandleType(mask_res.handle) == GL_TEXTURE_2D;
+    }
+
+    bool ok = true;
+    if (g.session_ready && g.rs_dev != nullptr && g.rs_dev != dev_api)
+    {
+        Log("[feed] the game recreated its device; rebuilding the session");
+        ShutdownSession();
+    }
+    // GL names live in the share group of the context that was current at import. A
+    // game that renders through an unshared or recreated context would strand every
+    // import, so the session is torn down and rebuilt on the new context instead.
+    if (g.session_ready && g.gl.ok && g.gl.wglGetCurrentContext() != g.gl_ctx)
+    {
+        Log("[feed] the GL context changed (%p -> %p); rebuilding the session on the new one",
+            (void *)g.gl_ctx, (void *)g.gl.wglGetCurrentContext());
+        ShutdownSession();
+    }
+    if (!g.session_ready) ok = InitSessionGl(rt);
+
+    const DXGI_FORMAT bbf = have_bb_desc ? static_cast<DXGI_FORMAT>(cd.texture.format)
+                                         : DXGI_FORMAT_R8G8B8A8_UNORM;   // default FB: assume 8-bit; the blit converts anyway
+    const bool needs_build_gl = !g.frame_ready || w != g.width || h != g.height || bbf != g.bb_fmt;
+    if (ok && needs_build_gl && g.create_grace < g_cfg.create_delay)
+    {
+        if (++g.create_grace == 1)
+            Log("[feed] holding the feature (re)build for %d frames (the DLSS 5 add-on re-arms its hooks asynchronously)",
+                g_cfg.create_delay);
+        ok = false;
+    }
+    if (ok && needs_build_gl)
+    {
+        Log("[feed] building: %ux%u backbuffer %s (OpenGL transport, depth reversed=%d)", w, h,
+            FormatName(bbf), g.depth_reversed ? 1 : 0);
+        ok = BuildResourcesGl(w, h, bbf, bb_res.handle);
+        if (!ok) FeedFail("resource build");
+        else g.consecutive_fails = 0;
+    }
+
+    if (ok && g.frame_ready)
+    {
+        FeedGlStateGuard guard(&g.gl);
+
+        // Capture. MV, Depth and the Mask are exact-format GL_TEXTURE_2Ds, so they go
+        // by glCopyImageSubData, which touches no state at all. The colour goes by
+        // blit: it converts formats and channel order, and it can read what a raw copy
+        // cannot -- a renderbuffer or the default framebuffer.
+        Breadcrumb("copying inputs (OpenGL)");
+        FeedGlCopy(&g.gl, FeedGlHandleName(mv_res.handle),    g.gl_tex[SLOT_MV],    w, h);
+        FeedGlCopy(&g.gl, FeedGlHandleName(depth_res.handle), g.gl_tex[SLOT_DEPTH], w, h);
+        if (g.mask_ok)
+            FeedGlCopy(&g.gl, FeedGlHandleName(mask_res.handle), g.gl_tex[SLOT_MASK], w, h);
+        bool captured = FeedGlBlit(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
+                                   bb_res.handle, false, g.gl_tex[SLOT_COLOR], true, w, h);
+        if (!captured)
+        {
+            static bool said = false;
+            if (!said) { said = true; Log("[feed] the colour capture blit could not be set up (incomplete framebuffer)"); }
+            FeedFail("colour capture");
+            QueryPerformanceCounter(&t1);
+            TimingTick(t0.QuadPart, t1.QuadPart);
+            return;
+        }
+
+        if (g_cfg.mode == 1)
+        {
+            // Transport test: blit the LEFT half of our captured COLOR straight back
+            // over the technique's target -- a split screen is unambiguous proof of
+            // the round trip, without NGX in the way.
+            FeedGlBlit(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
+                       g.gl_tex[SLOT_COLOR], true, bb_res.handle, false, w / 2, h);
+            ++g.frames_done;
+        }
+        else
+        {
+            const UINT64 n = ++g.gl_frame;
+            const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+            g.need_reset = false;
+
+            Breadcrumb("signalling the shared fence (OpenGL)");
+            {
+                const GLuint inputs[4] = { g.gl_tex[SLOT_COLOR], g.gl_tex[SLOT_DEPTH], g.gl_tex[SLOT_MV], g.gl_tex[SLOT_MASK] };
+                FeedGlSignal(&g.gl, g.gl_sem_in, n, inputs, g.mask_ok ? 4u : 3u);
+            }
+
+            // D3D12: wait for the copies, evaluate, signal back. Unchanged machinery.
+            g.queue->Wait(g.fence12_in, n);
+            bool done = false;
+            if (!BeginCommands()) FeedFail("command list");
+            else
+            {
+                Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                MvProbeRecord(g.tex12[SLOT_MV], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+                NVSDK_NGX_D3D12_DLSS_Eval_Params ep = {};
+                ep.Feature.pInColor  = g.tex12[SLOT_COLOR];
+                ep.Feature.pInOutput = g.tex12[SLOT_OUTPUT];
+                ep.Feature.InSharpness = 0.0f;
+                ep.pInDepth          = g.tex12[SLOT_DEPTH];
+                ep.pInMotionVectors  = g.tex12[SLOT_MV];
+                ep.pInBiasCurrentColorMask = g.mask_ok ? g.tex12[SLOT_MASK] : nullptr;   // the shader's validation mask
+                ep.InJitterOffsetX   = 0.0f;
+                ep.InJitterOffsetY   = 0.0f;
+                ep.InRenderSubrectDimensions.Width  = g.width;
+                ep.InRenderSubrectDimensions.Height = g.height;
+                ep.InReset           = reset;
+                ep.InMVScaleX        = g_cfg.mv_scale_x;
+                ep.InMVScaleY        = g_cfg.mv_scale_y;
+                ep.InPreExposure     = 1.0f;
+                ep.InExposureScale   = 1.0f;
+
+                Breadcrumb("running the D3D12 evaluate (OpenGL transport)");
+                DWORD ecode = 0;
+                NVSDK_NGX_Result re = SafeEvaluateDLSS(&ep, &ecode);
+                if (ecode != 0)
+                {
+                    AbortCommands();  // never execute a list NGX crashed while recording
+                    Log("[feed] evaluate raised exception 0x%08X (caught; nothing was submitted)", ecode);
+                    FeedDisable("the DLSS evaluate crashed (the DLSS 5 add-on may be incompatible with this game/resolution)");
+                    g.frame_ready = false;
+                }
+                else
+                {
+                    Barrier(g.tex12[SLOT_COLOR],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    Barrier(g.tex12[SLOT_DEPTH],  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    Barrier(g.tex12[SLOT_MV],     D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    if (g.mask_ok) Barrier(g.tex12[SLOT_MASK], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+                    Barrier(g.tex12[SLOT_OUTPUT], D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON);
+                    EndCommands();
+                    if (NVSDK_NGX_FAILED(re))
+                    {
+                        Log("[feed] evaluate failed 0x%08X (%s)", re, NgxResultName(re));
+                        FeedFail("evaluate");
+                        g.frame_ready = false;
+                    }
+                    else
+                        done = true;
+                }
+            }
+            if (done)
+                g.queue->Signal(g.fence12_out, n);   // after the evaluate, GPU-ordered
+            else
+                g.fence12_out->Signal(n);            // CPU-signal so the GL stream never hangs on us
+                                                     // (glWaitSemaphoreEXT has no timeout)
+
+            Breadcrumb("waiting for the result (OpenGL)");
+            {
+                const GLuint outputs[1] = { g.gl_tex[SLOT_OUTPUT] };
+                FeedGlWait(&g.gl, g.gl_sem_out, n, outputs, 1);   // server-side: the GPU stalls, the CPU does not
+            }
+            if (done)
+                FeedGlBlit(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
+                           g.gl_tex[SLOT_OUTPUT], true, bb_res.handle, false, w, h);
+
+            if (done)
+            {
+                const UINT64 fn = ++g.frames_done;
+                g.consecutive_fails = 0;
+                if (fn <= static_cast<UINT64>(g_cfg.log_frames) || (fn % 1800) == 0)
+                    Log("[feed] frame %llu delivered (%ux%u, reset=%d, OpenGL transport)", fn, g.width, g.height, reset);
+
+                if (g_cfg.warmup_rebuild > 0 && !g.warmup_done && !g_renodx_lazy && fn >= static_cast<UINT64>(g_cfg.warmup_rebuild))
+                {
+                    g.warmup_done = true;
+                    g.frame_ready = false;
+                    Log("[feed] warm-up: re-creating the DLSS feature once (frame %llu, OpenGL transport)", fn);
+                }
+            }
+        }
+
+        // One sweep per frame while the log is still young: a silent GL error here
+        // would otherwise only show up as a black frame.
+        if (g.frames_done <= static_cast<UINT64>(g_cfg.log_frames))
+            if (const GLenum e = FeedGlDrainErrors(&g.gl))
+                Log("[feed] GL error 0x%04X during frame %llu", e, g.frames_done);
+    }
+
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
+// ---------------------------------------------------------------------------
 // Per frame, D3D11: the original private-device transport
 // ---------------------------------------------------------------------------
 
@@ -2904,7 +3527,8 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
     case reshade::api::device_api::d3d11: FeedFrame11(rt, cl, rtv); break;
     case reshade::api::device_api::d3d12: FeedFrame12(rt, cl, rtv); break;
     case reshade::api::device_api::vulkan: FeedFrameVk(rt, cl, rtv); break;
-    default: FeedDisable("only Direct3D 11/12 and Vulkan games are supported"); break;
+    case reshade::api::device_api::opengl: FeedFrameGl(rt, cl, rtv); break;
+    default: FeedDisable("only Direct3D 11/12, Vulkan and OpenGL games are supported"); break;
     }
 }
 
@@ -3061,6 +3685,12 @@ static void OnDestroyDevice(reshade::api::device *dev)
     else if (g.session_ready && dev->get_api() == reshade::api::device_api::vulkan && dev == g.rs_dev)
     {
         Log("[feed] the game's Vulkan device is being destroyed; shutting the session down");
+        g_ngx_dying = true;
+        ShutdownSession();
+    }
+    else if (g.session_ready && dev->get_api() == reshade::api::device_api::opengl && dev == g.rs_dev)
+    {
+        Log("[feed] the game's OpenGL device is being destroyed; shutting the session down");
         g_ngx_dying = true;
         ShutdownSession();
     }

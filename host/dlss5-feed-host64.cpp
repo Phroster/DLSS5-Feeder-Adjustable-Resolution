@@ -641,6 +641,46 @@ static ID3D12Resource *MakeTex(UINT w, UINT h_, DXGI_FORMAT fmt, bool uav)
     return t;
 }
 
+// The shared half of MakeTex, for OpenGL clients: this host creates the texture --
+// GL memory objects are import-only, so the game cannot -- and hands out an NT handle
+// plus the allocation size the GL import needs. ALLOW_SIMULTANEOUS_ACCESS is what
+// pairs with GL_LAYOUT_GENERAL_EXT on the other side; SHARED puts it in a heap the
+// other process can open. This is also a better resource than the D3D11 route's:
+// it is born with exactly the flags NGX wants, with none of MakeSharedPair's
+// UAV-flag uncertainty.
+static ID3D12Resource *MakeSharedTexHost(UINT w, UINT h_, DXGI_FORMAT fmt, bool uav,
+                                         HANDLE *out_handle, uint64_t *out_size)
+{
+    *out_handle = nullptr;
+    *out_size   = 0;
+
+    D3D12_HEAP_PROPERTIES hp = {};
+    hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rd = {};
+    rd.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rd.Width            = w;
+    rd.Height           = h_;
+    rd.DepthOrArraySize = 1;
+    rd.MipLevels        = 1;
+    rd.Format           = fmt;
+    rd.SampleDesc.Count = 1;
+    rd.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rd.Flags            = D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS |
+                          (uav ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE);
+    ID3D12Resource *t = nullptr;
+    HRESULT hr = h.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd, D3D12_RESOURCE_STATE_COMMON,
+                                                nullptr, __uuidof(ID3D12Resource), reinterpret_cast<void **>(&t));
+    if (SUCCEEDED(hr)) hr = h.dev->CreateSharedHandle(t, nullptr, GENERIC_ALL, nullptr, out_handle);
+    if (FAILED(hr))
+    {
+        Log("[host] shared texture %ux%u fmt=%u failed 0x%08X", w, h_, fmt, hr);
+        if (t != nullptr) t->Release();
+        return nullptr;
+    }
+    *out_size = h.dev->GetResourceAllocationInfo(0, 1, &rd).SizeInBytes;
+    return t;
+}
+
 static int RunTest()
 {
     const UINT W = 640, H = 360;
@@ -701,13 +741,26 @@ static int Serve(DWORD game_pid)
     if (!ConnectNamedPipe(pipe, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED)
     { Log("[host] ConnectNamedPipe failed %lu", GetLastError()); return 1; }
 
+    // A v1 client's hello is three uint32s; v2 appends client_kind. Read the common
+    // prefix, then only what this client's version actually sent -- reading the full
+    // struct from a v1 client would block on bytes it never writes.
     FeedHello hello = {};
-    if (!ReadFull(pipe, &hello, sizeof(hello)) || hello.magic != FEED_IPC_MAGIC)
+    if (!ReadFull(pipe, &hello, FEED_HELLO_V1_SIZE) || hello.magic != FEED_IPC_MAGIC)
     { Log("[host] bad hello"); return 1; }
+    if (hello.version >= 2 && !ReadFull(pipe, &hello.client_kind, sizeof(hello.client_kind)))
+    { Log("[host] truncated hello"); return 1; }
+    if (hello.version > FEED_IPC_VERSION)
+    {
+        Log("[host] the game add-on speaks protocol v%u, this host only v%u -- update host64\\",
+            hello.version, FEED_IPC_VERSION);
+        return 1;
+    }
+    const bool gl_client = hello.client_kind == FEED_CLIENT_GL;
     FeedHelloAck ack = { FEED_IPC_MAGIC, FEED_IPC_VERSION };
     DWORD put = 0;
     WriteFile(pipe, &ack, sizeof(ack), &put, nullptr);
-    Log("[host] game pid %u connected (protocol v%u)", hello.pid, hello.version);
+    Log("[host] game pid %u connected (protocol v%u, %s client)", hello.pid, hello.version,
+        gl_client ? "OpenGL: this host creates the shared textures" : "D3D11: the game creates the shared textures");
 
     HANDLE hgame = OpenProcess(PROCESS_DUP_HANDLE, FALSE, hello.pid);
     if (hgame == nullptr) { Log("[host] OpenProcess failed %lu", GetLastError()); return 1; }
@@ -771,18 +824,42 @@ static int Serve(DWORD game_pid)
             for (int i = 0; i < FEED_SLOTS; ++i)
                 if (h.tex[i] != nullptr) { h.tex[i]->Release(); h.tex[i] = nullptr; }
 
-            // Open the game's textures (duplicate the handles out of the game).
             bool ok = true;
-            for (int i = 0; i < FEED_SLOTS && ok; ++i)
+            uint64_t game_tex[FEED_SLOTS] = {}, tex_size[FEED_SLOTS] = {};
+            if (gl_client)
             {
-                HANDLE local = nullptr;
-                if (!DuplicateHandle(hgame, reinterpret_cast<HANDLE>(static_cast<uintptr_t>(b.tex[i])),
-                                     GetCurrentProcess(), &local, 0, FALSE, DUPLICATE_SAME_ACCESS))
-                { Log("[host] DuplicateHandle(tex %d) failed %lu", i, GetLastError()); ok = false; break; }
-                HRESULT hr = h.dev->OpenSharedHandle(local, __uuidof(ID3D12Resource),
-                                                     reinterpret_cast<void **>(&h.tex[i]));
-                CloseHandle(local);
-                if (FAILED(hr)) { Log("[host] OpenSharedHandle(tex %d) failed 0x%08X", i, hr); ok = false; }
+                // OpenGL client: WE create, and duplicate the handles into the game,
+                // which imports them as GL textures (PLAN-OPENGL §5, design A).
+                const DXGI_FORMAT fmt[FEED_SLOTS] = {
+                    static_cast<DXGI_FORMAT>(b.color_fmt), static_cast<DXGI_FORMAT>(b.output_fmt),
+                    DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT };
+                for (int i = 0; i < FEED_SLOTS && ok; ++i)
+                {
+                    HANDLE local = nullptr;
+                    h.tex[i] = MakeSharedTexHost(b.width, b.height, fmt[i], i == FEED_OUTPUT, &local, &tex_size[i]);
+                    if (h.tex[i] == nullptr) { ok = false; break; }
+                    HANDLE remote = nullptr;
+                    if (!DuplicateHandle(GetCurrentProcess(), local, hgame, &remote, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                    { Log("[host] DuplicateHandle(tex %d into the game) failed %lu", i, GetLastError()); ok = false; }
+                    CloseHandle(local);   // the duplicate stands on its own; the resource keeps the memory
+                    game_tex[i] = reinterpret_cast<uint64_t>(remote);
+                }
+                if (ok) Log("[host] created and handed over %d shared textures (%ux%u)", FEED_SLOTS, b.width, b.height);
+            }
+            else
+            {
+                // D3D11 client: open the game's textures (duplicate the handles out).
+                for (int i = 0; i < FEED_SLOTS && ok; ++i)
+                {
+                    HANDLE local = nullptr;
+                    if (!DuplicateHandle(hgame, reinterpret_cast<HANDLE>(static_cast<uintptr_t>(b.tex[i])),
+                                         GetCurrentProcess(), &local, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                    { Log("[host] DuplicateHandle(tex %d) failed %lu", i, GetLastError()); ok = false; break; }
+                    HRESULT hr = h.dev->OpenSharedHandle(local, __uuidof(ID3D12Resource),
+                                                         reinterpret_cast<void **>(&h.tex[i]));
+                    CloseHandle(local);
+                    if (FAILED(hr)) { Log("[host] OpenSharedHandle(tex %d) failed 0x%08X", i, hr); ok = false; }
+                }
             }
 
             NVSDK_NGX_Result rf = NVSDK_NGX_Result_Fail;
@@ -828,6 +905,7 @@ static int Serve(DWORD game_pid)
             back.ngx_result = static_cast<uint32_t>(rf);
             back.fence_in   = reinterpret_cast<uint64_t>(game_in);
             back.fence_out  = reinterpret_cast<uint64_t>(game_out);
+            for (int i = 0; i < FEED_SLOTS; ++i) { back.tex[i] = game_tex[i]; back.tex_size[i] = tex_size[i]; }
             WriteFile(pipe, &back, sizeof(back), &put, nullptr);
         }
         else if (tag == 'F')
